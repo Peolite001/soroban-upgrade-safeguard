@@ -180,6 +180,11 @@ pub struct SafetyReport {
     pub(crate) scope: AnalysisScope,
 
     #[cfg(feature = "unstable")]
+    pub rpc_provenance: Option<crate::rpc::RpcProvenance>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) rpc_provenance: Option<crate::rpc::RpcProvenance>,
+
+    #[cfg(feature = "unstable")]
     pub metrics: Option<BuildMetrics>,
     #[cfg(not(feature = "unstable"))]
     pub(crate) metrics: Option<BuildMetrics>,
@@ -565,6 +570,7 @@ impl SafetyReport {
             gated_axes,
             empirical: false,
             empirical_findings: Vec::new(),
+            rpc_provenance: None,
             settings: ReportSettings::default(),
         }
     }
@@ -840,6 +846,7 @@ impl SafetyReport {
             gated_axes,
             empirical: false,
             empirical_findings: Vec::new(),
+            rpc_provenance: None,
             settings: ReportSettings {
                 strict,
                 explain,
@@ -938,6 +945,10 @@ impl SafetyReport {
                     .flatten()
                     .map(|hash| hash.to_hex())
                     .collect(),
+                ledger_sequence: self.rpc_provenance.as_ref().map(|p| p.ledger_sequence),
+                network: self.rpc_provenance.as_ref().map(|p| p.network.clone()),
+                rpc_endpoint: self.rpc_provenance.as_ref().map(|p| p.rpc_endpoint.clone()),
+                code_hash: self.rpc_provenance.as_ref().map(|p| p.code_hash.clone()),
             },
             is_safe: self.is_safe,
             strict: self.strict,
@@ -1116,6 +1127,7 @@ mod tests {
             no_timestamp: false,
             old_spec_summary: None,
             new_spec_summary: None,
+            rpc_provenance: None,
             scope: AnalysisScope::default(),
             metrics: None,
             axis_verdicts: HashMap::new(),

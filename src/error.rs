@@ -23,6 +23,7 @@ pub enum ErrorKind {
     InvalidHeaderName,
     RemoteFetch,
     OciFetch,
+    RpcSnapshotConsistency,
 }
 
 /// The canonical error type for the soroban-upgrade-safeguard library.
@@ -126,6 +127,12 @@ pub enum Error {
         details: String,
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     },
+    RpcSnapshotConsistency {
+        rpc_url: String,
+        details: String,
+        attempts: u32,
+        observed_sequences: Vec<u64>,
+    },
 }
 
 impl Error {
@@ -151,6 +158,7 @@ impl Error {
             Error::InvalidHeaderName { .. } => ErrorKind::InvalidHeaderName,
             Error::RemoteFetch { .. } => ErrorKind::RemoteFetch,
             Error::OciFetch { .. } => ErrorKind::OciFetch,
+            Error::RpcSnapshotConsistency { .. } => ErrorKind::RpcSnapshotConsistency,
         }
     }
 
@@ -301,6 +309,17 @@ impl fmt::Display for Error {
                     write!(f, "Failed to fetch OCI input '{reference}': {details}")
                 }
             }
+            Error::RpcSnapshotConsistency {
+                rpc_url,
+                details,
+                attempts,
+                ..
+            } => {
+                write!(
+                    f,
+                    "RPC snapshot consistency failure for '{rpc_url}' after {attempts} attempts: {details}"
+                )
+            }
         }
     }
 }
@@ -345,6 +364,7 @@ impl std::error::Error for Error {
             Error::OciFetch { source, .. } => source
                 .as_ref()
                 .map(|s| s.as_ref() as &dyn std::error::Error),
+            Error::RpcSnapshotConsistency { .. } => None,
         }
     }
 }

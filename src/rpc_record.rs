@@ -267,6 +267,7 @@ fn fetch_wasm_recording(
         path: format!("stellar://{}", contract_id),
         sha256: sha256_hex(&wasm_bytes),
         bytes: wasm_bytes,
+        rpc_provenance: None,
     })
 }
 
@@ -425,6 +426,7 @@ pub fn replay_wasm_from_bundle_struct(bundle: &ReplayBundle) -> Result<WasmModul
         path: format!("replay://bundle/{}", bundle.contract_id),
         sha256: sha,
         bytes: wasm_bytes,
+        rpc_provenance: None,
     })
 }
 

@@ -26,10 +26,36 @@ impl fmt::Debug for RpcHeader {
     }
 }
 
-#[derive(Clone, Default)]
+pub const DEFAULT_MAX_SNAPSHOT_RETRIES: u32 = 3;
+
+/// Provenance metadata captured from an RPC snapshot read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RpcProvenance {
+    /// Ledger sequence at which the snapshot was captured.
+    pub ledger_sequence: u64,
+    /// Stellar network passphrase or identifier (e.g. `"Public Global Stellar Network ; September 2015"`).
+    pub network: String,
+    /// Redacted RPC endpoint URL.
+    pub rpc_endpoint: String,
+    /// Lowercase hex SHA-256 hash of the contract's WASM code.
+    pub code_hash: String,
+}
+
+#[derive(Clone)]
 pub struct RpcClientConfig {
     pub url: String,
     pub headers: Vec<RpcHeader>,
+    pub max_snapshot_retries: u32,
+}
+
+impl Default for RpcClientConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            headers: Vec::new(),
+            max_snapshot_retries: DEFAULT_MAX_SNAPSHOT_RETRIES,
+        }
+    }
 }
 
 impl fmt::Debug for RpcClientConfig {
@@ -37,6 +63,7 @@ impl fmt::Debug for RpcClientConfig {
         f.debug_struct("RpcClientConfig")
             .field("url", &redact_url(&self.url))
             .field("headers", &self.headers)
+            .field("max_snapshot_retries", &self.max_snapshot_retries)
             .finish()
     }
 }
@@ -48,7 +75,14 @@ impl RpcClientConfig {
         Ok(Self {
             url,
             headers: Vec::new(),
+            max_snapshot_retries: DEFAULT_MAX_SNAPSHOT_RETRIES,
         })
+    }
+
+    /// Configure maximum retries for snapshot consistency failures.
+    pub fn with_max_retries(mut self, retries: u32) -> Self {
+        self.max_snapshot_retries = retries;
+        self
     }
 
     /// Add a header whose value is read from `env_var` at resolution time.
