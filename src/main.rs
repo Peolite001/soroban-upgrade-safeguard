@@ -2261,7 +2261,8 @@ fn compare_contracts(
             }) {
                 Ok((loaded, storage_provenance)) => {
                     if let Some(ref contract_provenance) = report.rpc_provenance {
-                        if contract_provenance.ledger_sequence != storage_provenance.ledger_sequence {
+                        if contract_provenance.ledger_sequence != storage_provenance.ledger_sequence
+                        {
                             return Err(anyhow::anyhow!(soroban_upgrade_safeguard::error::Error::RpcSnapshotConsistency {
                                 rpc_url: storage_provenance.rpc_endpoint,
                                 details: format!("Empirical storage ledger {} does not match contract/code ledger {}", storage_provenance.ledger_sequence, contract_provenance.ledger_sequence),
