@@ -3,6 +3,7 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+#[allow(unused_imports)]
 use std::time::Duration;
 
 use soroban_upgrade_safeguard::{

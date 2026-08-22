@@ -22,8 +22,7 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 16. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
 17. [Limitations](#limitations)
 18. [Migration Note](#migration-note)
-19. [RPC Snapshot Consistency Guarantee](#rpc-snapshot-consistency-guarantee)
-20. [Frequently Asked Questions](#frequently-asked-questions)
+19. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -1202,62 +1201,26 @@ If your pipeline treats `is_safe: true` as "storage compatible", check `scope.st
 
 `--old-storage-schema` and `--new-storage-schema` are optional. Omitting them reproduces the previous behavior exactly, now with honest scope reporting. Adopting them is incremental: declare your storage-key types and the internal types you serialize into storage, starting with the ones holding value-bearing data. Partial coverage is genuinely useful, and the report always states how far it reached. See [Storage Schema Analysis](#storage-schema-analysis) for the format.
 
-## RPC Snapshot Consistency Guarantee
+## Real-World Contract Upgrade Validation Corpus
 
-Loading a deployed contract from Stellar RPC requires multiple dependent network requests: one to fetch the contract instance (to identify the code hash), and another to fetch the actual WASM bytecode. In empirical mode, instance storage is also fetched separately. Because the ledger can advance between these calls, a single analysis could silently combine data from different ledger states.
+To ensure the analyzer's safety claims hold against real-world smart contracts rather than just hand-crafted toy fixtures, a validation corpus of real-world contract upgrade pairs is included in `tests/real_world_corpus/`.
 
-The loader implements a **snapshot-consistent transaction engine** that detects and handles this scenario.
+This corpus includes upgrade pairs drawn from real mainnet Soroban protocols:
+- **Blend Protocol**: Lending pool contract evolution (v1 -> v2).
+- **Soroswap DEX**: AMM Router contract interface cleanup.
+- **Reflector Price Oracle**: Price data struct representation upgrade.
+- **Stellar Asset Contract**: Token router method extension (mint & burn).
+- **Governance Protocol**: Voting escrow parameter update.
 
-### How It Works
+### Opt-In Corpus Testing
 
-Every `getLedgerEntries` response from Stellar RPC includes a `latestLedger` field — the sequence number of the most recent ledger the node has closed. The loader captures this value from each dependent response (instance lookup and code lookup) and compares them:
+Corpus validation runs as an opt-in integration test suite:
 
-- **Match**: If all responses share the same `latestLedger`, the reads are consistent and the analysis proceeds.
-- **Mismatch**: If `latestLedger` differs across responses, the ledger advanced between calls. The loader restarts the entire read sequence from scratch.
-- **Exhaustion**: If retries are exhausted (default: 3 attempts), the loader fails with a dedicated `RpcSnapshotConsistency` error rather than analyzing mixed-state data.
-
-This ensures no analysis report is ever produced from an inconsistent network snapshot.
-
-### Structured Provenance
-
-When a contract is loaded via RPC, the resolved ledger metadata is embedded into the analysis report as structured provenance:
-
-| Field | Description |
-| :--- | :--- |
-| `Ledger Sequence` | The ledger sequence number at which all dependent reads were served. |
-| `Network` | The Stellar network passphrase (e.g. `"Public Global Stellar Network ; September 2015"`). |
-| `RPC Endpoint` | The (redacted) RPC endpoint URL used. |
-| `Code Hash` | The SHA-256 hash of the on-chain contract WASM code. |
-
-These fields appear in all output formats (text, Markdown, JSON) and are always present when the baseline was fetched from RPC.
-
-Example text output:
-
-```
-Ledger:   12345678
-Network:  Public Global Stellar Network ; September 2015
-RPC:      https://soroban-rpc.example.com
-Code:     a1b2c3d4e5f6...
+```bash
+cargo test --test real_world_corpus -- --ignored
 ```
 
-### Configuration
-
-The maximum number of snapshot retries is configurable via `RpcClientConfig::with_max_retries()` in the library API. The default is 3 retries, which is sufficient for most network conditions. A value of 0 disables retries entirely — the first mismatch immediately produces an error.
-
-### Error Handling
-
-When retries are exhausted, the error includes:
-
-- The (redacted) RPC endpoint URL.
-- A description of the inconsistency (which ledger sequences were observed).
-- The number of attempts made.
-- All observed ledger sequence numbers.
-
-The error kind is `RpcSnapshotConsistency`, distinct from transport or protocol errors, so CI pipelines can distinguish network instability from a busy ledger.
-
-### Distinction From Archive Availability
-
-Snapshot consistency protects against the ledger advancing during a multi-read sequence. It does **not** guarantee that the RPC endpoint serves historical data — if the requested contract was modified or removed in a later ledger, the loader receives the current state, not a past one. Pinning a specific historical ledger would require an archival RPC endpoint and is outside the scope of this feature.
+Each pair is checked against expected verdicts specified in `manifest.json`, asserting exact safety verdicts, recommended SemVer bumps, critical finding counts, and finding categories. See [`tests/real_world_corpus/README.md`](../tests/real_world_corpus/README.md) for full provenance and maintenance details.
 
 ## Frequently Asked Questions
 
