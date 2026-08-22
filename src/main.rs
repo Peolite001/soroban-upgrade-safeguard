@@ -14,7 +14,7 @@ use soroban_upgrade_safeguard::{
         VerificationPolicy,
     },
     color::{should_disable_color, ColorMode},
-    diff, loader, manifest,
+    diff, limits::ResourcePolicy, lint, loader, manifest,
     oci::{self, OciArtifactKind, OciFetchConfig, OciReference},
     parser,
     remote::{self, RemoteFetchConfig, RemoteRef},
@@ -23,6 +23,8 @@ use soroban_upgrade_safeguard::{
     rpc::RpcClientConfig,
     spec,
     spec_json::ExtractedSpec,
+    storage_inference,
+    storage_schema::{SchemaFormat, StorageSchema},
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -384,6 +386,65 @@ enum Command {
     VerifyAttestation(VerifyAttestationArgs),
     /// Streaming JSON Lines batch mode: one job per line on stdin, one result per line on stdout
     Stream(StreamArgs),
+    /// Validate one contract spec (and optional storage schema) in isolation
+    Lint(LintArgs),
+}
+
+/// `lint`: validate a single decoded contract spec (and optional storage
+/// schema) for graph and schema integrity, independent of any comparison.
+///
+/// Exit codes are distinct from the comparison command's:
+/// - `0`: clean, or only warning/info findings without `--strict`.
+/// - `2`: at least one error-severity finding (the artifact is structurally invalid).
+/// - `3`: only warning/info findings, but `--strict` was passed.
+#[derive(ClapArgs, Debug)]
+struct LintArgs {
+    /// WASM file to decode. Omit when using --contract-id/--rpc-url.
+    #[arg(value_name = "WASM")]
+    wasm: Option<PathBuf>,
+
+    /// Stellar/Soroban Contract ID to fetch from on-chain (e.g. C...)
+    #[arg(long, value_name = "CONTRACT_ID", requires = "rpc_url")]
+    contract_id: Option<String>,
+
+    /// Stellar RPC URL (e.g. https://soroban-testnet.stellar.org)
+    #[arg(long, value_name = "RPC_URL", requires = "contract_id")]
+    rpc_url: Option<String>,
+
+    #[arg(long = "rpc-header", value_name = "NAME=ENV_VAR")]
+    rpc_headers: Vec<String>,
+
+    /// Optional declared storage schema (JSON or TOML, inferred from extension).
+    #[arg(long, value_name = "SCHEMA")]
+    storage_schema: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = LintOutputFormat::Text)]
+    format: LintOutputFormat,
+
+    /// Include remediation guidance for each finding.
+    #[arg(long)]
+    explain: bool,
+
+    /// Exit non-zero even when only warning/info findings are present.
+    #[arg(long)]
+    strict: bool,
+
+    /// Maximum recursive type-walk depth. Overrides the built-in default.
+    #[arg(long, value_name = "N")]
+    max_walk_depth: Option<usize>,
+
+    #[arg(long)]
+    no_color: bool,
+}
+
+/// Output format for the `lint` subcommand.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum LintOutputFormat {
+    #[default]
+    Text,
+    Json,
+    Markdown,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -635,6 +696,103 @@ fn print_oci_provenance(artifact: &oci::OciArtifact) {
         artifact.cache_status,
         artifact.media_type
     );
+}
+
+/// Exit code when the lint run found at least one error-severity finding.
+const LINT_EXIT_ERROR: i32 = 2;
+/// Exit code when only warning/info findings were found but `--strict` was passed.
+const LINT_EXIT_STRICT_WARNINGS: i32 = 3;
+
+/// Validate one decoded contract spec (and optional storage schema) in isolation.
+fn run_lint(args: &LintArgs) -> Result<()> {
+    if args.no_color || std::env::var_os("NO_COLOR").is_some() {
+        colored::control::set_override(false);
+    }
+
+    let build = match (&args.wasm, &args.contract_id) {
+        (Some(path), None) => loader::load_wasm(path)?,
+        (None, Some(contract_id)) => {
+            let rpc_url = args
+                .rpc_url
+                .as_ref()
+                .expect("clap requires --rpc-url alongside --contract-id");
+            loader::fetch_wasm_from_rpc_with_config(
+                contract_id,
+                &rpc_config(rpc_url, &args.rpc_headers)?,
+            )?
+        }
+        (Some(_), Some(_)) => anyhow::bail!(
+            "Provide either a WASM path or --contract-id, not both.\n\n\
+             Usage: soroban-upgrade-safeguard lint <WASM>\n       \
+             soroban-upgrade-safeguard lint --contract-id <ID> --rpc-url <URL>"
+        ),
+        (None, None) => anyhow::bail!(
+            "Missing WASM path.\n\n\
+             Usage: soroban-upgrade-safeguard lint <WASM>\n       \
+             soroban-upgrade-safeguard lint --contract-id <ID> --rpc-url <URL>"
+        ),
+    };
+
+    let metadata = parser::extract_metadata(&build.bytes)?;
+
+    let schema = match &args.storage_schema {
+        Some(path) => {
+            let content = std::fs::read_to_string(path).with_context(|| {
+                format!("Failed to read storage schema '{}'", path.display())
+            })?;
+            let format = match path.extension().and_then(|e| e.to_str()) {
+                Some("toml") => SchemaFormat::Toml,
+                _ => SchemaFormat::Json,
+            };
+            // Parse without eagerly validating here: an invalid schema should
+            // surface as a lint finding, not a hard CLI error.
+            let parsed = match format {
+                SchemaFormat::Json => StorageSchema::from_json(&content),
+                SchemaFormat::Toml => StorageSchema::from_toml(&content),
+            };
+            match parsed {
+                Ok(schema) => Some(schema),
+                Err(err) => {
+                    anyhow::bail!("Failed to parse storage schema '{}': {err}", path.display())
+                }
+            }
+        }
+        None => None,
+    };
+
+    let inferred = if schema.is_some() {
+        Some(storage_inference::infer_storage(&build.bytes).map_err(|e| anyhow::anyhow!(e))?)
+    } else {
+        None
+    };
+
+    let mut policy = ResourcePolicy::default();
+    if let Some(v) = args.max_walk_depth {
+        policy.max_walk_depth = v;
+    }
+
+    let options = lint::LintOptions {
+        schema: schema.as_ref(),
+        inferred_storage: inferred.as_ref(),
+        policy,
+    };
+
+    let report = lint::lint(&metadata.spec, &options);
+
+    match args.format {
+        LintOutputFormat::Text => print!("{}", report.render_text(args.explain)),
+        LintOutputFormat::Markdown => print!("{}", report.render_markdown(args.explain)),
+        LintOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report.to_json_value())?),
+    }
+
+    if report.has_errors() {
+        std::process::exit(LINT_EXIT_ERROR);
+    }
+    if args.strict && report.has_warnings() {
+        std::process::exit(LINT_EXIT_STRICT_WARNINGS);
+    }
+
+    Ok(())
 }
 
 fn file_artifact(path: &Path) -> Result<AttestedArtifact> {
@@ -1081,6 +1239,7 @@ fn main() -> Result<()> {
             return run_verify_attestation(verify_args)
         }
         Some(Command::Stream(stream_args)) => return run_stream(stream_args),
+        Some(Command::Lint(lint_args)) => return run_lint(lint_args),
         None => {}
     }
 
