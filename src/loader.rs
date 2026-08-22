@@ -661,10 +661,13 @@ fn fetch_instance_storage_from_rpc_with_provenance_inner(
         message: "RPC response missing latestLedger for snapshot provenance".to_string(),
     })?;
     let network = query_network_passphrase(rpc_url, auth);
-    Ok((entries, crate::rpc::RpcProvenance {
-        ledger_sequence,
-        network,
-        rpc_endpoint: crate::rpc::redact_url(rpc_url),
-        code_hash: String::new(),
-    }))
+    Ok((
+        entries,
+        crate::rpc::RpcProvenance {
+            ledger_sequence,
+            network,
+            rpc_endpoint: crate::rpc::redact_url(rpc_url),
+            code_hash: String::new(),
+        },
+    ))
 }
