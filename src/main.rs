@@ -1343,6 +1343,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             },
             empirical: false,
             empirical_findings: Vec::new(),
+            budget_violations: Vec::new(),
             settings: report::ReportSettings::default(),
         };
 
@@ -1647,6 +1648,7 @@ fn synthesize_error_report(
         },
         empirical: false,
         empirical_findings: Vec::new(),
+        budget_violations: Vec::new(),
         settings: report::ReportSettings::default(),
     }
 }

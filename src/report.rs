@@ -211,6 +211,18 @@ pub struct SafetyReport {
     /// Findings from empirical validation, if performed.
     #[cfg(not(feature = "unstable"))]
     pub(crate) empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
+
+    /// Configured compatibility budgets ([`crate::budget`]) that were
+    /// exceeded. Always gates `is_safe`, independent of `--strict` and axis
+    /// gate policy, since a budget is an explicit opt-in the team configured.
+    #[cfg(feature = "unstable")]
+    pub budget_violations: Vec<crate::budget::BudgetViolation>,
+    /// Configured compatibility budgets ([`crate::budget`]) that were
+    /// exceeded. Always gates `is_safe`, independent of `--strict` and axis
+    /// gate policy, since a budget is an explicit opt-in the team configured.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) budget_violations: Vec<crate::budget::BudgetViolation>,
+
     #[cfg(feature = "unstable")]
     pub settings: ReportSettings,
     #[cfg(not(feature = "unstable"))]
@@ -415,6 +427,10 @@ impl SafetyReport {
 
     pub fn empirical_findings(&self) -> &[crate::empirical::EmpiricalFinding] {
         &self.empirical_findings
+    }
+
+    pub fn budget_violations(&self) -> &[crate::budget::BudgetViolation] {
+        &self.budget_violations
     }
 }
 
@@ -653,6 +669,7 @@ impl SafetyReport {
             gated_axes,
             empirical: false,
             empirical_findings: Vec::new(),
+            budget_violations: Vec::new(),
             settings: ReportSettings::default(),
         }
     }
@@ -913,6 +930,15 @@ impl SafetyReport {
             .values()
             .any(|&status| status == AxisStatus::Failed);
 
+        let reported_refs: Vec<&ReportedFinding> =
+            findings_by_category.values().flatten().collect();
+        let budget_violations =
+            crate::budget::evaluate(&reported_refs, &suppressions.budgets().entries);
+        // A configured budget is an explicit, deliberate policy the team
+        // opted into -- unlike axis gating it does not depend on `--strict`
+        // or the default gate policy, so any violation always fails the run.
+        let is_safe = is_safe && budget_violations.is_empty();
+
         Self {
             call_abi,
             critical_count,
@@ -939,6 +965,7 @@ impl SafetyReport {
             gated_axes,
             empirical: false,
             empirical_findings: Vec::new(),
+            budget_violations,
             settings: ReportSettings {
                 strict,
                 explain,
@@ -1068,6 +1095,7 @@ impl SafetyReport {
             call_abi: self.call_abi.clone(),
             empirical: self.empirical,
             empirical_findings: self.empirical_findings.clone(),
+            budget_violations: self.budget_violations.clone(),
         }
     }
 
@@ -1093,20 +1121,7 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
 }
 
 fn canonical_rule_id(category: &str) -> String {
-    category
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("_")
+    crate::suppression::canonical_rule_id(category)
 }
 
 /// Return the current UTC time as an RFC 3339 / ISO 8601 string.
@@ -1228,6 +1243,7 @@ mod tests {
             gated_axes: HashSet::new(),
             empirical: false,
             empirical_findings: Vec::new(),
+            budget_violations: Vec::new(),
             settings: ReportSettings::default(),
         };
 

@@ -104,6 +104,22 @@ pub struct SuppressionConfig {
     #[serde(default)]
     #[cfg(not(feature = "unstable"))]
     pub(crate) policy: PolicyConfig,
+
+    /// Per-axis and per-rule compatibility budgets. Parsed from raw
+    /// `[[budget]]` tables and validated by [`Self::load_from_path`] /
+    /// [`Self::from_toml_str`] via [`crate::budget::BudgetConfig::from_file_entries`].
+    #[serde(default, rename = "budget")]
+    raw_budget: Vec<crate::budget::BudgetEntryFile>,
+    /// The validated form of `raw_budget`. Always `Some` on a config that
+    /// successfully parsed via [`Self::from_toml_str`] / [`Self::load_from_path`];
+    /// `None` only for a config built directly with [`SuppressionConfig::default`]
+    /// (which has no budgets to validate).
+    #[serde(skip)]
+    #[cfg(feature = "unstable")]
+    pub budgets: crate::budget::BudgetConfig,
+    #[serde(skip)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) budgets: crate::budget::BudgetConfig,
 }
 
 impl SuppressionConfig {
@@ -115,6 +131,11 @@ impl SuppressionConfig {
     /// Get the gating policy configuration.
     pub fn policy(&self) -> &PolicyConfig {
         &self.policy
+    }
+
+    /// Get the validated compatibility budgets.
+    pub fn budgets(&self) -> &crate::budget::BudgetConfig {
+        &self.budgets
     }
 }
 
@@ -239,7 +260,11 @@ impl SuppressionRule {
     }
 }
 
-fn canonical_rule_id(category: &str) -> String {
+/// Normalize a finding category string into the stable, snake_case rule ID
+/// used by [`crate::report::ReportedFinding::rule_id`] and by
+/// [`crate::budget`]'s `rule`-scoped budgets, so both name a rule the same
+/// way.
+pub(crate) fn canonical_rule_id(category: &str) -> String {
     category
         .chars()
         .map(|c| {
@@ -259,11 +284,23 @@ fn canonical_rule_id(category: &str) -> String {
 impl SuppressionConfig {
     /// Parse a config from a TOML string.
     pub fn from_toml_str(contents: &str) -> Result<Self, Error> {
-        toml::from_str(contents).map_err(|e| Error::SuppressionConfig {
+        let mut config: SuppressionConfig =
+            toml::from_str(contents).map_err(|e| Error::SuppressionConfig {
+                path: None,
+                details: "Failed to parse suppression config as TOML".to_string(),
+                source: Some(Box::new(e)),
+            })?;
+
+        config.budgets = crate::budget::BudgetConfig::from_file_entries(
+            std::mem::take(&mut config.raw_budget),
+        )
+        .map_err(|errors| Error::SuppressionConfig {
             path: None,
-            details: "Failed to parse suppression config as TOML".to_string(),
-            source: Some(Box::new(e)),
-        })
+            details: format!("Invalid [[budget]] configuration: {}", errors.join("; ")),
+            source: None,
+        })?;
+
+        Ok(config)
     }
 
     /// Load a config from an explicit path. Errors if the file is missing or
