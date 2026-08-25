@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 #[allow(unused_imports)]
 use std::time::Duration;
@@ -22,7 +22,7 @@ use soroban_upgrade_safeguard::{
     report,
     rpc::RpcClientConfig,
     spec,
-    spec_json::ExtractedSpec,
+    spec_json::{ExtractedSpec, InterfaceLockfile},
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -161,6 +161,7 @@ enum RenderFormat {
                       soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]\n       \
                       soroban-upgrade-safeguard extract <WASM> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard lockfile <WASM> --output <PATH> [OPTIONS]\n       \
                       soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]\n       \
                       soroban-upgrade-safeguard init [OPTIONS]\n       \
                       soroban-upgrade-safeguard stream [OPTIONS]",
@@ -245,6 +246,10 @@ struct Args {
     /// Expected SHA-256 hash (hex) of the on-chain WASM baseline.
     #[arg(long, value_name = "HEX_HASH")]
     expected_wasm_hash: Option<String>,
+
+    /// Compare the candidate WASM against a committed interface lockfile.
+    #[arg(long, value_name = "LOCKFILE")]
+    interface_lockfile: Option<PathBuf>,
 
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
@@ -374,6 +379,8 @@ fn oci_fetch_config(args: &Args) -> OciFetchConfig {
 enum Command {
     /// Dump a single contract's decoded spec as JSON
     Extract(ExtractArgs),
+    /// Generate or update a committed interface lockfile from one WASM build
+    Lockfile(LockfileArgs),
     /// Re-render a previously saved JSON report in another format
     Render(RenderArgs),
     /// Generate a suppression config from current findings
@@ -472,6 +479,22 @@ struct ExtractArgs {
     /// Print only the interface hash, with no other output.
     #[arg(long)]
     hash_only: bool,
+}
+
+/// `lockfile`: write a committed snapshot of one contract's exported interface.
+#[derive(ClapArgs, Debug)]
+struct LockfileArgs {
+    /// WASM file whose exported interface should be recorded.
+    #[arg(value_name = "WASM")]
+    wasm: PathBuf,
+
+    /// Destination path for the interface lockfile.
+    #[arg(long, value_name = "PATH", required = true)]
+    output: PathBuf,
+
+    /// Allow replacing an existing lockfile.
+    #[arg(long)]
+    force: bool,
 }
 
 /// `render`: turn a stored JSON report back into a human format.
@@ -578,6 +601,48 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
 
     let extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
     println!("{}", serde_json::to_string_pretty(&extracted)?);
+    Ok(())
+}
+
+/// Extract one build and write its exported interface as a lockfile.
+fn run_lockfile(args: &LockfileArgs) -> Result<()> {
+    if args.output.exists() && !args.force {
+        anyhow::bail!(
+            "{} already exists. Use --force to update it.",
+            args.output.display()
+        );
+    }
+
+    let build = loader::load_wasm(&args.wasm)
+        .map_err(|error| anyhow::anyhow!("Failed to load '{}': {error}", args.wasm.display()))?;
+    let metadata = parser::extract_metadata(&build.bytes)
+        .context("Failed to extract metadata from the lockfile source WASM")?;
+    let contract_spec = spec::ContractSpec::from_entries(&metadata.spec);
+    let extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
+    let lockfile = InterfaceLockfile::from_extracted(&extracted);
+    let mut contents = serde_json::to_vec_pretty(&lockfile)?;
+    contents.push(b'\n');
+
+    if let Some(parent) = args
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create lockfile directory '{}'.",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::write(&args.output, contents)
+        .with_context(|| format!("Failed to write lockfile '{}'.", args.output.display()))?;
+    println!(
+        "{} {} ({})",
+        if args.force { "Updated" } else { "Generated" },
+        args.output.display(),
+        contract_spec.interface_hash()
+    );
     Ok(())
 }
 
@@ -757,6 +822,7 @@ fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
                 }],
             });
             println!("{}", serde_json::to_string_pretty(&result)?);
+            std::io::stdout().flush().ok();
             std::process::exit(1);
         }
     };
@@ -817,6 +883,7 @@ fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
     });
     println!("{}", serde_json::to_string_pretty(&result)?);
     if result["verified"] != true {
+        std::io::stdout().flush().ok();
         std::process::exit(1);
     }
     Ok(())
@@ -1074,6 +1141,7 @@ fn main() -> Result<()> {
 
     match &args.command {
         Some(Command::Extract(extract_args)) => return run_extract(extract_args),
+        Some(Command::Lockfile(lockfile_args)) => return run_lockfile(lockfile_args),
         Some(Command::Render(render_args)) => return run_render(render_args),
         Some(Command::Init(init_args)) => return run_init(init_args),
         Some(Command::Attest(attest_args)) => return run_attest(attest_args),
@@ -1109,6 +1177,16 @@ fn main() -> Result<()> {
 
     if is_batch && !args.wasm_paths.is_empty() {
         anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
+    }
+
+    if args.interface_lockfile.is_some() && is_batch {
+        anyhow::bail!("Cannot use --interface-lockfile with batch mode");
+    }
+    if args.interface_lockfile.is_some() && args.contract_id.is_some() {
+        anyhow::bail!("Cannot use --interface-lockfile with --contract-id; the lockfile supplies the baseline");
+    }
+    if args.interface_lockfile.is_some() && (args.empirical || args.empirical_file.is_some()) {
+        anyhow::bail!("Cannot use empirical validation with --interface-lockfile");
     }
 
     // Manifest-resolution mode: show how the composition resolved and exit,
@@ -1954,7 +2032,12 @@ fn run_single(
     suppressions: &SuppressionConfig,
     progress: &dyn Fn(String),
 ) -> Result<()> {
+    if args.interface_lockfile.is_some() && args.wasm_paths.len() != 1 {
+        anyhow::bail!("--interface-lockfile requires exactly one candidate WASM path");
+    }
+
     let (old_source, new_wasm_path) = match (args.wasm_paths.len(), &args.contract_id) {
+        (1, None) if args.interface_lockfile.is_some() => (None, &args.wasm_paths[0]),
         (2, None) => (None, &args.wasm_paths[1]),
         (1, Some(_)) => (args.contract_id.as_deref(), &args.wasm_paths[0]),
         (2, Some(_)) => {
@@ -2027,16 +2110,6 @@ fn run_single(
         let remote_config = remote_fetch_config(args);
         let oci_config = oci_fetch_config(args);
 
-        let old = if let Some(contract_id) = old_source {
-            let rpc_url = args.rpc_url.as_ref().unwrap();
-            loader::fetch_wasm_from_rpc_with_config(
-                contract_id,
-                &rpc_config(rpc_url, &args.rpc_headers)?,
-            )?
-        } else {
-            load_wasm_input(&args.wasm_paths[0], &remote_config, &oci_config, progress)?
-        };
-
         let new = load_wasm_input(new_wasm_path, &remote_config, &oci_config, progress)?;
 
         if !suppressions.rules.is_empty() {
@@ -2046,24 +2119,56 @@ fn run_single(
             ));
         }
 
-        let safety_report = compare_contracts(
-            &ContractComparison {
-                old_bytes: &old.bytes,
-                old_path: &old.path,
-                new_bytes: &new.bytes,
-                new_path: &new.path,
-                suppressions,
-                explain: args.explain,
-                strict: args.strict,
-                no_timestamp: args.no_timestamp,
-                empirical: args.empirical || args.empirical_file.is_some(),
-                empirical_file: args.empirical_file.as_deref(),
-                contract_id: old_source,
-                rpc_url: args.rpc_url.as_deref(),
-                rpc_headers: &args.rpc_headers,
-            },
-            progress,
-        )?;
+        let safety_report = if let Some(lockfile_path) = &args.interface_lockfile {
+            let lockfile_json = std::fs::read_to_string(lockfile_path).with_context(|| {
+                format!(
+                    "Failed to read interface lockfile '{}'.",
+                    lockfile_path.display()
+                )
+            })?;
+            progress(format!(
+                "\n🔒 Checking exported interface against {}...",
+                lockfile_path.display()
+            ));
+            soroban_upgrade_safeguard::compare_wasm_against_interface_lockfile(
+                &lockfile_json,
+                &new.bytes,
+                &soroban_upgrade_safeguard::CompareOptions {
+                    suppressions: Some(suppressions),
+                    explain: args.explain,
+                    strict: args.strict,
+                    storage_schemas: None,
+                },
+            )?
+        } else {
+            let old = if let Some(contract_id) = old_source {
+                let rpc_url = args.rpc_url.as_ref().unwrap();
+                loader::fetch_wasm_from_rpc_with_config(
+                    contract_id,
+                    &rpc_config(rpc_url, &args.rpc_headers)?,
+                )?
+            } else {
+                load_wasm_input(&args.wasm_paths[0], &remote_config, &oci_config, progress)?
+            };
+            compare_contracts(
+                &ContractComparison {
+                    old_bytes: &old.bytes,
+                    old_path: &old.path,
+                    new_bytes: &new.bytes,
+                    new_path: &new.path,
+                    suppressions,
+                    explain: args.explain,
+                    strict: args.strict,
+                    no_timestamp: args.no_timestamp,
+                    empirical: args.empirical || args.empirical_file.is_some(),
+                    empirical_file: args.empirical_file.as_deref(),
+                    contract_id: old_source,
+                    rpc_url: args.rpc_url.as_deref(),
+                    rpc_headers: &args.rpc_headers,
+                },
+                progress,
+            )?
+        };
 
         render_to_outputs(
             &safety_report,

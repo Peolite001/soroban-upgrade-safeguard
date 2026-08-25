@@ -6,7 +6,9 @@
 
 use std::path::PathBuf;
 
-use soroban_upgrade_safeguard::{compare_wasm_bytes, compare_wasm_files};
+use soroban_upgrade_safeguard::{
+    compare_wasm_against_interface_lockfile, compare_wasm_bytes, compare_wasm_files,
+};
 
 /// Absolute path to a fixture WASM under `tests/wasm/`.
 fn wasm(name: &str) -> PathBuf {
@@ -63,6 +65,37 @@ fn library_compares_in_memory_bytes() {
     let from_files = compare_wasm_files(&wasm("v1.wasm"), &wasm("v2.wasm")).unwrap();
     assert_eq!(report.critical_count(), from_files.critical_count());
     assert_eq!(report.total_findings(), from_files.total_findings());
+}
+
+#[test]
+fn library_compares_wasm_against_interface_lockfile() {
+    let old = std::fs::read(wasm("v1.wasm")).expect("read v1 fixture");
+    let new = std::fs::read(wasm("v2.wasm")).expect("read v2 fixture");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("extract")
+        .arg(wasm("v1.wasm"))
+        .output()
+        .expect("extract v1");
+    let extracted: soroban_upgrade_safeguard::spec_json::ExtractedSpec =
+        serde_json::from_slice(&output.stdout).expect("parse extracted spec");
+    let lockfile = soroban_upgrade_safeguard::InterfaceLockfile::from_extracted(&extracted);
+
+    let matching = compare_wasm_against_interface_lockfile(
+        &serde_json::to_string(&lockfile).unwrap(),
+        &old,
+        &Default::default(),
+    )
+    .expect("matching lockfile comparison should succeed");
+    assert!(matching.is_safe());
+
+    let drifting = compare_wasm_against_interface_lockfile(
+        &serde_json::to_string(&lockfile).unwrap(),
+        &new,
+        &Default::default(),
+    )
+    .expect("drifting lockfile comparison should succeed");
+    assert!(!drifting.is_safe());
+    assert!(drifting.critical_count() >= 1);
 }
 
 #[test]
