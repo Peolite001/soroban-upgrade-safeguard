@@ -23,6 +23,7 @@ fn live(format: &str) -> String {
         .arg(wasm("v2.wasm"))
         .args(["--format", format])
         .arg("--no-color")
+        .arg("--no-timestamp")
         .output()
         .expect("failed to run binary");
     String::from_utf8(output.stdout).expect("stdout was not valid UTF-8")

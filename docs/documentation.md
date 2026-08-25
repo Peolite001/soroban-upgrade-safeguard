@@ -240,6 +240,13 @@ soroban-upgrade-safeguard --manifest <MANIFEST_PATH>
 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>
 ```
 
+- Interface lockfile mode (one candidate WASM):
+
+```bash
+soroban-upgrade-safeguard <NEW_WASM> \
+  --interface-lockfile <LOCKFILE>
+```
+
 - Glob pair mode (pair matches by file stem):
 
 ```bash
@@ -252,6 +259,45 @@ directory, and glob modes run batch comparisons. The full usage strings and opti
 match the CLI help output (`--help`) and the `override_usage` in `src/main.rs`.
 
 Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), and the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)).
+
+### Interface lockfiles
+
+An interface lockfile pins the exported `contractspecv0` interface in a deterministic,
+version-controlled JSON artifact. Generate one from an approved build:
+
+```bash
+soroban-upgrade-safeguard lockfile ./wasm/v1.wasm \
+  --output ./wasm/contract.interface.lock.json
+```
+
+The command refuses to replace an existing file unless `--force` is provided. Use
+that flag only when the public interface change is intentional:
+
+```bash
+soroban-upgrade-safeguard lockfile ./wasm/v2.wasm \
+  --output ./wasm/contract.interface.lock.json --force
+```
+
+Review the resulting JSON diff as an API change. Named collections are sorted for
+stable diffs, while function parameters, struct fields, and union cases retain
+declaration order because those positions affect compatibility. Documentation is
+kept in the artifact so informational documentation findings remain available.
+The stored interface hash is checked against the structured content when the file
+is loaded, preventing a hand-edited or stale lockfile from silently being trusted.
+
+Run the lockfile check in CI with the candidate build as the only positional input:
+
+```bash
+soroban-upgrade-safeguard ./wasm/candidate.wasm \
+  --interface-lockfile ./wasm/contract.interface.lock.json \
+  --format json
+```
+
+A matching interface exits `0`. Drift exits non-zero and uses the normal diff
+categories, severities, suppression handling, and report formats. Lockfile mode
+deliberately analyzes the exported interface only; it does not compare environment
+metadata, host imports, runtime surface, storage schemas, or empirical storage
+observations. Use a two-build comparison when those dimensions are required.
 
 ### Spec JSON input mode
 
