@@ -2437,9 +2437,7 @@ mod tests {
         let finding = &report.findings[0];
         assert_eq!(finding.severity, Severity::Warning);
         assert_eq!(finding.category, FindingCategory::Environment.as_str());
-        assert!(finding
-            .message
-            .contains("upgraded from 21 to 22"));
+        assert!(finding.message.contains("upgraded from 21 to 22"));
     }
 
     #[test]
@@ -3513,7 +3511,9 @@ mod tests {
         assert_eq!(f.category, "Environment");
         assert_eq!(f.severity, Severity::Warning);
         assert_eq!(f.target.as_deref(), Some("pre_release_version"));
-        assert!(f.message.contains("pre-release version downgraded from 2 to 1"));
+        assert!(f
+            .message
+            .contains("pre-release version downgraded from 2 to 1"));
     }
 
     #[test]
@@ -3529,7 +3529,9 @@ mod tests {
         assert_eq!(f.category, "Environment");
         assert_eq!(f.severity, Severity::Info);
         assert_eq!(f.target.as_deref(), Some("pre_release_version"));
-        assert!(f.message.contains("pre-release version upgraded from 1 to 2"));
+        assert!(f
+            .message
+            .contains("pre-release version upgraded from 1 to 2"));
     }
 
     #[test]
@@ -3540,14 +3542,20 @@ mod tests {
         compare_env_metadata(None, Some(&meta), &mut report_app);
         assert_eq!(report_app.findings.len(), 1);
         assert_eq!(report_app.findings[0].severity, Severity::Info);
-        assert_eq!(report_app.findings[0].target.as_deref(), Some("env_metadata"));
+        assert_eq!(
+            report_app.findings[0].target.as_deref(),
+            Some("env_metadata")
+        );
         assert!(report_app.findings[0].message.contains("appeared"));
 
         let mut report_rem = DiffReport::default();
         compare_env_metadata(Some(&meta), None, &mut report_rem);
         assert_eq!(report_rem.findings.len(), 1);
         assert_eq!(report_rem.findings[0].severity, Severity::Warning);
-        assert_eq!(report_rem.findings[0].target.as_deref(), Some("env_metadata"));
+        assert_eq!(
+            report_rem.findings[0].target.as_deref(),
+            Some("env_metadata")
+        );
         assert!(report_rem.findings[0].message.contains("removed"));
     }
 

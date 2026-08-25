@@ -217,15 +217,14 @@ pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata, Error> {
                     let section_index = env_section_index;
                     env_section_index += 1;
 
-                    let env_meta = decode_env_meta(section.data()).map_err(|e| {
-                        Error::SectionExtraction {
+                    let env_meta =
+                        decode_env_meta(section.data()).map_err(|e| Error::SectionExtraction {
                             section_name: "contractenvmetav0".to_string(),
                             section_index,
                             byte_offset: section.data_offset() as u64,
                             details: String::new(),
                             source: Some(Box::new(e)),
-                        }
-                    })?;
+                        })?;
                     metadata.env_meta = Some(env_meta);
                 }
                 _ => {}
