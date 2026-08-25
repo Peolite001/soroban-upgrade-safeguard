@@ -166,17 +166,39 @@ impl ExtractedSpec {
                 .iter()
                 .map(|f| {
                     Ok(stellar_xdr::curr::ScSpecUdtStructFieldV0 {
-                        doc: f.doc.as_str().try_into().map_err(|_| anyhow::anyhow!("doc error"))?,
-                        name: f.name.as_str().try_into().map_err(|_| anyhow::anyhow!("name error"))?,
+                        doc: f
+                            .doc
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("doc error"))?,
+                        name: f
+                            .name
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("name error"))?,
                         type_: (&f.type_).try_into()?,
                     })
                 })
                 .collect();
             let xdr_struct = stellar_xdr::curr::ScSpecUdtStructV0 {
-                doc: s.doc.as_str().try_into().map_err(|_| anyhow::anyhow!("doc error"))?,
-                lib: s.lib.as_str().try_into().map_err(|_| anyhow::anyhow!("lib error"))?,
-                name: s.name.as_str().try_into().map_err(|_| anyhow::anyhow!("name error"))?,
-                fields: fields?.try_into().map_err(|_| anyhow::anyhow!("Too many fields"))?,
+                doc: s
+                    .doc
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                lib: s
+                    .lib
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("lib error"))?,
+                name: s
+                    .name
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                fields: fields?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many fields"))?,
             };
             spec.structs.insert(s.name.clone(), xdr_struct);
         }
@@ -187,17 +209,39 @@ impl ExtractedSpec {
                 .iter()
                 .map(|c| {
                     Ok(stellar_xdr::curr::ScSpecUdtEnumCaseV0 {
-                        doc: c.doc.as_str().try_into().map_err(|_| anyhow::anyhow!("doc error"))?,
-                        name: c.name.as_str().try_into().map_err(|_| anyhow::anyhow!("name error"))?,
+                        doc: c
+                            .doc
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("doc error"))?,
+                        name: c
+                            .name
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("name error"))?,
                         value: c.value,
                     })
                 })
                 .collect();
             let xdr_enum = stellar_xdr::curr::ScSpecUdtEnumV0 {
-                doc: e.doc.as_str().try_into().map_err(|_| anyhow::anyhow!("doc error"))?,
-                lib: e.lib.as_str().try_into().map_err(|_| anyhow::anyhow!("lib error"))?,
-                name: e.name.as_str().try_into().map_err(|_| anyhow::anyhow!("name error"))?,
-                cases: cases?.try_into().map_err(|_| anyhow::anyhow!("Too many cases"))?,
+                doc: e
+                    .doc
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                lib: e
+                    .lib
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("lib error"))?,
+                name: e
+                    .name
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                cases: cases?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many cases"))?,
             };
             spec.enums.insert(e.name.clone(), xdr_enum);
         }
@@ -210,8 +254,14 @@ impl ExtractedSpec {
                     UnionCaseJson::Void { name, doc } => {
                         Ok(stellar_xdr::curr::ScSpecUdtUnionCaseV0::VoidV0(
                             stellar_xdr::curr::ScSpecUdtUnionCaseVoidV0 {
-                                doc: doc.as_str().try_into().map_err(|_| anyhow::anyhow!("doc error"))?,
-                                name: name.as_str().try_into().map_err(|_| anyhow::anyhow!("name error"))?,
+                                doc: doc
+                                    .as_str()
+                                    .try_into()
+                                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                                name: name
+                                    .as_str()
+                                    .try_into()
+                                    .map_err(|_| anyhow::anyhow!("name error"))?,
                             },
                         ))
                     }
@@ -220,8 +270,14 @@ impl ExtractedSpec {
                             types.iter().map(|t| t.try_into()).collect();
                         Ok(stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(
                             stellar_xdr::curr::ScSpecUdtUnionCaseTupleV0 {
-                                doc: doc.as_str().try_into().map_err(|_| anyhow::anyhow!("doc error"))?,
-                                name: name.as_str().try_into().map_err(|_| anyhow::anyhow!("name error"))?,
+                                doc: doc
+                                    .as_str()
+                                    .try_into()
+                                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                                name: name
+                                    .as_str()
+                                    .try_into()
+                                    .map_err(|_| anyhow::anyhow!("name error"))?,
                                 type_: parsed_types?
                                     .try_into()
                                     .map_err(|_| anyhow::anyhow!("Too many types"))?,
@@ -231,10 +287,24 @@ impl ExtractedSpec {
                 })
                 .collect();
             let xdr_union = stellar_xdr::curr::ScSpecUdtUnionV0 {
-                doc: u.doc.as_str().try_into().map_err(|_| anyhow::anyhow!("doc error"))?,
-                lib: u.lib.as_str().try_into().map_err(|_| anyhow::anyhow!("lib error"))?,
-                name: u.name.as_str().try_into().map_err(|_| anyhow::anyhow!("name error"))?,
-                cases: cases?.try_into().map_err(|_| anyhow::anyhow!("Too many cases"))?,
+                doc: u
+                    .doc
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                lib: u
+                    .lib
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("lib error"))?,
+                name: u
+                    .name
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                cases: cases?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many cases"))?,
             };
             spec.unions.insert(u.name.clone(), xdr_union);
         }
@@ -245,17 +315,39 @@ impl ExtractedSpec {
                 .iter()
                 .map(|c| {
                     Ok(stellar_xdr::curr::ScSpecUdtErrorEnumCaseV0 {
-                        doc: c.doc.as_str().try_into().map_err(|_| anyhow::anyhow!("doc error"))?,
-                        name: c.name.as_str().try_into().map_err(|_| anyhow::anyhow!("name error"))?,
+                        doc: c
+                            .doc
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("doc error"))?,
+                        name: c
+                            .name
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("name error"))?,
                         value: c.value,
                     })
                 })
                 .collect();
             let xdr_error = stellar_xdr::curr::ScSpecUdtErrorEnumV0 {
-                doc: err.doc.as_str().try_into().map_err(|_| anyhow::anyhow!("doc error"))?,
-                lib: err.lib.as_str().try_into().map_err(|_| anyhow::anyhow!("lib error"))?,
-                name: err.name.as_str().try_into().map_err(|_| anyhow::anyhow!("name error"))?,
-                cases: cases?.try_into().map_err(|_| anyhow::anyhow!("Too many cases"))?,
+                doc: err
+                    .doc
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                lib: err
+                    .lib
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("lib error"))?,
+                name: err
+                    .name
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                cases: cases?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many cases"))?,
             };
             spec.error_enums.insert(err.name.clone(), xdr_error);
         }
@@ -266,8 +358,16 @@ impl ExtractedSpec {
                 .iter()
                 .map(|i| {
                     Ok(stellar_xdr::curr::ScSpecFunctionInputV0 {
-                        doc: i.doc.as_str().try_into().map_err(|_| anyhow::anyhow!("doc error"))?,
-                        name: i.name.as_str().try_into().map_err(|_| anyhow::anyhow!("name error"))?,
+                        doc: i
+                            .doc
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("doc error"))?,
+                        name: i
+                            .name
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("name error"))?,
                         type_: (&i.type_).try_into()?,
                     })
                 })
@@ -275,10 +375,22 @@ impl ExtractedSpec {
             let outputs: Result<Vec<_>, anyhow::Error> =
                 func.outputs.iter().map(|o| o.try_into()).collect();
             let xdr_func = stellar_xdr::curr::ScSpecFunctionV0 {
-                doc: func.doc.as_str().try_into().map_err(|_| anyhow::anyhow!("doc error"))?,
-                name: func.name.as_str().try_into().map_err(|_| anyhow::anyhow!("name error"))?,
-                inputs: inputs?.try_into().map_err(|_| anyhow::anyhow!("Too many inputs"))?,
-                outputs: outputs?.try_into().map_err(|_| anyhow::anyhow!("Too many outputs"))?,
+                doc: func
+                    .doc
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                name: func
+                    .name
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                inputs: inputs?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many inputs"))?,
+                outputs: outputs?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many outputs"))?,
             };
             spec.functions.insert(func.name.clone(), xdr_func);
         }
@@ -583,28 +695,44 @@ impl TryFrom<&SpecType> for ScSpecTypeDef {
             SpecType::String => Ok(ScSpecTypeDef::String),
             SpecType::Symbol => Ok(ScSpecTypeDef::Symbol),
             SpecType::Address => Ok(ScSpecTypeDef::Address),
-            SpecType::Option { value } => Ok(ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-                value_type: Box::new(ScSpecTypeDef::try_from(value.as_ref())?),
-            }))),
-            SpecType::Result { ok, error } => Ok(ScSpecTypeDef::Result(Box::new(stellar_xdr::curr::ScSpecTypeResult {
-                ok_type: Box::new(ScSpecTypeDef::try_from(ok.as_ref())?),
-                error_type: Box::new(ScSpecTypeDef::try_from(error.as_ref())?),
-            }))),
-            SpecType::Vec { element } => Ok(ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
-                element_type: Box::new(ScSpecTypeDef::try_from(element.as_ref())?),
-            }))),
-            SpecType::Map { key, value } => Ok(ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
-                key_type: Box::new(ScSpecTypeDef::try_from(key.as_ref())?),
-                value_type: Box::new(ScSpecTypeDef::try_from(value.as_ref())?),
-            }))),
+            SpecType::Option { value } => Ok(ScSpecTypeDef::Option(Box::new(
+                stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: Box::new(ScSpecTypeDef::try_from(value.as_ref())?),
+                },
+            ))),
+            SpecType::Result { ok, error } => Ok(ScSpecTypeDef::Result(Box::new(
+                stellar_xdr::curr::ScSpecTypeResult {
+                    ok_type: Box::new(ScSpecTypeDef::try_from(ok.as_ref())?),
+                    error_type: Box::new(ScSpecTypeDef::try_from(error.as_ref())?),
+                },
+            ))),
+            SpecType::Vec { element } => Ok(ScSpecTypeDef::Vec(Box::new(
+                stellar_xdr::curr::ScSpecTypeVec {
+                    element_type: Box::new(ScSpecTypeDef::try_from(element.as_ref())?),
+                },
+            ))),
+            SpecType::Map { key, value } => Ok(ScSpecTypeDef::Map(Box::new(
+                stellar_xdr::curr::ScSpecTypeMap {
+                    key_type: Box::new(ScSpecTypeDef::try_from(key.as_ref())?),
+                    value_type: Box::new(ScSpecTypeDef::try_from(value.as_ref())?),
+                },
+            ))),
             SpecType::Tuple { values } => {
                 let parsed_types: Result<Vec<_>, _> =
                     values.iter().map(ScSpecTypeDef::try_from).collect();
-                Ok(ScSpecTypeDef::Tuple(Box::new(stellar_xdr::curr::ScSpecTypeTuple {
-                    value_types: parsed_types?.try_into().map_err(|_| anyhow::anyhow!("Tuple too large"))?,
-                })))
+                Ok(ScSpecTypeDef::Tuple(Box::new(
+                    stellar_xdr::curr::ScSpecTypeTuple {
+                        value_types: parsed_types?
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("Tuple too large"))?,
+                    },
+                )))
             }
-            SpecType::BytesN { n } => Ok(ScSpecTypeDef::BytesN(stellar_xdr::curr::ScSpecTypeBytesN { n: *n })),
+            SpecType::BytesN { n } => {
+                Ok(ScSpecTypeDef::BytesN(stellar_xdr::curr::ScSpecTypeBytesN {
+                    n: *n,
+                }))
+            }
             SpecType::Udt { name } => Ok(ScSpecTypeDef::Udt(stellar_xdr::curr::ScSpecTypeUdt {
                 name: name.as_str().try_into()?,
             })),

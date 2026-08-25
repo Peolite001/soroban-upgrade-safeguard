@@ -378,13 +378,21 @@ impl ResolvedConfig {
             .record_version
             .clone()
             .or_else(|| env_string("SAFEGUARD_RECORD_VERSION"))
-            .or_else(|| file_config.as_ref().and_then(|fc| fc.record_version.clone()));
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|fc| fc.record_version.clone())
+            });
 
         let retire_version = args
             .retire_version
             .clone()
             .or_else(|| env_string("SAFEGUARD_RETIRE_VERSION"))
-            .or_else(|| file_config.as_ref().and_then(|fc| fc.retire_version.clone()));
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|fc| fc.retire_version.clone())
+            });
 
         let max_live_versions = args
             .max_live_versions

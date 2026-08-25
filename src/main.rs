@@ -2113,14 +2113,20 @@ fn run_single(
                 created_at: "2026-08-25T00:00:00Z".to_string(),
                 status: soroban_upgrade_safeguard::lineage::LiveStatus::Live,
                 wasm_hash: loader::sha256_hex(&new.bytes),
-                interface_hash: soroban_upgrade_safeguard::interface_hash::InterfaceHash::of_spec(&new_spec).to_hex(),
+                interface_hash: soroban_upgrade_safeguard::interface_hash::InterfaceHash::of_spec(
+                    &new_spec,
+                )
+                .to_hex(),
                 spec_json,
                 storage_schema: None,
                 metadata: std::collections::BTreeMap::new(),
             };
             store.record_version(record)?;
             store.save_to_path(path)?;
-            progress(format!("📜 Lineage store updated and saved to {}", path.display()));
+            progress(format!(
+                "📜 Lineage store updated and saved to {}",
+                path.display()
+            ));
         }
 
         render_to_outputs(
@@ -2667,19 +2673,15 @@ fn compare_contracts(
     }
 
     if let Some(store) = lineage_store {
-        let lineage_report = soroban_upgrade_safeguard::lineage::validate_candidate_against_lineage(
-            new_bytes,
-            &new_spec,
-            store,
-            suppressions,
-            *strict,
-        )?;
-        report.apply_lineage_report(
-            &lineage_report,
-            suppressions,
-            *explain,
-            *strict,
-        );
+        let lineage_report =
+            soroban_upgrade_safeguard::lineage::validate_candidate_against_lineage(
+                new_bytes,
+                &new_spec,
+                store,
+                suppressions,
+                *strict,
+            )?;
+        report.apply_lineage_report(&lineage_report, suppressions, *explain, *strict);
     }
 
     Ok(report)

@@ -1,10 +1,10 @@
 //! Integration tests for the persistent compatibility lineage ledger.
 
-use std::collections::BTreeMap;
 use soroban_upgrade_safeguard::lineage::{
     LineageRecord, LineageStore, LiveStatus, LiveVersionPolicy,
 };
 use soroban_upgrade_safeguard::{compare_wasm_bytes_with_options, CompareOptions};
+use std::collections::BTreeMap;
 
 #[test]
 fn test_lineage_store_persistence_json_and_toml() {
@@ -38,7 +38,13 @@ fn test_lineage_store_persistence_json_and_toml() {
     store.record_version(rec2).unwrap();
 
     // Test JSON save and load
-    let json_path = std::env::temp_dir().join(format!("test_lineage_{}.json", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let json_path = std::env::temp_dir().join(format!(
+        "test_lineage_{}.json",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     store.save_to_path(&json_path).unwrap();
 
     let loaded_json = LineageStore::load_from_path(&json_path).unwrap();
@@ -49,7 +55,13 @@ fn test_lineage_store_persistence_json_and_toml() {
     assert_eq!(loaded_json.records[1].version_id, "v1.1.0");
 
     // Test TOML save and load
-    let toml_path = std::env::temp_dir().join(format!("test_lineage_{}.toml", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let toml_path = std::env::temp_dir().join(format!(
+        "test_lineage_{}.toml",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     store.save_to_path(&toml_path).unwrap();
 
     let loaded_toml = LineageStore::load_from_path(&toml_path).unwrap();

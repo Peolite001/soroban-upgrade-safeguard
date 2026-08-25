@@ -30,19 +30,14 @@ use crate::suppression::SuppressionConfig;
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 /// The deployment or live status of a historical version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LiveStatus {
     /// Active on network; data written by this version must survive upgrade.
+    #[default]
     Live,
     /// Explicitly retired version; no longer validated unless policy dictates.
     Retired,
-}
-
-impl Default for LiveStatus {
-    fn default() -> Self {
-        Self::Live
-    }
 }
 
 /// Governance policy for live historical versions in the store.
@@ -169,9 +164,12 @@ impl LineageStore {
             })?
         };
 
-        store
-            .validate_integrity()
-            .with_context(|| format!("Lineage store at '{}' failed integrity check", path.display()))?;
+        store.validate_integrity().with_context(|| {
+            format!(
+                "Lineage store at '{}' failed integrity check",
+                path.display()
+            )
+        })?;
 
         Ok(store)
     }
@@ -181,8 +179,8 @@ impl LineageStore {
         self.validate_integrity()
             .context("Cannot save lineage store with invalid integrity")?;
 
-        let json_bytes = serde_json::to_vec_pretty(self)
-            .context("Failed to serialize lineage store to JSON")?;
+        let json_bytes =
+            serde_json::to_vec_pretty(self).context("Failed to serialize lineage store to JSON")?;
 
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)
@@ -198,8 +196,9 @@ impl LineageStore {
             nano_suffix
         ));
 
-        let mut file = fs::File::create(&temp_path)
-            .with_context(|| format!("Failed to create temporary file '{}'", temp_path.display()))?;
+        let mut file = fs::File::create(&temp_path).with_context(|| {
+            format!("Failed to create temporary file '{}'", temp_path.display())
+        })?;
         file.write_all(&json_bytes)?;
         file.sync_all()?;
         drop(file);
@@ -263,10 +262,7 @@ impl LineageStore {
             last_order = record.order;
 
             if record.wasm_hash.trim().is_empty() {
-                bail!(
-                    "Lineage record '{}' has empty wasm_hash",
-                    record.version_id
-                );
+                bail!("Lineage record '{}' has empty wasm_hash", record.version_id);
             }
         }
 
@@ -439,9 +435,7 @@ pub fn validate_candidate_against_lineage(
                     Severity::Critical => {
                         critical_count += 1;
                         if suppressions.policy.gate_storage_layout
-                            || finding
-                                .axes
-                                .contains(&CompatibilityAxis::StorageLayout)
+                            || finding.axes.contains(&CompatibilityAxis::StorageLayout)
                             || strict
                         {
                             is_safe = false;
