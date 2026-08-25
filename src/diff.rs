@@ -498,67 +498,97 @@ pub fn compare_env_metadata(
         (None, None) => {}
         (Some(old_meta), Some(new_meta)) if old_meta == new_meta => {}
         (old_meta, new_meta) => {
-            let severity = env_metadata_change_severity(old_meta, new_meta);
+            let (severity, target, message) = analyze_env_metadata_change(old_meta, new_meta);
             report.findings.push(Finding {
                 axes: Vec::new(),
                 severity,
                 category: FindingCategory::Environment.as_str().to_string(),
-                message: format_env_metadata_change(old_meta, new_meta),
+                message,
                 type_name: None,
-                target: None,
+                target: Some(target),
                 root_target: None,
             });
         }
     }
 }
 
-fn env_metadata_change_severity(
+fn analyze_env_metadata_change(
     old: Option<&ContractEnvMeta>,
     new: Option<&ContractEnvMeta>,
-) -> Severity {
-    let old_protocol = old.and_then(ContractEnvMeta::protocol_version);
-    let new_protocol = new.and_then(ContractEnvMeta::protocol_version);
-
-    if old_protocol.is_some() && new_protocol.is_some() && old_protocol != new_protocol {
-        Severity::Warning
-    } else {
-        Severity::Info
-    }
-}
-
-fn format_env_metadata_change(
-    old: Option<&ContractEnvMeta>,
-    new: Option<&ContractEnvMeta>,
-) -> String {
+) -> (Severity, String, String) {
     match (old, new) {
-        (None, Some(new_meta)) => format!(
-            "Contract environment metadata appeared ({}).",
-            new_meta.summary()
+        (None, Some(new_meta)) => (
+            Severity::Info,
+            "env_metadata".to_string(),
+            format!(
+                "Contract environment metadata appeared ({}).",
+                new_meta.summary()
+            ),
         ),
-        (Some(old_meta), None) => format!(
-            "Contract environment metadata was removed (was: {}).",
-            old_meta.summary()
+        (Some(old_meta), None) => (
+            Severity::Warning,
+            "env_metadata".to_string(),
+            format!(
+                "Contract environment metadata was removed (was: {}).",
+                old_meta.summary()
+            ),
         ),
         (Some(old_meta), Some(new_meta)) => {
-            if let (Some(old_proto), Some(new_proto)) =
-                (old_meta.protocol_version(), new_meta.protocol_version())
-            {
-                if old_proto != new_proto {
-                    return format!(
-                        "Soroban protocol interface version changed from {} to {} \
-                         (pre-release {} → {}).",
-                        old_proto,
-                        new_proto,
-                        old_meta.pre_release_version().unwrap_or(0),
-                        new_meta.pre_release_version().unwrap_or(0),
+            let old_proto = old_meta.protocol_version();
+            let new_proto = new_meta.protocol_version();
+            let old_pre = old_meta.pre_release_version().unwrap_or(0);
+            let new_pre = new_meta.pre_release_version().unwrap_or(0);
+
+            if let (Some(old_p), Some(new_p)) = (old_proto, new_proto) {
+                if old_p > new_p {
+                    return (
+                        Severity::Critical,
+                        "protocol_version".to_string(),
+                        format!(
+                            "Soroban protocol version downgraded from {} to {} (pre-release {} → {}).",
+                            old_p, new_p, old_pre, new_pre
+                        ),
                     );
+                } else if old_p < new_p {
+                    return (
+                        Severity::Warning,
+                        "protocol_version".to_string(),
+                        format!(
+                            "Soroban protocol version upgraded from {} to {} (pre-release {} → {}).",
+                            old_p, new_p, old_pre, new_pre
+                        ),
+                    );
+                } else if old_pre != new_pre {
+                    if old_pre > new_pre {
+                        return (
+                            Severity::Warning,
+                            "pre_release_version".to_string(),
+                            format!(
+                                "Soroban protocol pre-release version downgraded from {} to {} (protocol version {} unchanged).",
+                                old_pre, new_pre, old_p
+                            ),
+                        );
+                    } else {
+                        return (
+                            Severity::Info,
+                            "pre_release_version".to_string(),
+                            format!(
+                                "Soroban protocol pre-release version upgraded from {} to {} (protocol version {} unchanged).",
+                                old_pre, new_pre, old_p
+                            ),
+                        );
+                    }
                 }
             }
 
-            format!(
-                "Contract environment metadata changed from {} to {}.",
-                old_meta.summary(),
-                new_meta.summary()
+            (
+                Severity::Info,
+                "env_metadata".to_string(),
+                format!(
+                    "Contract environment metadata changed from {} to {}.",
+                    old_meta.summary(),
+                    new_meta.summary()
+                ),
             )
         }
         (None, None) => unreachable!("compare_env_metadata filters identical/absent pairs"),
@@ -2407,9 +2437,7 @@ mod tests {
         let finding = &report.findings[0];
         assert_eq!(finding.severity, Severity::Warning);
         assert_eq!(finding.category, FindingCategory::Environment.as_str());
-        assert!(finding
-            .message
-            .contains("protocol interface version changed"));
+        assert!(finding.message.contains("upgraded from 21 to 22"));
     }
 
     #[test]
@@ -3436,5 +3464,106 @@ mod tests {
             "Message was: {}",
             fc.message
         );
+    }
+
+    #[test]
+    fn protocol_version_upgrade_emits_warning_with_target() {
+        let old_meta = make_env_meta(20, 0);
+        let new_meta = make_env_meta(21, 0);
+        let mut report = DiffReport::default();
+
+        compare_env_metadata(Some(&old_meta), Some(&new_meta), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.category, "Environment");
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.target.as_deref(), Some("protocol_version"));
+        assert!(f.message.contains("upgraded from 20 to 21"));
+    }
+
+    #[test]
+    fn protocol_version_downgrade_emits_critical_with_target() {
+        let old_meta = make_env_meta(21, 0);
+        let new_meta = make_env_meta(20, 0);
+        let mut report = DiffReport::default();
+
+        compare_env_metadata(Some(&old_meta), Some(&new_meta), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.category, "Environment");
+        assert_eq!(f.severity, Severity::Critical);
+        assert_eq!(f.target.as_deref(), Some("protocol_version"));
+        assert!(f.message.contains("downgraded from 21 to 20"));
+    }
+
+    #[test]
+    fn prerelease_downgrade_emits_warning_with_target() {
+        let old_meta = make_env_meta(21, 2);
+        let new_meta = make_env_meta(21, 1);
+        let mut report = DiffReport::default();
+
+        compare_env_metadata(Some(&old_meta), Some(&new_meta), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.category, "Environment");
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.target.as_deref(), Some("pre_release_version"));
+        assert!(f
+            .message
+            .contains("pre-release version downgraded from 2 to 1"));
+    }
+
+    #[test]
+    fn prerelease_upgrade_emits_info_with_target() {
+        let old_meta = make_env_meta(21, 1);
+        let new_meta = make_env_meta(21, 2);
+        let mut report = DiffReport::default();
+
+        compare_env_metadata(Some(&old_meta), Some(&new_meta), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.category, "Environment");
+        assert_eq!(f.severity, Severity::Info);
+        assert_eq!(f.target.as_deref(), Some("pre_release_version"));
+        assert!(f
+            .message
+            .contains("pre-release version upgraded from 1 to 2"));
+    }
+
+    #[test]
+    fn env_metadata_appearance_and_removal() {
+        let meta = make_env_meta(20, 0);
+
+        let mut report_app = DiffReport::default();
+        compare_env_metadata(None, Some(&meta), &mut report_app);
+        assert_eq!(report_app.findings.len(), 1);
+        assert_eq!(report_app.findings[0].severity, Severity::Info);
+        assert_eq!(
+            report_app.findings[0].target.as_deref(),
+            Some("env_metadata")
+        );
+        assert!(report_app.findings[0].message.contains("appeared"));
+
+        let mut report_rem = DiffReport::default();
+        compare_env_metadata(Some(&meta), None, &mut report_rem);
+        assert_eq!(report_rem.findings.len(), 1);
+        assert_eq!(report_rem.findings[0].severity, Severity::Warning);
+        assert_eq!(
+            report_rem.findings[0].target.as_deref(),
+            Some("env_metadata")
+        );
+        assert!(report_rem.findings[0].message.contains("removed"));
+    }
+
+    fn make_env_meta(protocol: u32, pre_release: u32) -> ContractEnvMeta {
+        use stellar_xdr::curr::ScEnvMetaEntry;
+        let version = ((protocol as u64) << 32) | (pre_release as u64);
+        ContractEnvMeta {
+            entries: vec![ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(version)],
+        }
     }
 }
