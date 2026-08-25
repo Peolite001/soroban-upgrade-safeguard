@@ -605,6 +605,7 @@ fn process_job(
             explain: job.overrides.explain,
             strict,
             storage_schemas: None,
+            lineage_store: None,
         },
     ) {
         Ok(report) => {

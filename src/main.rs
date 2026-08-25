@@ -344,6 +344,22 @@ struct Args {
     /// reference can be pinned afterward. Off by default.
     #[arg(long)]
     allow_oci_tags: bool,
+
+    /// Path to a persistent lineage store (JSON/TOML) tracking historical versions.
+    #[arg(long, value_name = "PATH")]
+    lineage_store: Option<PathBuf>,
+
+    /// Record candidate build as a new version in the lineage store with this tag.
+    #[arg(long, value_name = "VERSION_ID")]
+    record_version: Option<String>,
+
+    /// Mark an existing historical version as retired in the lineage store.
+    #[arg(long, value_name = "VERSION_ID")]
+    retire_version: Option<String>,
+
+    /// Maximum live historical versions to validate candidate against.
+    #[arg(long, value_name = "N")]
+    max_live_versions: Option<usize>,
 }
 
 /// Build the remote-fetch policy for `https://` inputs from the top-level CLI flags.
@@ -1429,6 +1445,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                                         &storage_schemas.old,
                                         &storage_schemas.new,
                                     )),
+                                    lineage_store: None,
                                 },
                             )?;
                         report.set_no_timestamp(settings.no_timestamp.value);
@@ -1449,6 +1466,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                                 contract_id: None,
                                 rpc_url: None,
                                 rpc_headers: &args.rpc_headers,
+                                lineage_store: None,
                             },
                             progress,
                         )
@@ -2039,12 +2057,25 @@ fn run_single(
 
         let new = load_wasm_input(new_wasm_path, &remote_config, &oci_config, progress)?;
 
-        if !suppressions.rules.is_empty() {
-            progress(format!(
-                "\n🔕 {} suppression rule(s) loaded",
-                suppressions.rules.len()
-            ));
-        }
+        let mut store_opt = if let Some(ref path) = args.lineage_store {
+            let mut store = if path.exists() {
+                soroban_upgrade_safeguard::lineage::LineageStore::load_from_path(path)?
+            } else {
+                soroban_upgrade_safeguard::lineage::LineageStore::new(
+                    args.contract_id.clone(),
+                    args.contract_id.clone(),
+                )
+            };
+            if let Some(max_v) = args.max_live_versions {
+                store.policy.max_live_versions = Some(max_v);
+            }
+            if let Some(ref ret_v) = args.retire_version {
+                store.retire_version(ret_v)?;
+            }
+            Some(store)
+        } else {
+            None
+        };
 
         let safety_report = compare_contracts(
             &ContractComparison {
@@ -2061,9 +2092,36 @@ fn run_single(
                 contract_id: old_source,
                 rpc_url: args.rpc_url.as_deref(),
                 rpc_headers: &args.rpc_headers,
+                lineage_store: store_opt.as_ref(),
             },
             progress,
         )?;
+
+        if let (Some(ref mut store), Some(ref version_id), Some(ref path)) =
+            (&mut store_opt, &args.record_version, &args.lineage_store)
+        {
+            let new_meta = parser::extract_metadata(&new.bytes)?;
+            let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
+            let extracted = ExtractedSpec::new(&new.path, &new_meta, &new_spec);
+            let spec_json = canonical_json_bytes(&extracted)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok());
+
+            let record = soroban_upgrade_safeguard::lineage::LineageRecord {
+                version_id: version_id.clone(),
+                order: 0,
+                created_at: "2026-08-25T00:00:00Z".to_string(),
+                status: soroban_upgrade_safeguard::lineage::LiveStatus::Live,
+                wasm_hash: loader::sha256_hex(&new.bytes),
+                interface_hash: soroban_upgrade_safeguard::interface_hash::InterfaceHash::of_spec(&new_spec).to_hex(),
+                spec_json,
+                storage_schema: None,
+                metadata: std::collections::BTreeMap::new(),
+            };
+            store.record_version(record)?;
+            store.save_to_path(path)?;
+            progress(format!("📜 Lineage store updated and saved to {}", path.display()));
+        }
 
         render_to_outputs(
             &safety_report,
@@ -2394,14 +2452,14 @@ struct BatchPair {
 }
 
 impl From<manifest::ResolvedPair> for BatchPair {
-    fn from(pair: manifest::ResolvedPair) -> Self {
+    fn from(p: manifest::ResolvedPair) -> Self {
         Self {
-            name: pair.name,
-            old: pair.old,
-            new: pair.new,
-            old_storage_schema: pair.old_storage_schema,
-            new_storage_schema: pair.new_storage_schema,
-            settings: pair.settings,
+            name: p.name,
+            old: p.old,
+            new: p.new,
+            old_storage_schema: p.old_storage_schema,
+            new_storage_schema: p.new_storage_schema,
+            settings: p.settings,
         }
     }
 }
@@ -2420,6 +2478,7 @@ struct ContractComparison<'a> {
     contract_id: Option<&'a str>,
     rpc_url: Option<&'a str>,
     rpc_headers: &'a [String],
+    lineage_store: Option<&'a soroban_upgrade_safeguard::lineage::LineageStore>,
 }
 
 struct PairStorageSchemas {
@@ -2475,6 +2534,7 @@ fn compare_contracts(
         contract_id,
         rpc_url,
         rpc_headers,
+        lineage_store,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -2604,6 +2664,22 @@ fn compare_contracts(
 
     if report.empirical_findings.iter().any(|ef| !ef.is_success) {
         report.is_safe = false;
+    }
+
+    if let Some(store) = lineage_store {
+        let lineage_report = soroban_upgrade_safeguard::lineage::validate_candidate_against_lineage(
+            new_bytes,
+            &new_spec,
+            store,
+            suppressions,
+            *strict,
+        )?;
+        report.apply_lineage_report(
+            &lineage_report,
+            suppressions,
+            *explain,
+            *strict,
+        );
     }
 
     Ok(report)

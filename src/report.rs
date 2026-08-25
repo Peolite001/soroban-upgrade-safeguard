@@ -313,6 +313,73 @@ impl SafetyReport {
         }
     }
 
+    pub fn apply_lineage_report(
+        &mut self,
+        lineage_report: &crate::lineage::LineageValidationReport,
+        suppressions: &SuppressionConfig,
+        explain: bool,
+        strict: bool,
+    ) {
+        if !lineage_report.is_safe {
+            self.is_safe = false;
+        }
+
+        for hist in &lineage_report.historical_findings {
+            let category = format!("Historical Lineage Break ({})", hist.historical_version_id);
+            let finding = hist.finding.clone();
+            let rule = suppressions.matching_rule(&finding);
+            let suppressed = rule.is_some();
+
+            match finding.severity {
+                crate::diff::Severity::Critical => {
+                    self.critical_count += 1;
+                    if suppressed {
+                        self.suppressed_critical_count += 1;
+                    }
+                }
+                crate::diff::Severity::Warning => {
+                    self.warning_count += 1;
+                    if suppressed {
+                        self.suppressed_warning_count += 1;
+                    }
+                }
+                crate::diff::Severity::Info => {
+                    self.info_count += 1;
+                    if suppressed {
+                        self.suppressed_info_count += 1;
+                    }
+                }
+            }
+
+            self.total_findings += 1;
+            if suppressed {
+                self.suppressed_count += 1;
+            } else {
+                for axis in &finding.axes {
+                    if self.gated_axes.contains(axis) || strict {
+                        self.is_safe = false;
+                        self.axis_verdicts.insert(*axis, AxisStatus::Failed);
+                    }
+                }
+            }
+
+            self.findings_by_category
+                .entry(category)
+                .or_default()
+                .push(ReportedFinding {
+                    rule_id: "historical_lineage_break".to_string(),
+                    axes: finding.axes.clone(),
+                    finding,
+                    suppressed,
+                    suppression_reason: rule.and_then(|r| r.reason.clone()),
+                    remediation: explain.then(|| {
+                        "Update candidate build to maintain backward compatibility with this historical version."
+                            .to_string()
+                    }),
+                });
+        }
+    }
+
     pub fn critical_count(&self) -> usize {
         self.critical_count
     }

@@ -53,10 +53,7 @@ pub mod error;
 #[cfg(not(feature = "unstable"))]
 mod error;
 
-#[cfg(feature = "unstable")]
 pub mod interface_hash;
-#[cfg(not(feature = "unstable"))]
-mod interface_hash;
 
 #[cfg(feature = "unstable")]
 pub mod jsonl;
@@ -153,6 +150,11 @@ pub mod suppression;
 #[cfg(not(feature = "unstable"))]
 mod suppression;
 
+#[cfg(feature = "unstable")]
+pub mod lineage;
+#[cfg(not(feature = "unstable"))]
+pub mod lineage;
+
 // Stable public API exports at the root
 pub use crate::attestation::{
     sign_statement, verify_artifacts, verify_signatures, ArtifactDigest, AttestationSigner,
@@ -163,6 +165,10 @@ pub use crate::call_abi::{
     CallAbiBreak, CallAbiCompatibility, CallDirection, DirectionalCallVerdict,
 };
 pub use crate::diff::{Finding, Severity};
+pub use crate::lineage::{
+    validate_candidate_against_lineage, HistoricalFinding, LineageRecord, LineageStore,
+    LineageValidationReport, LiveStatus, LiveVersionPolicy,
+};
 pub use crate::oci::{
     OciArtifact, OciArtifactKind, OciFetchConfig, OciReference, OciSelector,
     MEDIA_TYPE_EXTRACTED_SPEC, MEDIA_TYPE_WASM,
@@ -252,6 +258,7 @@ pub struct CompareOptions<'a> {
     pub explain: bool,
     pub strict: bool,
     pub storage_schemas: Option<(&'a StorageSchema, &'a StorageSchema)>,
+    pub lineage_store: Option<&'a lineage::LineageStore>,
 }
 
 /// Compare two Soroban contract builds supplied as raw WASM byte slices with options.
@@ -315,6 +322,22 @@ pub fn compare_wasm_bytes_with_options(
         );
         safety_report.apply_storage_schema_comparison(
             &storage_comparison,
+            suppressions,
+            options.explain,
+            options.strict,
+        );
+    }
+
+    if let Some(store) = options.lineage_store {
+        let lineage_report = lineage::validate_candidate_against_lineage(
+            new_wasm,
+            &new_spec,
+            store,
+            suppressions,
+            options.strict,
+        )?;
+        safety_report.apply_lineage_report(
+            &lineage_report,
             suppressions,
             options.explain,
             options.strict,
