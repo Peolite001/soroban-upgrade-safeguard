@@ -2150,25 +2150,6 @@ fn run_single(
             None
         };
 
-        let safety_report = compare_contracts(
-            &ContractComparison {
-                old_bytes: &old.bytes,
-                old_path: &old.path,
-                new_bytes: &new.bytes,
-                new_path: &new.path,
-                suppressions,
-                explain: args.explain,
-                strict: args.strict,
-                no_timestamp: args.no_timestamp,
-                empirical: args.empirical || args.empirical_file.is_some(),
-                empirical_file: args.empirical_file.as_deref(),
-                contract_id: old_source,
-                rpc_url: args.rpc_url.as_deref(),
-                rpc_headers: &args.rpc_headers,
-                lineage_store: store_opt.as_ref(),
-            },
-            progress,
-        )?;
         let safety_report = if let Some(lockfile_path) = &args.interface_lockfile {
             let lockfile_json = std::fs::read_to_string(lockfile_path).with_context(|| {
                 format!(
@@ -2188,6 +2169,7 @@ fn run_single(
                     explain: args.explain,
                     strict: args.strict,
                     storage_schemas: None,
+                    lineage_store: store_opt.as_ref(),
                 },
             )?
         } else {
@@ -2215,6 +2197,7 @@ fn run_single(
                     contract_id: old_source,
                     rpc_url: args.rpc_url.as_deref(),
                     rpc_headers: &args.rpc_headers,
+                    lineage_store: store_opt.as_ref(),
                 },
                 progress,
             )?

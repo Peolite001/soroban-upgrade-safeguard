@@ -407,6 +407,8 @@ impl ExtractedSpec {
 
         Ok(spec)
     }
+}
+
 /// A deterministic, reviewable snapshot of a contract's exported interface.
 ///
 /// Build-specific provenance is intentionally omitted: changing a source path
