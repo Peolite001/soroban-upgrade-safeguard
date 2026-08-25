@@ -116,6 +116,22 @@ pub struct Args {
     /// detection). Overrides `[limits]` and the default.
     #[arg(long, value_name = "N")]
     pub max_walk_depth: Option<usize>,
+
+    /// Path to a persistent lineage store (JSON/TOML) tracking historical versions.
+    #[arg(long, value_name = "PATH")]
+    pub lineage_store: Option<PathBuf>,
+
+    /// Record candidate build as a new version in the lineage store with this tag.
+    #[arg(long, value_name = "VERSION_ID")]
+    pub record_version: Option<String>,
+
+    /// Mark an existing historical version as retired in the lineage store.
+    #[arg(long, value_name = "VERSION_ID")]
+    pub retire_version: Option<String>,
+
+    /// Maximum live historical versions to validate candidate against.
+    #[arg(long, value_name = "N")]
+    pub max_live_versions: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -134,6 +150,10 @@ pub struct FileConfig {
     pub new_dir: Option<PathBuf>,
     pub wasm_paths: Option<Vec<PathBuf>>,
     pub limits: Option<LimitsConfig>,
+    pub lineage_store: Option<PathBuf>,
+    pub record_version: Option<String>,
+    pub retire_version: Option<String>,
+    pub max_live_versions: Option<usize>,
     #[serde(default, rename = "suppress")]
     pub suppress: Vec<SuppressionRule>,
 }
@@ -154,6 +174,10 @@ pub struct ResolvedConfig {
     pub policy: ResourcePolicy,
     pub suppressions: SuppressionConfig,
     pub expected_wasm_hash: Option<String>,
+    pub lineage_store: Option<PathBuf>,
+    pub record_version: Option<String>,
+    pub retire_version: Option<String>,
+    pub max_live_versions: Option<usize>,
 }
 
 impl ResolvedConfig {
@@ -339,6 +363,42 @@ impl ResolvedConfig {
             );
         }
 
+        let lineage_store = args
+            .lineage_store
+            .clone()
+            .or_else(|| env_path("SAFEGUARD_LINEAGE_STORE"))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|fc| fc.lineage_store.clone())
+                    .map(|p| resolve_path(base_dir, p))
+            });
+
+        let record_version = args
+            .record_version
+            .clone()
+            .or_else(|| env_string("SAFEGUARD_RECORD_VERSION"))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|fc| fc.record_version.clone())
+            });
+
+        let retire_version = args
+            .retire_version
+            .clone()
+            .or_else(|| env_string("SAFEGUARD_RETIRE_VERSION"))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|fc| fc.retire_version.clone())
+            });
+
+        let max_live_versions = args
+            .max_live_versions
+            .or_else(|| env_usize("SAFEGUARD_MAX_LIVE_VERSIONS"))
+            .or_else(|| file_config.as_ref().and_then(|fc| fc.max_live_versions));
+
         Ok(Self {
             wasm_paths,
             contract_id,
@@ -354,6 +414,10 @@ impl ResolvedConfig {
             policy,
             suppressions,
             expected_wasm_hash: args.expected_wasm_hash.clone(),
+            lineage_store,
+            record_version,
+            retire_version,
+            max_live_versions,
         })
     }
 
