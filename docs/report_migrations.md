@@ -130,6 +130,10 @@ instead.
 
 ## Adding a new migration
 
+For the full compatibility contract covering stable fields, additive fields,
+enum values, rule IDs, and consumer guidance, see
+[Report Schema Compatibility Policy](report_schema_compatibility.md).
+
 When [`REPORT_SCHEMA_VERSION`](../src/render.rs) needs to move to `N+1`:
 
 1. Bump `REPORT_SCHEMA_VERSION`.
