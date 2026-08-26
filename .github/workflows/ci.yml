@@ -35,6 +35,22 @@ jobs:
       - name: Check Public API Changes
         run: python scripts/check_api_changes.py
 
+      - name: Validate workflow example YAML syntax
+        run: |
+          python3 - <<'EOF'
+          import sys, pathlib, yaml
+          errors = []
+          for p in pathlib.Path("docs/workflow-examples").glob("*.yml"):
+              try:
+                  yaml.safe_load_all(p.read_text())
+              except yaml.YAMLError as e:
+                  errors.append(f"{p}: {e}")
+          if errors:
+              print("\n".join(errors), file=sys.stderr)
+              sys.exit(1)
+          print(f"OK: {len(list(pathlib.Path('docs/workflow-examples').glob('*.yml')))} workflow example(s) parsed cleanly.")
+          EOF
+
   test:
     strategy:
       fail-fast: false

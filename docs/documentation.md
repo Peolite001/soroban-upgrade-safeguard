@@ -75,6 +75,8 @@ Scope:  Exported interface + environment metadata only — storage layout is NOT
 
 ## Installation
 
+For a full breakdown of which Rust toolchain, Soroban protocol metadata version, and report schema version are supported by each release, see the [Release Compatibility Table](compatibility-table.md).
+
 Install the published crate from crates.io:
 
 ```bash
@@ -1081,6 +1083,11 @@ breaking change to the shape will be called out in the release notes. Consumers
 should ignore unknown fields so additive changes do not break them. A firmer
 "additive changes only within a major version" guarantee is intended once the
 crate reaches 1.0.
+
+For the full field-level compatibility contract — which fields are stable,
+additive, conditional, or deprecated, how to handle unknown fields, and how to
+handle unsupported future versions — see the
+[Report Schema Compatibility Policy](report_schema_compatibility.md).
 
 ### Upgrading an older saved report
 
