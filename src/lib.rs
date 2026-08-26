@@ -81,6 +81,11 @@ pub mod mapper;
 mod mapper;
 
 #[cfg(feature = "unstable")]
+pub mod migration;
+#[cfg(not(feature = "unstable"))]
+mod migration;
+
+#[cfg(feature = "unstable")]
 pub mod oci;
 #[cfg(not(feature = "unstable"))]
 mod oci;
