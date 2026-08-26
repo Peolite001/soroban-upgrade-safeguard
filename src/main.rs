@@ -1633,6 +1633,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         }
 
         results.push(BatchResult::Error {
+            id: gap.name.clone(),
             name: gap.name,
             old_path: gap.old_path,
             new_path: None,
@@ -1647,6 +1648,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
     // Process each regular pair with error-handling (per-pair failures do not abort the batch)
     for (i, pair) in pairs.iter().enumerate() {
         let contract_name = pair.name.clone();
+        let contract_id = pair.id.clone();
         let settings = &pair.settings;
         let pair_suppressions = suppressions_for_pair(settings, &mut config_cache)?;
         let explain = settings.explain.value;
@@ -1785,6 +1787,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         if let Some(error) = pair_error {
             results.push(BatchResult::Error {
                 name: contract_name,
+                id: contract_id,
                 old_path: pair.old.clone(),
                 new_path: Some(pair.new.clone()),
                 old_storage_schema: pair.old_storage_schema.clone(),
@@ -1795,6 +1798,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         } else {
             results.push(BatchResult::Success {
                 name: contract_name,
+                id: contract_id,
                 old_path: pair.old.clone(),
                 new_path: pair.new.clone(),
                 old_storage_schema: pair.old_storage_schema.clone(),
@@ -1924,6 +1928,9 @@ fn synthesize_error_report(
 enum BatchResult {
     Success {
         name: String,
+        /// Stable identifier for CI annotations and reruns. See
+        /// [`manifest::ResolvedPair::id`].
+        id: String,
         old_path: PathBuf,
         new_path: PathBuf,
         old_storage_schema: Option<PathBuf>,
@@ -1932,6 +1939,7 @@ enum BatchResult {
     },
     Error {
         name: String,
+        id: String,
         old_path: PathBuf,
         new_path: Option<PathBuf>,
         old_storage_schema: Option<PathBuf>,
@@ -1945,6 +1953,12 @@ impl BatchResult {
     fn name(&self) -> &str {
         match self {
             Self::Success { name, .. } | Self::Error { name, .. } => name,
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Self::Success { id, .. } | Self::Error { id, .. } => id,
         }
     }
 
@@ -2003,6 +2017,7 @@ fn render_batch_summary(
                 for result in results {
                     let mut entry = serde_json::json!({
                         "name": result.name(),
+                        "id": result.id(),
                         "coverage": result.coverage(),
                         "report": result.report().to_json(),
                     });
@@ -2723,6 +2738,11 @@ fn load_wasm_input(
 /// per-pair settings need no special-casing there.
 struct BatchPair {
     name: String,
+    /// Stable identifier for CI annotations and reruns. See
+    /// [`manifest::ResolvedPair::id`]; directory-scan mode has no manifest to
+    /// read an explicit one from, so it always falls back to `name`, the same
+    /// deterministic rule manifest mode uses when `id` is omitted.
+    id: String,
     old: PathBuf,
     new: PathBuf,
     old_storage_schema: Option<PathBuf>,
@@ -2734,6 +2754,7 @@ impl From<manifest::ResolvedPair> for BatchPair {
     fn from(p: manifest::ResolvedPair) -> Self {
         Self {
             name: p.name,
+            id: p.id,
             old: p.old,
             new: p.new,
             old_storage_schema: p.old_storage_schema,
@@ -3120,7 +3141,8 @@ fn scan_directories(
                     .clone()
                     .unwrap_or_else(|| filename.to_string_lossy().to_string());
                 pairs.push(BatchPair {
-                    name: derived,
+                    name: derived.clone(),
+                    id: derived,
                     old: path,
                     new: new_path,
                     old_storage_schema: None,

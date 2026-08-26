@@ -166,6 +166,12 @@ pub struct RawPair {
     /// Report name. Defaults to the file name of `new`.
     #[serde(default)]
     pub name: Option<String>,
+    /// Stable identifier for CI annotations and reruns, independent of
+    /// `name`. Defaults to the pair's resolved `name` when omitted. Must be
+    /// non-empty and contain only ASCII letters, digits, `-`, `_`, and `.`
+    /// when given explicitly; must be unique across the whole composition.
+    #[serde(default)]
+    pub id: Option<String>,
     /// Base directory for this pair's relative `old`/`new`.
     #[serde(default)]
     pub base_dir: Option<PathBuf>,
@@ -356,6 +362,9 @@ impl ResolvedSettings {
 pub struct ResolvedPair {
     /// Report identity: the explicit `name`, else the file name of `new`.
     pub name: String,
+    /// Stable identifier for CI annotations and reruns: the explicit `id`,
+    /// else this pair's resolved `name`. Unique across the whole composition.
+    pub id: String,
     pub old: PathBuf,
     pub new: PathBuf,
     /// Optional schema paths, resolved against the manifest that declared the pair.
@@ -566,12 +575,24 @@ fn visit(path: &Path, walk: &mut Walk, stack: &mut Vec<PathBuf>, depth: usize) -
 }
 
 /// Apply the precedence chain to every walked pair and check identities.
+/// Whether `id` is a well-formed pair ID: non-empty, and restricted to
+/// characters safe in CI annotations, file names, and shell arguments —
+/// ASCII letters, digits, `-`, `_`, and `.`. (An empty string vacuously
+/// passes the character check alone, hence the explicit `is_empty` guard.)
+fn is_valid_pair_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 fn fold_pairs(walk: &Walk, cli: &CliSettings) -> Result<Vec<ResolvedPair>> {
     let mut resolved = Vec::with_capacity(walk.pairs.len());
     // Duplicate detection runs before any comparison, so a collision fails the
     // run with nothing written — the old code bailed mid-loop, after earlier
     // pairs had already produced report files.
     let mut names: HashMap<String, PathBuf> = HashMap::new();
+    let mut ids: HashMap<String, PathBuf> = HashMap::new();
 
     for walked in &walk.pairs {
         let pair_layer = Layer {
@@ -615,8 +636,42 @@ fn fold_pairs(walk: &Walk, cli: &CliSettings) -> Result<Vec<ResolvedPair>> {
         }
         names.insert(name.clone(), walked.defined_in.clone());
 
+        // Pair ID: explicit `id`, validated, else the resolved `name`. The
+        // fallback is not itself re-validated against the ID charset — it
+        // reuses `name` verbatim, exactly as `name` has always behaved, so an
+        // existing manifest that never sets `id` cannot start failing here.
+        let id = match &walked.raw.id {
+            Some(explicit) => {
+                if !is_valid_pair_id(explicit) {
+                    bail!(
+                        "Invalid pair id '{}' for '{}' in {}.\n  \
+                         IDs must be non-empty and contain only ASCII letters, digits, \
+                         '-', '_', and '.'.",
+                        explicit,
+                        name,
+                        walked.defined_in.display()
+                    );
+                }
+                explicit.clone()
+            }
+            None => name.clone(),
+        };
+
+        if let Some(previous) = ids.get(&id) {
+            bail!(
+                "Duplicate pair id '{}' in the manifest composition.\n  \
+                 first defined in: {}\n  also defined in:  {}\n\
+                 Give one of them an explicit `id` so reruns and CI annotations stay unambiguous.",
+                id,
+                previous.display(),
+                walked.defined_in.display()
+            );
+        }
+        ids.insert(id.clone(), walked.defined_in.clone());
+
         resolved.push(ResolvedPair {
             name,
+            id,
             old,
             new,
             old_storage_schema: walked
@@ -876,6 +931,7 @@ impl ResolvedManifest {
         out.push_str(&format!("\npairs ({}):\n", self.pairs.len()));
         for (index, pair) in self.pairs.iter().enumerate() {
             out.push_str(&format!("\n  [{}] {}\n", index + 1, pair.name));
+            out.push_str(&format!("      id:         {}\n", pair.id));
             out.push_str(&format!(
                 "      defined in: {}\n",
                 pair.defined_in.display()
@@ -929,6 +985,7 @@ impl ResolvedPair {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "name": self.name,
+            "id": self.id,
             "defined_in": self.defined_in.display().to_string(),
             "old": self.old.display().to_string(),
             "new": self.new.display().to_string(),
@@ -1660,6 +1717,262 @@ mod tests {
         );
         assert!(error.contains("frag.toml"), "first file missing: {error}");
         assert!(error.contains("root.toml"), "second file missing: {error}");
+    }
+
+    // ── pair IDs ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn id_defaults_to_the_resolved_name_when_omitted() {
+        let dir = temp_dir("id-default");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old  = "a_v1.wasm"
+            new  = "a_v2.wasm"
+            name = "token"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].name, "token");
+        assert_eq!(resolved.pairs[0].id, "token");
+    }
+
+    #[test]
+    fn id_defaults_to_the_new_file_name_when_neither_name_nor_id_is_set() {
+        let dir = temp_dir("id-default-filename");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].name, "a_v2.wasm");
+        assert_eq!(resolved.pairs[0].id, "a_v2.wasm");
+    }
+
+    #[test]
+    fn explicit_id_is_independent_of_name() {
+        let dir = temp_dir("id-explicit");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old  = "a_v1.wasm"
+            new  = "a_v2.wasm"
+            name = "Token (v1 -> v2)"
+            id   = "token-v1-v2"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].name, "Token (v1 -> v2)");
+        assert_eq!(resolved.pairs[0].id, "token-v1-v2");
+    }
+
+    #[test]
+    fn duplicate_explicit_ids_name_both_files() {
+        let dir = temp_dir("id-dupe");
+        write(
+            &dir,
+            "frag.toml",
+            r#"
+            [[pairs]]
+            old  = "a_v1.wasm"
+            new  = "a_v2.wasm"
+            name = "token-a"
+            id   = "shared-id"
+            "#,
+        );
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            include = ["frag.toml"]
+
+            [[pairs]]
+            old  = "b_v1.wasm"
+            new  = "b_v2.wasm"
+            name = "token-b"
+            id   = "shared-id"
+            "#,
+        );
+
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(
+            error.contains("Duplicate pair id 'shared-id'"),
+            "got: {error}"
+        );
+        assert!(error.contains("frag.toml"), "first file missing: {error}");
+        assert!(error.contains("root.toml"), "second file missing: {error}");
+    }
+
+    #[test]
+    fn an_explicit_id_colliding_with_another_pairs_fallback_id_is_rejected() {
+        // Pair 1 has no explicit id, so its id falls back to its name "dup".
+        // Pair 2 explicitly claims "dup" too -> must still be caught.
+        let dir = temp_dir("id-dupe-fallback");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old  = "a_v1.wasm"
+            new  = "a_v2.wasm"
+            name = "dup"
+
+            [[pairs]]
+            old  = "b_v1.wasm"
+            new  = "b_v2.wasm"
+            name = "token-b"
+            id   = "dup"
+            "#,
+        );
+
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Duplicate pair id 'dup'"), "got: {error}");
+    }
+
+    #[test]
+    fn empty_id_is_rejected() {
+        let dir = temp_dir("id-empty");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            id  = ""
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Invalid pair id"), "got: {error}");
+    }
+
+    #[test]
+    fn id_with_whitespace_is_rejected() {
+        let dir = temp_dir("id-whitespace");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            id  = "has space"
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(
+            error.contains("Invalid pair id 'has space'"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn id_with_disallowed_characters_is_rejected() {
+        let dir = temp_dir("id-bad-chars");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            id  = "token/v1"
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Invalid pair id 'token/v1'"), "got: {error}");
+    }
+
+    #[test]
+    fn id_allows_letters_digits_dash_underscore_dot() {
+        let dir = temp_dir("id-valid-charset");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            id  = "Token-v1.2_beta"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].id, "Token-v1.2_beta");
+    }
+
+    #[test]
+    fn a_name_with_characters_invalid_for_id_still_works_as_a_fallback() {
+        // `name` has no charset restriction; a fallback id derived from it
+        // must not be re-validated against the id charset, or an existing
+        // manifest that never set `id` could start failing.
+        let dir = temp_dir("id-fallback-not-revalidated");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old  = "a_v1.wasm"
+            new  = "a_v2.wasm"
+            name = "token (legacy name with spaces)"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default())
+            .expect("a fallback id derived from an unrestricted name must not be rejected");
+        assert_eq!(resolved.pairs[0].id, "token (legacy name with spaces)");
+    }
+
+    #[test]
+    fn ids_are_unique_across_a_json_manifest_too() {
+        let dir = temp_dir("id-json-dupe");
+        let root = write(
+            &dir,
+            "root.json",
+            r#"{"pairs":[
+                {"old":"a_v1.wasm","new":"a_v2.wasm","name":"a","id":"same"},
+                {"old":"b_v1.wasm","new":"b_v2.wasm","name":"b","id":"same"}
+            ]}"#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Duplicate pair id 'same'"), "got: {error}");
+    }
+
+    #[test]
+    fn ids_accepted_in_a_json_manifest() {
+        let dir = temp_dir("id-json-ok");
+        let root = write(
+            &dir,
+            "root.json",
+            r#"{"pairs":[{"old":"a_v1.wasm","new":"a_v2.wasm","name":"a","id":"a-1"}]}"#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].id, "a-1");
+    }
+
+    #[test]
+    fn resolved_pair_json_includes_id() {
+        let dir = temp_dir("id-json-output");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            id  = "a-1"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        let json = resolved.to_json();
+        assert_eq!(json["pairs"][0]["id"], "a-1");
     }
 
     #[test]

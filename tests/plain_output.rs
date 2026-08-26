@@ -47,8 +47,11 @@ fn write_manifest(name: &str, contents: &str) -> PathBuf {
 
 #[test]
 fn plainify_converts_markers_and_strips_decorative_unicode() {
+    // 🔕 is always emitted as a prefix immediately before the literal text
+    // "[SUPPRESSED]" (see render.rs); asciify_markers strips the redundant
+    // emoji rather than inserting the bracketed label itself in that case.
     let input = "🔴 critical\n🟡 warn\n🔵 info\n✅ pass\n❌ fail\n⚠️ warning\n\
-                 🔕 suppressed\n    ↳ guidance: fix it\n────────\n";
+                 🔕 [SUPPRESSED] finding\n    ↳ guidance: fix it\n────────\n";
     let out = plainify(input);
     assert_no_decoration(&out, "plainify output");
     assert!(out.contains("[CRITICAL]"));
@@ -57,9 +60,18 @@ fn plainify_converts_markers_and_strips_decorative_unicode() {
     assert!(out.contains("[PASS]"));
     assert!(out.contains("[FAIL]"));
     assert!(out.contains("[WARNING]"));
-    assert!(out.contains("[SUPPRESSED]"));
+    assert!(out.contains("[SUPPRESSED] finding"));
     assert!(out.contains("-> guidance: fix it"));
     assert!(out.contains("--------"));
+}
+
+#[test]
+fn plainify_converts_a_standalone_suppressed_marker_too() {
+    // A bare 🔕 with no trailing space (not the "🔕 " prefix form above)
+    // converts to the bracketed label directly.
+    let out = plainify("🔕\n");
+    assert_no_decoration(&out, "plainify output");
+    assert!(out.contains("[SUPPRESSED]"));
 }
 
 #[test]
@@ -147,7 +159,8 @@ fn plain_report_body_is_decoration_free_even_without_quiet() {
 
 #[test]
 fn plain_file_output_is_fully_decoration_free() {
-    let tmp = std::env::temp_dir().join(format!("safeguard_plain_file_test_{}", std::process::id()));
+    let tmp =
+        std::env::temp_dir().join(format!("safeguard_plain_file_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let text_path = tmp.join("report.txt");

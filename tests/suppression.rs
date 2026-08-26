@@ -370,8 +370,7 @@ fn explicit_cli_config_outranks_env_var() {
     );
     let cwd = temp_dir("env-var-precedence-cwd");
 
-    let (json, code) =
-        run_with_env_config(Some(&cli_config), Some(&env_config), &[], Some(&cwd));
+    let (json, code) = run_with_env_config(Some(&cli_config), Some(&env_config), &[], Some(&cwd));
 
     assert_eq!(
         code, 1,
@@ -487,7 +486,8 @@ fn env_var_source_is_reported_in_diagnostics() {
     // Default text format keeps progress on stdout.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("SOROBAN_SAFEGUARD_CONFIG") && stdout.contains(&config.display().to_string()),
+        stdout.contains("SOROBAN_SAFEGUARD_CONFIG")
+            && stdout.contains(&config.display().to_string()),
         "diagnostics should name both the env var and the resolved path: {stdout}"
     );
 }
