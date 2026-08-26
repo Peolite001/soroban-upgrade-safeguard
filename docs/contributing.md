@@ -309,6 +309,8 @@ separate decision from declaring this floor, and is not currently done:
 `rust-version` states what the crate supports, not what any given
 contributor's local toolchain must be.
 
+The per-release compatibility matrix -- tool version, MSRV, stellar-xdr crate version, and report schema version -- is maintained in [docs/compatibility-table.md](compatibility-table.md). Update that table whenever any of these values change.
+
 ## Coding Guidelines
 
 - Format every change with `cargo fmt` before committing.
@@ -327,8 +329,9 @@ Most new rules belong in `diff.rs`. The general shape is:
 3. Push a `Finding` with a clear message when the condition is met.
 4. If your rule concerns a user-defined type whose change could cascade to types that embed it, set the `type_name` field on the `Finding` to `Some(name)` so the cascade detector can identify affected types from structured data.
 5. Add tests and, if helpful, a fixture pair.
-
 When in doubt about whether something should be critical or a warning, lean toward the stricter level only when the change genuinely corrupts stored data or breaks callers. Overusing critical erodes trust in the report.
+
+For a complete walkthrough of every coordinated change required -- stable identifier rules, cascade detection, suppression implications, documentation regeneration, schema considerations, and a per-file checklist -- see [Adding a Finding Category](adding-finding-categories.md).
 
 ## Commit and Pull Request Process
 
