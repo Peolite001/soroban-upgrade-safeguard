@@ -40,6 +40,18 @@ pub struct Provenance {
     /// Input identifiers: paths, contract IDs, or content hashes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<String>,
+    /// Resolved ledger sequence number (if fetched via RPC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_sequence: Option<u64>,
+    /// Stellar network passphrase / identifier (if fetched via RPC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Sanitized RPC endpoint URL (if fetched via RPC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_endpoint: Option<String>,
+    /// On-chain code hash (if fetched via RPC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_hash: Option<String>,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -212,6 +224,18 @@ impl RenderableReport {
         for input in &self.provenance.inputs {
             block.push_str(&format!("Input:    {input}\n").dimmed());
         }
+        if let Some(seq) = self.provenance.ledger_sequence {
+            block.push_str(&format!("Ledger:   {seq}\n").dimmed());
+        }
+        if let Some(ref net) = self.provenance.network {
+            block.push_str(&format!("Network:  {net}\n").dimmed());
+        }
+        if let Some(ref rpc) = self.provenance.rpc_endpoint {
+            block.push_str(&format!("RPC:      {rpc}\n").dimmed());
+        }
+        if let Some(ref hash) = self.provenance.code_hash {
+            block.push_str(&format!("CodeHash: {hash}\n").dimmed());
+        }
         block.push_str(
             &"────────────────────────────────────────\n"
                 .dimmed()
@@ -239,6 +263,18 @@ impl RenderableReport {
         }
         for input in &self.provenance.inputs {
             block.push_str(&format!("- **Input**: {}\n", markdown_code_span(input)));
+        }
+        if let Some(seq) = self.provenance.ledger_sequence {
+            block.push_str(&format!("- **Ledger Sequence**: `{seq}`\n"));
+        }
+        if let Some(ref net) = self.provenance.network {
+            block.push_str(&format!("- **Network**: `{net}`\n"));
+        }
+        if let Some(ref rpc) = self.provenance.rpc_endpoint {
+            block.push_str(&format!("- **RPC Endpoint**: `{rpc}`\n"));
+        }
+        if let Some(ref hash) = self.provenance.code_hash {
+            block.push_str(&format!("- **Code Hash**: `{hash}`\n"));
         }
         block.push('\n');
         block
@@ -992,6 +1028,7 @@ mod tests {
             tool_version: "0.1.0".to_string(),
             timestamp: "2024-01-15T10:30:00Z".to_string(),
             inputs: vec!["v1.wasm".to_string(), "v2.wasm".to_string()],
+            ..Default::default()
         };
 
         let json = serde_json::to_string_pretty(&renderable).unwrap();
@@ -1010,6 +1047,7 @@ mod tests {
             tool_version: "0.1.0".to_string(),
             timestamp: "2024-01-15T10:30:00Z".to_string(),
             inputs: vec!["v1.wasm".to_string(), "v2.wasm".to_string()],
+            ..Default::default()
         };
 
         let text = renderable.to_text(false);
@@ -1028,6 +1066,7 @@ mod tests {
             tool_version: "0.1.0".to_string(),
             timestamp: "2024-01-15T10:30:00Z".to_string(),
             inputs: vec!["v1.wasm".to_string(), "v2.wasm".to_string()],
+            ..Default::default()
         };
 
         let markdown = renderable.to_markdown();
@@ -1078,6 +1117,7 @@ mod tests {
             tool_version: "0.1.0".to_string(),
             timestamp: String::new(),
             inputs: vec![],
+            ..Default::default()
         };
 
         let text = renderable.to_text(false);
@@ -1097,6 +1137,7 @@ mod tests {
             tool_version: "0.2.0".to_string(),
             timestamp: "2024-06-01T00:00:00Z".to_string(),
             inputs: vec!["old.wasm".to_string(), "new.wasm".to_string()],
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&renderable).unwrap();

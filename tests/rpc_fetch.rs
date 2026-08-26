@@ -129,8 +129,9 @@ fn finish_http_response(stream: &mut std::net::TcpStream, response: &[u8]) {
     stream.flush().expect("failed to flush HTTP response");
 }
 
-/// A tiny HTTP server that handles exactly two sequential `getLedgerEntries`
-/// requests and returns pre-canned JSON-RPC responses.
+/// A tiny HTTP server that handles exactly three sequential requests
+/// (instance lookup, code lookup, then `getNetwork`) and returns pre-canned
+/// JSON-RPC responses.
 ///
 /// Returns the bound address (e.g. "127.0.0.1:PORT").
 fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpListener>) {
@@ -140,7 +141,7 @@ fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpLis
     let listener_clone = Arc::clone(&listener);
 
     thread::spawn(move || {
-        // Handle exactly 2 requests (instance lookup, then code lookup)
+        // Handle the getLedgerEntries responses (instance, then code)...
         for xdr in [instance_xdr, code_xdr].iter() {
             let (mut stream, _) = listener_clone.accept().expect("failed to accept");
 
@@ -167,6 +168,20 @@ fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpLis
             );
             finish_http_response(&mut stream, response.as_bytes());
         }
+
+        // ...then the trailing `getNetwork` call the loader always issues to
+        // populate RPC provenance.
+        let (mut stream, _) = listener_clone.accept().expect("failed to accept");
+        let _ = read_http_request(&mut stream);
+        let body =
+            serde_json::to_string(&build_network_response("Test SDF Network ; September 2015"))
+                .unwrap();
+        let response = format!(
+            "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        finish_http_response(&mut stream, response.as_bytes());
     });
 
     (addr, listener)
@@ -456,9 +471,11 @@ fn fetch_wasm_from_rpc_happy_path() {
     let instance_xdr = build_instance_entry_xdr(&wasm_hash);
     let code_xdr = build_code_entry_xdr(&wasm_hash, &code);
 
+    let network_passphrase = "Test SDF Network ; September 2015";
     let (addr, _listener) = start_mock_rpc_with(vec![
         build_rpc_success(&instance_xdr),
         build_rpc_success(&code_xdr),
+        build_network_response(network_passphrase),
     ]);
 
     let module = fetch_wasm_from_rpc(TEST_CONTRACT_ID, &format!("http://{}", addr))
@@ -466,6 +483,13 @@ fn fetch_wasm_from_rpc_happy_path() {
 
     assert_eq!(module.path, format!("stellar://{}", TEST_CONTRACT_ID));
     assert_eq!(module.bytes, code);
+    assert_eq!(
+        module
+            .rpc_provenance
+            .expect("provenance should be set")
+            .network,
+        network_passphrase
+    );
 }
 
 #[test]
@@ -632,4 +656,144 @@ fn authenticated_request_does_not_follow_cross_origin_redirect() {
     assert_eq!(error.kind(), ErrorKind::RpcTransport);
     thread::sleep(Duration::from_millis(50));
     assert!(sink.accept().is_err(), "redirect target received a request");
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot consistency tests
+// ---------------------------------------------------------------------------
+
+/// Build a JSON-RPC success response with a specific `latestLedger` value.
+fn build_rpc_success_with_ledger(xdr: &str, ledger: u64) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "latestLedger": ledger,
+            "entries": [{
+                "key": "ignored",
+                "xdr": xdr,
+                "lastModifiedLedgerSeq": 100
+            }]
+        }
+    })
+}
+
+/// Build a mock `getNetwork` JSON-RPC response.
+fn build_network_response(passphrase: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "passphrase": passphrase
+        }
+    })
+}
+
+#[test]
+fn snapshot_consistent_reads_succeed_with_provenance() {
+    // Both instance and code reads return the same latestLedger → should succeed.
+    let code = wasm_bytes("v1.wasm");
+    let wasm_hash = [99u8; 32];
+    let instance_xdr = build_instance_entry_xdr(&wasm_hash);
+    let code_xdr = build_code_entry_xdr(&wasm_hash, &code);
+
+    let ledger_seq = 500u64;
+    let network_passphrase = "Test SDF Network ; September 2015";
+
+    // The loader issues: 1) getLedgerEntries (instance), 2) getLedgerEntries (code),
+    // 3) getNetwork (for passphrase).
+    let (addr, _listener) = start_mock_rpc_with(vec![
+        build_rpc_success_with_ledger(&instance_xdr, ledger_seq),
+        build_rpc_success_with_ledger(&code_xdr, ledger_seq),
+        build_network_response(network_passphrase),
+    ]);
+
+    let module = fetch_wasm_from_rpc(TEST_CONTRACT_ID, &format!("http://{}", addr))
+        .expect("consistent snapshot should succeed");
+
+    assert_eq!(module.bytes, code);
+    assert_eq!(module.path, format!("stellar://{}", TEST_CONTRACT_ID));
+
+    // Verify provenance is populated.
+    let prov = module
+        .rpc_provenance
+        .expect("rpc_provenance should be set on RPC fetch");
+    assert_eq!(prov.ledger_sequence, ledger_seq);
+    assert_eq!(prov.network, network_passphrase);
+    assert_eq!(prov.code_hash, hex::encode(wasm_hash));
+    assert!(
+        !prov.rpc_endpoint.is_empty(),
+        "rpc_endpoint should be populated"
+    );
+}
+
+#[test]
+fn snapshot_mismatch_retries_then_succeeds() {
+    // First attempt: instance returns ledger 100, code returns ledger 101 → mismatch.
+    // Retry: both return ledger 101 → success.
+    let code = wasm_bytes("v1.wasm");
+    let wasm_hash = [77u8; 32];
+    let instance_xdr = build_instance_entry_xdr(&wasm_hash);
+    let code_xdr = build_code_entry_xdr(&wasm_hash, &code);
+
+    let network_passphrase = "Test SDF Network ; September 2015";
+
+    let (addr, _listener) = start_mock_rpc_with(vec![
+        // Attempt 1: instance at ledger 100
+        build_rpc_success_with_ledger(&instance_xdr, 100),
+        // Attempt 1: code at ledger 101 → mismatch triggers retry
+        build_rpc_success_with_ledger(&code_xdr, 101),
+        // Attempt 2: instance at ledger 101
+        build_rpc_success_with_ledger(&instance_xdr, 101),
+        // Attempt 2: code at ledger 101 → consistent → success
+        build_rpc_success_with_ledger(&code_xdr, 101),
+        // getNetwork
+        build_network_response(network_passphrase),
+    ]);
+
+    let module = fetch_wasm_from_rpc(TEST_CONTRACT_ID, &format!("http://{}", addr))
+        .expect("should succeed after retry");
+
+    assert_eq!(module.bytes, code);
+    let prov = module.rpc_provenance.expect("rpc_provenance should be set");
+    assert_eq!(prov.ledger_sequence, 101);
+}
+
+#[test]
+fn snapshot_mismatch_exhaustion_fails() {
+    // Every attempt has mismatched ledgers. After max_retries (1), should fail
+    // with RpcSnapshotConsistency error.
+    let code = wasm_bytes("v1.wasm");
+    let wasm_hash = [88u8; 32];
+    let instance_xdr = build_instance_entry_xdr(&wasm_hash);
+    let code_xdr = build_code_entry_xdr(&wasm_hash, &code);
+
+    // With max_retries=1, the loader tries: attempt 0 (initial) + attempt 1 (1 retry)
+    // = 2 total rounds. Each round needs instance + code responses.
+    let (addr, _listener) = start_mock_rpc_with(vec![
+        // Attempt 0: instance at ledger 100, code at ledger 101
+        build_rpc_success_with_ledger(&instance_xdr, 100),
+        build_rpc_success_with_ledger(&code_xdr, 101),
+        // Attempt 1 (retry): instance at ledger 102, code at ledger 103
+        build_rpc_success_with_ledger(&instance_xdr, 102),
+        build_rpc_success_with_ledger(&code_xdr, 103),
+    ]);
+
+    let config = RpcClientConfig::new(format!("http://{addr}"))
+        .unwrap()
+        .with_max_retries(1);
+
+    let err = fetch_wasm_from_rpc_with_config(TEST_CONTRACT_ID, &config)
+        .expect_err("should exhaust retries");
+
+    assert_eq!(
+        err.kind(),
+        ErrorKind::RpcSnapshotConsistency,
+        "error should be RpcSnapshotConsistency, got: {err}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Inconsistent ledger sequence"),
+        "error should mention ledger sequence inconsistency, got: {msg}"
+    );
 }

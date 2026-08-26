@@ -1368,6 +1368,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             strict: args.strict,
             critical_root_count: 1,
             cascade_critical_count: 0,
+            rpc_provenance: None,
             old_interface_hash: None,
             new_interface_hash: None,
             no_timestamp: args.no_timestamp,
@@ -1679,6 +1680,7 @@ fn synthesize_error_report(
         strict,
         critical_root_count: 1,
         cascade_critical_count: 0,
+        rpc_provenance: None,
         old_interface_hash: None,
         new_interface_hash: None,
         no_timestamp,
@@ -2710,7 +2712,6 @@ fn compare_contracts(
     .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
 
     report.no_timestamp = *no_timestamp;
-
     let mut empirical_findings = Vec::new();
     let mut is_empirical = false;
 
@@ -2739,10 +2740,21 @@ fn compare_contracts(
         } else if let (Some(cid), Some(rpc)) = (contract_id, rpc_url) {
             progress("🌐 Fetching contract instance storage from RPC...".to_string());
             match rpc_config(rpc, rpc_headers).and_then(|config| {
-                loader::fetch_instance_storage_from_rpc_with_config(cid, &config)
+                loader::fetch_instance_storage_from_rpc_with_provenance(cid, &config)
                     .map_err(|e| anyhow::anyhow!(e))
             }) {
-                Ok(loaded) => {
+                Ok((loaded, storage_provenance)) => {
+                    if let Some(ref contract_provenance) = report.rpc_provenance {
+                        if contract_provenance.ledger_sequence != storage_provenance.ledger_sequence
+                        {
+                            return Err(anyhow::anyhow!(soroban_upgrade_safeguard::error::Error::RpcSnapshotConsistency {
+                                rpc_url: storage_provenance.rpc_endpoint,
+                                details: format!("Empirical storage ledger {} does not match contract/code ledger {}", storage_provenance.ledger_sequence, contract_provenance.ledger_sequence),
+                                attempts: 1,
+                                observed_sequences: vec![contract_provenance.ledger_sequence, storage_provenance.ledger_sequence],
+                            }));
+                        }
+                    }
                     progress(format!(
                         "✅ Fetched {} instance storage entries from RPC",
                         loaded.len()
