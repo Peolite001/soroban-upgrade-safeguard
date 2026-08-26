@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::capability;
 use crate::category::FindingCategory;
 use crate::mapper::LayoutMapper;
@@ -254,22 +256,24 @@ pub fn compare_call_abi(
     crate::call_abi::compare(old, new)
 }
 
-/// Recursively check if type_def references target_name directly or transitively in spec.
-fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractSpec) -> bool {
+fn references_type_inner(
+    type_def: &ScSpecTypeDef,
+    target_name: &str,
+    spec: &ContractSpec,
+    visited: &mut HashSet<String>,
+) -> bool {
     match type_def {
         ScSpecTypeDef::Udt(udt) => {
             let udt_name = udt.name.to_string();
             if udt_name == target_name {
                 return true;
             }
+            if !visited.insert(udt_name.clone()) {
+                return false;
+            }
             if let Some(st) = spec.structs.get(&udt_name) {
                 for field in st.fields.iter() {
-                    if let ScSpecTypeDef::Udt(ref f_udt) = field.type_ {
-                        if f_udt.name.to_string() == udt_name {
-                            continue;
-                        }
-                    }
-                    if references_type(&field.type_, target_name, spec) {
+                    if references_type_inner(&field.type_, target_name, spec, visited) {
                         return true;
                     }
                 }
@@ -278,12 +282,7 @@ fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractS
                 for case in un.cases.iter() {
                     if let stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) = case {
                         for ty in t.type_.iter() {
-                            if let ScSpecTypeDef::Udt(ref f_udt) = ty {
-                                if f_udt.name.to_string() == udt_name {
-                                    continue;
-                                }
-                            }
-                            if references_type(ty, target_name, spec) {
+                            if references_type_inner(ty, target_name, spec, visited) {
                                 return true;
                             }
                         }
@@ -292,22 +291,27 @@ fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractS
             }
             false
         }
-        ScSpecTypeDef::Option(opt) => references_type(&opt.value_type, target_name, spec),
+        ScSpecTypeDef::Option(opt) => references_type_inner(&opt.value_type, target_name, spec, visited),
         ScSpecTypeDef::Result(res) => {
-            references_type(&res.ok_type, target_name, spec)
-                || references_type(&res.error_type, target_name, spec)
+            references_type_inner(&res.ok_type, target_name, spec, visited)
+                || references_type_inner(&res.error_type, target_name, spec, visited)
         }
-        ScSpecTypeDef::Vec(v) => references_type(&v.element_type, target_name, spec),
+        ScSpecTypeDef::Vec(v) => references_type_inner(&v.element_type, target_name, spec, visited),
         ScSpecTypeDef::Map(m) => {
-            references_type(&m.key_type, target_name, spec)
-                || references_type(&m.value_type, target_name, spec)
+            references_type_inner(&m.key_type, target_name, spec, visited)
+                || references_type_inner(&m.value_type, target_name, spec, visited)
         }
         ScSpecTypeDef::Tuple(t) => t
             .value_types
             .iter()
-            .any(|ty| references_type(ty, target_name, spec)),
+            .any(|ty| references_type_inner(ty, target_name, spec, visited)),
         _ => false,
     }
+}
+
+fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractSpec) -> bool {
+    let mut visited = HashSet::new();
+    references_type_inner(type_def, target_name, spec, &mut visited)
 }
 
 /// Helper to check if type_name is used in any function signatures.
