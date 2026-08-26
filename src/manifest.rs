@@ -46,13 +46,16 @@
 //! **Valued settings** — `config`, `policy.*`, `limits.*` — last writer wins:
 //!
 //! ```text
-//! built-in default  <  CLI flag  <  included defaults  <  root [defaults]  <  pair field
+//! built-in default  <  SOROBAN_SAFEGUARD_CONFIG  <  CLI flag  <  included defaults  <  root [defaults]  <  pair field
 //! ```
 //!
-//! The CLI sits *below* the manifest deliberately: `--config` is the run-level
-//! fallback, and a manifest naming a config is the more specific statement.
-//! `--no-config` is the one exception — an explicit escape hatch that wins over
-//! everything.
+//! `config` is the one valued setting with an environment-variable layer:
+//! `SOROBAN_SAFEGUARD_CONFIG` lets a CI system set a config path once instead
+//! of repeating `--config` on every invocation, but sits below `--config`
+//! itself so an explicit flag always wins. The CLI (env var included) sits
+//! *below* the manifest deliberately: it is the run-level fallback, and a
+//! manifest naming a config is the more specific statement. `--no-config` is
+//! the one exception — an explicit escape hatch that wins over everything.
 //!
 //! **Escalation booleans** — `strict`, `explain`, `ascii`, `no_timestamp` —
 //! OR-chain: any layer may enable, none may disable. This mirrors
@@ -242,6 +245,9 @@ pub enum Origin {
     BuiltIn,
     /// A command-line flag.
     Cli,
+    /// An environment variable (e.g. `SOROBAN_SAFEGUARD_CONFIG`), read
+    /// because no more specific layer set the value.
+    Env,
     /// A manifest file, by path.
     File(PathBuf),
 }
@@ -251,6 +257,7 @@ impl std::fmt::Display for Origin {
         match self {
             Origin::BuiltIn => write!(f, "built-in"),
             Origin::Cli => write!(f, "cli"),
+            Origin::Env => write!(f, "env"),
             Origin::File(path) => write!(f, "{}", path.display()),
         }
     }
@@ -385,15 +392,22 @@ pub struct ResolvedManifest {
 pub struct CliSettings {
     /// `--config`.
     pub config: Option<PathBuf>,
-    /// The implicitly discovered `.safeguard.toml`, when one exists and no
-    /// `--config` was given.
+    /// The `SOROBAN_SAFEGUARD_CONFIG` environment variable, read only when
+    /// `--config` was not given. Sits above [`Self::default_config`] and
+    /// below `--config` and every manifest layer: CI systems can set it once
+    /// instead of repeating `--config` on every invocation, but an explicit
+    /// flag or a manifest naming its own `config` still wins.
+    pub env_config: Option<PathBuf>,
+    /// The implicitly discovered `.safeguard.toml`, when one exists and
+    /// neither `--config` nor the environment variable named one.
     ///
-    /// This sits at the [`Origin::BuiltIn`] level — below `--config` and below
-    /// every manifest layer — because it is exactly that: the compiled-in
-    /// fallback the tool has always applied when nothing named a config. Keeping
-    /// it in the chain rather than as a post-hoc `unwrap_or` means a manifest
-    /// that names its own `config` overrides it, which is what a reader of the
-    /// precedence table would expect.
+    /// This sits at the [`Origin::BuiltIn`] level — below `--config`, below
+    /// the environment variable, and below every manifest layer — because it
+    /// is exactly that: the compiled-in fallback the tool has always applied
+    /// when nothing named a config. Keeping it in the chain rather than as a
+    /// post-hoc `unwrap_or` means a manifest that names its own `config`
+    /// overrides it, which is what a reader of the precedence table would
+    /// expect.
     pub default_config: Option<PathBuf>,
     /// `--no-config`: wins over every layer and yields no suppression config.
     pub no_config: bool,
@@ -654,13 +668,17 @@ fn fold_settings(layers: &[Layer], pair: &Layer, cli: &CliSettings) -> ResolvedS
             origin: Origin::Cli,
         }
     } else {
-        let mut current = match (&cli.config, &cli.default_config) {
-            (Some(path), _) => Sourced {
+        let mut current = match (&cli.config, &cli.env_config, &cli.default_config) {
+            (Some(path), _, _) => Sourced {
                 value: Some(path.clone()),
                 origin: Origin::Cli,
             },
-            (None, Some(path)) => Sourced::built_in(Some(path.clone())),
-            (None, None) => Sourced::built_in(None),
+            (None, Some(path), _) => Sourced {
+                value: Some(path.clone()),
+                origin: Origin::Env,
+            },
+            (None, None, Some(path)) => Sourced::built_in(Some(path.clone())),
+            (None, None, None) => Sourced::built_in(None),
         };
         for layer in chain() {
             if let Some(path) = &layer.config {
@@ -1333,6 +1351,102 @@ mod tests {
             Some(dir.join("b.safeguard.toml"))
         );
         assert_eq!(resolved.pairs[1].settings.config.origin, Origin::File(root));
+    }
+
+    #[test]
+    fn env_config_is_used_when_cli_config_and_manifest_layers_are_absent() {
+        let dir = temp_dir("env-config-fallback");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            env_config: Some(PathBuf::from("/env/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/env/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Env);
+    }
+
+    #[test]
+    fn cli_config_outranks_env_config() {
+        let dir = temp_dir("cli-outranks-env-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            config: Some(PathBuf::from("/cli/.safeguard.toml")),
+            env_config: Some(PathBuf::from("/env/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/cli/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Cli);
+    }
+
+    #[test]
+    fn env_config_outranks_discovered_default_config() {
+        let dir = temp_dir("env-outranks-default-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            env_config: Some(PathBuf::from("/env/.safeguard.toml")),
+            default_config: Some(PathBuf::from(".safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/env/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Env);
+    }
+
+    #[test]
+    fn no_config_outranks_env_config() {
+        let dir = temp_dir("no-config-outranks-env-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            env_config: Some(PathBuf::from("/env/.safeguard.toml")),
+            no_config: true,
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(resolved.pairs[0].settings.config.value, None);
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Cli);
     }
 
     #[test]

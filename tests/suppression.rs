@@ -64,7 +64,46 @@ fn run_ext(config: Option<&PathBuf>, extra_args: &[&str], cwd: Option<&PathBuf>)
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"));
     cmd.arg(wasm("v1.wasm"))
         .arg(wasm("v2.wasm"))
+        .args(["--format", "json"])
+        // Guard against the developer's/CI's own shell ambiently setting this,
+        // which would make every "no config" test below flaky.
+        .env_remove("SOROBAN_SAFEGUARD_CONFIG");
+    if let Some(path) = config {
+        cmd.args(["--config".as_ref(), path.as_os_str()]);
+    }
+    cmd.args(extra_args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+
+    let output = cmd.output().expect("failed to run binary");
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let json: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout was not valid JSON: {e}\n---stdout---\n{stdout}"));
+    let code = output.status.code().expect("process terminated by signal");
+    (json, code)
+}
+
+/// Like `run_ext`, but sets `SOROBAN_SAFEGUARD_CONFIG` for the child process
+/// instead of (or alongside) `--config`.
+fn run_with_env_config(
+    config: Option<&PathBuf>,
+    env_config: Option<&PathBuf>,
+    extra_args: &[&str],
+    cwd: Option<&PathBuf>,
+) -> (Value, i32) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"));
+    cmd.arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
         .args(["--format", "json"]);
+    match env_config {
+        Some(path) => {
+            cmd.env("SOROBAN_SAFEGUARD_CONFIG", path);
+        }
+        None => {
+            cmd.env_remove("SOROBAN_SAFEGUARD_CONFIG");
+        }
+    }
     if let Some(path) = config {
         cmd.args(["--config".as_ref(), path.as_os_str()]);
     }
@@ -281,4 +320,431 @@ fn missing_explicit_config_is_an_error() {
         stderr.contains("suppression config"),
         "error should mention the suppression config: {stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// SOROBAN_SAFEGUARD_CONFIG environment variable
+// ---------------------------------------------------------------------------
+
+#[test]
+fn env_var_missing_entirely_falls_back_to_current_default_behavior() {
+    // No --config, no SOROBAN_SAFEGUARD_CONFIG, and (via the temp cwd) no
+    // auto-discovered .safeguard.toml -> behaves exactly as before this
+    // feature existed: criticals fail the run, nothing suppressed.
+    let cwd = temp_dir("env-var-absent");
+    let (json, code) = run_with_env_config(None, None, &[], Some(&cwd));
+
+    assert_eq!(code, 1);
+    assert_eq!(json["is_safe"], Value::Bool(false));
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 0);
+    assert_eq!(json["counts"]["critical"].as_u64().unwrap(), 3);
+}
+
+#[test]
+fn env_var_is_used_when_cli_flag_is_absent() {
+    let config = write_config("env-var-basic", all_critical_suppressions());
+    let cwd = temp_dir("env-var-basic-cwd");
+
+    let (json, code) = run_with_env_config(None, Some(&config), &[], Some(&cwd));
+
+    assert_eq!(
+        code, 0,
+        "SOROBAN_SAFEGUARD_CONFIG should be read when --config is absent"
+    );
+    assert_eq!(json["is_safe"], Value::Bool(true));
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 3);
+}
+
+#[test]
+fn explicit_cli_config_outranks_env_var() {
+    // The env var names a config that suppresses everything; --config names
+    // one that suppresses nothing relevant. The explicit flag must win.
+    let env_config = write_config("env-var-precedence-env", all_critical_suppressions());
+    let cli_config = write_config(
+        "env-var-precedence-cli",
+        r#"
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.some_other_field"
+        "#,
+    );
+    let cwd = temp_dir("env-var-precedence-cwd");
+
+    let (json, code) =
+        run_with_env_config(Some(&cli_config), Some(&env_config), &[], Some(&cwd));
+
+    assert_eq!(
+        code, 1,
+        "--config must win over SOROBAN_SAFEGUARD_CONFIG, leaving criticals unsuppressed"
+    );
+    assert_eq!(json["is_safe"], Value::Bool(false));
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 0);
+}
+
+#[test]
+fn env_var_outranks_auto_discovered_default_config() {
+    // The cwd has its own .safeguard.toml (would normally auto-load and
+    // suppress everything); the env var names a config that suppresses
+    // nothing relevant. The env var must win over auto-discovery.
+    let cwd = temp_dir("env-var-outranks-default");
+    std::fs::write(cwd.join(".safeguard.toml"), all_critical_suppressions())
+        .expect("failed to write default config");
+    let env_config = write_config(
+        "env-var-outranks-default-env",
+        r#"
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.some_other_field"
+        "#,
+    );
+
+    let (json, code) = run_with_env_config(None, Some(&env_config), &[], Some(&cwd));
+
+    assert_eq!(
+        code, 1,
+        "SOROBAN_SAFEGUARD_CONFIG must outrank the auto-discovered .safeguard.toml"
+    );
+    assert_eq!(json["is_safe"], Value::Bool(false));
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 0);
+}
+
+#[test]
+fn no_config_flag_outranks_env_var() {
+    let config = write_config("env-var-no-config", all_critical_suppressions());
+    let cwd = temp_dir("env-var-no-config-cwd");
+
+    let (json, code) = run_with_env_config(None, Some(&config), &["--no-config"], Some(&cwd));
+
+    assert_eq!(
+        code, 1,
+        "--no-config must override SOROBAN_SAFEGUARD_CONFIG entirely"
+    );
+    assert_eq!(json["is_safe"], Value::Bool(false));
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 0);
+    assert_eq!(json["counts"]["critical"].as_u64().unwrap(), 3);
+}
+
+#[test]
+fn missing_env_var_config_is_an_error() {
+    // A path named by SOROBAN_SAFEGUARD_CONFIG that does not exist must be a
+    // hard error, exactly like a missing --config path: a typo in a CI
+    // pipeline's env var must never be silently treated as "no suppressions".
+    let missing = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("env-does-not-exist.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .env("SOROBAN_SAFEGUARD_CONFIG", &missing)
+        .output()
+        .expect("failed to run binary");
+
+    assert!(
+        !output.status.success(),
+        "missing SOROBAN_SAFEGUARD_CONFIG-named config must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("suppression config"),
+        "error should mention the suppression config: {stderr}"
+    );
+}
+
+#[test]
+fn malformed_env_var_config_is_an_error() {
+    let malformed = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("env-malformed.safeguard.toml");
+    std::fs::write(&malformed, "this is not valid toml {{{").expect("failed to write file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .env("SOROBAN_SAFEGUARD_CONFIG", &malformed)
+        .output()
+        .expect("failed to run binary");
+
+    assert!(
+        !output.status.success(),
+        "malformed SOROBAN_SAFEGUARD_CONFIG-named config must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("suppression config"),
+        "error should mention the suppression config: {stderr}"
+    );
+}
+
+#[test]
+fn env_var_source_is_reported_in_diagnostics() {
+    let config = write_config("env-var-diagnostics", all_critical_suppressions());
+    let cwd = temp_dir("env-var-diagnostics-cwd");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .env("SOROBAN_SAFEGUARD_CONFIG", &config)
+        .current_dir(&cwd)
+        .output()
+        .expect("failed to run binary");
+
+    // Default text format keeps progress on stdout.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("SOROBAN_SAFEGUARD_CONFIG") && stdout.contains(&config.display().to_string()),
+        "diagnostics should name both the env var and the resolved path: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// require_reason policy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn require_reason_policy_disabled_leaves_existing_configs_unaffected() {
+    // No [require_reason] table: a suppression with no reason must load and
+    // apply exactly as it always has.
+    let config = write_config(
+        "require-reason-disabled",
+        r#"
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.threshold"
+        "#,
+    );
+
+    let (json, code) = run(Some(&config));
+
+    assert_eq!(code, 1, "the other two unsuppressed criticals still fail");
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 1);
+    assert!(findings(&json)
+        .iter()
+        .any(|(c, t, s)| c == "Struct Field Removed"
+            && t.as_deref() == Some("ConfigData.threshold")
+            && *s));
+}
+
+#[test]
+fn require_reason_policy_enabled_rejects_a_missing_reason() {
+    let config = write_config(
+        "require-reason-enabled-missing",
+        r#"
+        [require_reason]
+        rule_ids = ["struct_field_removed"]
+
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.threshold"
+        "#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .args(["--config".as_ref(), config.as_os_str()])
+        .output()
+        .expect("failed to run binary");
+
+    assert!(
+        !output.status.success(),
+        "a gated rule with no reason must be rejected, not silently applied"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("require_reason"),
+        "error should name the policy: {stderr}"
+    );
+    assert!(
+        stderr.contains("rule #1") && stderr.contains("Struct Field Removed"),
+        "error should point at the offending rule as its source location: {stderr}"
+    );
+}
+
+#[test]
+fn require_reason_policy_enabled_rejects_a_whitespace_only_reason() {
+    let config = write_config(
+        "require-reason-enabled-whitespace",
+        r#"
+        [require_reason]
+        rule_ids = ["struct_field_removed"]
+
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.threshold"
+        reason   = "   "
+        "#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .args(["--config".as_ref(), config.as_os_str()])
+        .output()
+        .expect("failed to run binary");
+
+    assert!(
+        !output.status.success(),
+        "a whitespace-only reason must be rejected exactly like a missing one"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("require_reason"), "{stderr}");
+}
+
+#[test]
+fn require_reason_policy_enabled_accepts_a_real_reason() {
+    let config = write_config(
+        "require-reason-enabled-present",
+        r#"
+        [require_reason]
+        rule_ids = ["struct_field_removed"]
+
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.threshold"
+        reason   = "Planned migration, reviewed in #123."
+        "#,
+    );
+
+    let (json, code) = run(Some(&config));
+
+    assert_eq!(code, 1);
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 1);
+    assert!(findings(&json)
+        .iter()
+        .any(|(c, t, s)| c == "Struct Field Removed"
+            && t.as_deref() == Some("ConfigData.threshold")
+            && *s));
+}
+
+#[test]
+fn require_reason_policy_by_axis_rejects_a_missing_reason() {
+    // "Function Signature Changed" is a call_abi finding; gate the whole
+    // axis rather than naming the rule_id directly.
+    let config = write_config(
+        "require-reason-axis",
+        r#"
+        [require_reason]
+        axes = ["call_abi"]
+
+        [[suppress]]
+        category = "Function Signature Changed"
+        target   = "initialize"
+        "#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .args(["--config".as_ref(), config.as_os_str()])
+        .output()
+        .expect("failed to run binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("require_reason"), "{stderr}");
+    assert!(stderr.contains("Function Signature Changed"), "{stderr}");
+}
+
+#[test]
+fn require_reason_policy_mixed_config_only_enforces_gated_rules() {
+    // Three suppressions, matching the fixture's three known criticals:
+    //   - "Struct Field Removed" is gated by rule_id, and has a reason -> ok.
+    //   - "Function Signature Changed" is gated by axis (call_abi), and has a
+    //     reason -> ok.
+    //   - "Event Enum Case Value Changed" is entirely ungated -> no reason
+    //     required, must still apply.
+    let config = write_config(
+        "require-reason-mixed",
+        r#"
+        [require_reason]
+        rule_ids = ["struct_field_removed"]
+        axes     = ["call_abi"]
+
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.threshold"
+        reason   = "Planned migration, reviewed in #123."
+
+        [[suppress]]
+        category = "Function Signature Changed"
+        target   = "initialize"
+        reason   = "Planned re-init for the v2 migration."
+
+        [[suppress]]
+        category = "Event Enum Case Value Changed"
+        target   = "StatusEvent.Paused"
+        "#,
+    );
+
+    let (json, code) = run(Some(&config));
+
+    assert_eq!(
+        code, 0,
+        "all three criticals are suppressed (two reasoned, one ungated) -> exit 0"
+    );
+    assert_eq!(json["is_safe"], Value::Bool(true));
+    assert_eq!(json["suppressed_count"].as_u64().unwrap(), 3);
+}
+
+#[test]
+fn require_reason_policy_mixed_config_still_rejects_the_unreasoned_gated_rule() {
+    // Same as above, but the axis-gated rule's reason is dropped: only that
+    // one rule should be flagged, even though three rules are configured and
+    // one of them (event indexer) was never gated at all.
+    let config = write_config(
+        "require-reason-mixed-rejected",
+        r#"
+        [require_reason]
+        rule_ids = ["struct_field_removed"]
+        axes     = ["call_abi"]
+
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.threshold"
+        reason   = "Planned migration, reviewed in #123."
+
+        [[suppress]]
+        category = "Function Signature Changed"
+        target   = "initialize"
+
+        [[suppress]]
+        category = "Event Enum Case Value Changed"
+        target   = "StatusEvent.Paused"
+        "#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .args(["--config".as_ref(), config.as_os_str()])
+        .output()
+        .expect("failed to run binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("require_reason"), "{stderr}");
+    // Points at rule #2 specifically, not the other two configured rules.
+    assert!(stderr.contains("rule #2"), "{stderr}");
+    assert!(!stderr.contains("rule #1"), "{stderr}");
+    assert!(!stderr.contains("rule #3"), "{stderr}");
+}
+
+#[test]
+fn validate_config_reports_require_reason_violations() {
+    let config = write_config(
+        "require-reason-validate",
+        r#"
+        [require_reason]
+        rule_ids = ["struct_field_removed"]
+
+        [[suppress]]
+        category = "Struct Field Removed"
+        target   = "ConfigData.threshold"
+        "#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .args(["--validate-config".as_ref(), config.as_os_str()])
+        .output()
+        .expect("failed to run binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("require_reason"), "{stderr}");
 }
