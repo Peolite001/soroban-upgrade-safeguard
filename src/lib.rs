@@ -1,3 +1,8 @@
+//! # Soroban Upgrade Safeguard
+//!
+//! Library for analyzing and validating Soroban smart-contract upgrades on the
+//! Stellar network. It detects breaking changes in storage layout, function
+//! signatures, and event schemas before an upgrade is deployed.
 #[cfg(feature = "unstable")]
 pub mod attestation;
 #[cfg(not(feature = "unstable"))]
@@ -48,10 +53,7 @@ pub mod error;
 #[cfg(not(feature = "unstable"))]
 mod error;
 
-#[cfg(feature = "unstable")]
 pub mod interface_hash;
-#[cfg(not(feature = "unstable"))]
-mod interface_hash;
 
 #[cfg(feature = "unstable")]
 pub mod jsonl;
@@ -67,6 +69,11 @@ mod loader;
 pub mod limits;
 #[cfg(not(feature = "unstable"))]
 mod limits;
+
+#[cfg(feature = "unstable")]
+pub mod manifest;
+#[cfg(not(feature = "unstable"))]
+mod manifest;
 
 #[cfg(feature = "unstable")]
 pub mod mapper;
@@ -114,6 +121,11 @@ pub mod rpc_record;
 mod rpc_record;
 
 #[cfg(feature = "unstable")]
+pub mod runtime_surface;
+#[cfg(not(feature = "unstable"))]
+mod runtime_surface;
+
+#[cfg(feature = "unstable")]
 pub mod spec;
 #[cfg(not(feature = "unstable"))]
 mod spec;
@@ -138,6 +150,11 @@ pub mod suppression;
 #[cfg(not(feature = "unstable"))]
 mod suppression;
 
+#[cfg(feature = "unstable")]
+pub mod lineage;
+#[cfg(not(feature = "unstable"))]
+pub mod lineage;
+
 // Stable public API exports at the root
 pub use crate::attestation::{
     sign_statement, verify_artifacts, verify_signatures, ArtifactDigest, AttestationSigner,
@@ -148,6 +165,10 @@ pub use crate::call_abi::{
     CallAbiBreak, CallAbiCompatibility, CallDirection, DirectionalCallVerdict,
 };
 pub use crate::diff::{Finding, Severity};
+pub use crate::lineage::{
+    validate_candidate_against_lineage, HistoricalFinding, LineageRecord, LineageStore,
+    LineageValidationReport, LiveStatus, LiveVersionPolicy,
+};
 pub use crate::oci::{
     OciArtifact, OciArtifactKind, OciFetchConfig, OciReference, OciSelector,
     MEDIA_TYPE_EXTRACTED_SPEC, MEDIA_TYPE_WASM,
@@ -156,7 +177,14 @@ pub use crate::remote::{
     default_cache_dir, fetch_verified, CacheStatus, FetchedArtifact, RemoteFetchConfig, RemoteRef,
 };
 pub use crate::report::{ReportedFinding, SafetyReport};
-pub use crate::storage_schema::{StorageReconciliation, StorageSchema, StorageSchemaComparison};
+pub use crate::runtime_surface::{
+    DataSegmentSummary, ElementSegmentSummary, GlobalDeclaration, MemoryDeclaration,
+    RuntimeSurface, TableDeclaration,
+};
+pub use crate::spec_json::{InterfaceLockfile, INTERFACE_LOCKFILE_SCHEMA_VERSION};
+pub use crate::storage_schema::{
+    SchemaFormat, StorageReconciliation, StorageSchema, StorageSchemaComparison,
+};
 
 use std::path::Path;
 
@@ -204,7 +232,13 @@ pub fn compare_wasm_bytes(old_wasm: &[u8], new_wasm: &[u8]) -> Result<SafetyRepo
     let old_spec = ContractSpec::from_entries(&old_meta.spec);
     let new_spec = ContractSpec::from_entries(&new_meta.spec);
 
-    let diff_report = diff::compare(&old_spec, &new_spec);
+    let mut diff_report = diff::compare(&old_spec, &new_spec);
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
+        &mut diff_report,
+    );
+
     Ok(
         SafetyReport::new_with_specs(&diff_report, &old_spec, &new_spec)
             .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash()),
@@ -224,6 +258,8 @@ pub struct CompareOptions<'a> {
     pub suppressions: Option<&'a SuppressionConfig>,
     pub explain: bool,
     pub strict: bool,
+    pub storage_schemas: Option<(&'a StorageSchema, &'a StorageSchema)>,
+    pub lineage_store: Option<&'a lineage::LineageStore>,
 }
 
 /// Compare two Soroban contract builds supplied as raw WASM byte slices with options.
@@ -259,6 +295,12 @@ pub fn compare_wasm_bytes_with_options(
         &mut diff_report,
     );
 
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
+        &mut diff_report,
+    );
+
     let mut safety_report = SafetyReport::with_suppressions_with_specs(
         &diff_report,
         suppressions,
@@ -267,10 +309,79 @@ pub fn compare_wasm_bytes_with_options(
         &old_spec,
         &new_spec,
     );
+    safety_report.scope.exported_interface = true;
+    safety_report.scope.env_metadata = old_meta.env_meta.is_some() || new_meta.env_meta.is_some();
     safety_report.old_spec_summary = Some(old_spec.summary());
     safety_report.new_spec_summary = Some(new_spec.summary());
 
+    if let Some((old_schema, new_schema)) = options.storage_schemas {
+        let storage_comparison = storage_schema::compare_storage_schemas(
+            old_schema,
+            &old_meta.storage,
+            new_schema,
+            &new_meta.storage,
+        );
+        safety_report.apply_storage_schema_comparison(
+            &storage_comparison,
+            suppressions,
+            options.explain,
+            options.strict,
+        );
+    }
+
+    if let Some(store) = options.lineage_store {
+        let lineage_report = lineage::validate_candidate_against_lineage(
+            new_wasm,
+            &new_spec,
+            store,
+            suppressions,
+            options.strict,
+        )?;
+        safety_report.apply_lineage_report(
+            &lineage_report,
+            suppressions,
+            options.explain,
+            options.strict,
+        );
+    }
+
     Ok(safety_report)
+}
+
+/// Compare a Soroban contract build against a serialized interface lockfile.
+///
+/// Lockfile comparisons intentionally cover only the exported interface. A
+/// lockfile contains no WASM metadata for host imports, runtime surface, or
+/// environment metadata, so those axes are not inferred from the snapshot.
+pub fn compare_wasm_against_interface_lockfile(
+    lockfile_json: &str,
+    new_wasm: &[u8],
+    options: &CompareOptions<'_>,
+) -> Result<SafetyReport> {
+    let lockfile = InterfaceLockfile::from_json_str(lockfile_json)
+        .map_err(|error| anyhow::anyhow!("Invalid interface lockfile: {error}"))?;
+    let old_spec = lockfile
+        .to_contract_spec()
+        .map_err(|error| anyhow::anyhow!("Invalid interface lockfile: {error}"))?;
+    let new_meta = parser::extract_metadata(new_wasm)
+        .context("Failed to extract metadata from the candidate WASM")?;
+    let new_spec = ContractSpec::from_entries(&new_meta.spec);
+    let diff_report = diff::compare(&old_spec, &new_spec);
+    let empty_suppressions = SuppressionConfig::default();
+    let suppressions = options.suppressions.unwrap_or(&empty_suppressions);
+    let mut report = SafetyReport::with_suppressions_with_specs(
+        &diff_report,
+        suppressions,
+        options.explain,
+        options.strict,
+        &old_spec,
+        &new_spec,
+    )
+    .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
+    report.scope.exported_interface = true;
+    report.old_spec_summary = Some(old_spec.summary());
+    report.new_spec_summary = Some(new_spec.summary());
+    Ok(report)
 }
 
 /// Compare two Soroban contract builds read from WASM files on disk with options.

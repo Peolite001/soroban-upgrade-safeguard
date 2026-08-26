@@ -3,6 +3,8 @@ use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScEnvMetaEntry, ScSpecEntry};
 use wasmparser::{CompositeType, Parser, Payload, TypeRef, ValType};
 
 use crate::error::Error;
+use crate::limits::ResourcePolicy;
+use crate::runtime_surface::{extract_runtime_surface, RuntimeSurface};
 use crate::storage_inference::{infer_storage, StorageInference};
 
 /// The resolved parameter/result types of a function import, when the
@@ -77,6 +79,8 @@ pub struct SorobanMetadata {
     pub storage: StorageInference,
     /// Every function import declared by the module, in declaration order.
     pub host_imports: Vec<ImportedFunction>,
+    /// The normalized WebAssembly runtime surface.
+    pub runtime_surface: RuntimeSurface,
 }
 
 /// Decodes concatenated ScSpecEntry XDR objects from raw bytes.
@@ -135,6 +139,7 @@ pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata, Error> {
     let parser = Parser::new(0);
 
     let mut spec_section_index = 0usize;
+    let mut env_section_index = 0usize;
     // Function types declared by the module's type section, in declaration
     // order across all rec groups; `None` for a non-func composite type
     // (structs/arrays from the GC proposal, which Soroban contracts do not
@@ -209,7 +214,18 @@ pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata, Error> {
                     metadata.spec.extend(entries);
                 }
                 "contractenvmetav0" => {
-                    metadata.env_meta = decode_env_meta(section.data()).ok();
+                    let section_index = env_section_index;
+                    env_section_index += 1;
+
+                    let env_meta =
+                        decode_env_meta(section.data()).map_err(|e| Error::SectionExtraction {
+                            section_name: "contractenvmetav0".to_string(),
+                            section_index,
+                            byte_offset: section.data_offset() as u64,
+                            details: String::new(),
+                            source: Some(Box::new(e)),
+                        })?;
+                    metadata.env_meta = Some(env_meta);
                 }
                 _ => {}
             },
@@ -223,6 +239,8 @@ pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata, Error> {
         byte_offset: None,
         source: None,
     })?;
+
+    metadata.runtime_surface = extract_runtime_surface(bytes, &ResourcePolicy::default())?;
 
     Ok(metadata)
 }

@@ -229,10 +229,22 @@ soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>
 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>
 ```
 
+  A manifest can also compose other manifests (`include`), share settings across
+  pairs (`[defaults]`), and override them per pair. See
+  [Batch Manifests](batch_manifests.md) for the schema, the precedence rules,
+  path resolution, and `--explain-manifest`.
+
 - Directory scan (pair by file stem):
 
 ```bash
 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>
+```
+
+- Interface lockfile mode (one candidate WASM):
+
+```bash
+soroban-upgrade-safeguard <NEW_WASM> \
+  --interface-lockfile <LOCKFILE>
 ```
 
 - Glob pair mode (pair matches by file stem):
@@ -247,6 +259,45 @@ directory, and glob modes run batch comparisons. The full usage strings and opti
 match the CLI help output (`--help`) and the `override_usage` in `src/main.rs`.
 
 Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), and the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)).
+
+### Interface lockfiles
+
+An interface lockfile pins the exported `contractspecv0` interface in a deterministic,
+version-controlled JSON artifact. Generate one from an approved build:
+
+```bash
+soroban-upgrade-safeguard lockfile ./wasm/v1.wasm \
+  --output ./wasm/contract.interface.lock.json
+```
+
+The command refuses to replace an existing file unless `--force` is provided. Use
+that flag only when the public interface change is intentional:
+
+```bash
+soroban-upgrade-safeguard lockfile ./wasm/v2.wasm \
+  --output ./wasm/contract.interface.lock.json --force
+```
+
+Review the resulting JSON diff as an API change. Named collections are sorted for
+stable diffs, while function parameters, struct fields, and union cases retain
+declaration order because those positions affect compatibility. Documentation is
+kept in the artifact so informational documentation findings remain available.
+The stored interface hash is checked against the structured content when the file
+is loaded, preventing a hand-edited or stale lockfile from silently being trusted.
+
+Run the lockfile check in CI with the candidate build as the only positional input:
+
+```bash
+soroban-upgrade-safeguard ./wasm/candidate.wasm \
+  --interface-lockfile ./wasm/contract.interface.lock.json \
+  --format json
+```
+
+A matching interface exits `0`. Drift exits non-zero and uses the normal diff
+categories, severities, suppression handling, and report formats. Lockfile mode
+deliberately analyzes the exported interface only; it does not compare environment
+metadata, host imports, runtime surface, storage schemas, or empirical storage
+observations. Use a two-build comparison when those dimensions are required.
 
 ### Spec JSON input mode
 
@@ -476,6 +527,48 @@ soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm \
 
 Both flags are required together. Supplying only one is an error, because a single snapshot cannot show a change. Keep the manifest versioned next to your contract and update it in the same commit that changes a storage type.
 
+#### Schemas in batch manifests
+
+Each `[[pairs]]` entry may provide its own `old_storage_schema` and
+`new_storage_schema` fields. Schema-backed and interface-only comparisons can
+therefore coexist in one batch:
+
+```toml
+[[pairs]]
+old = "artifacts/token_v1.wasm"
+new = "artifacts/token_v2.wasm"
+name = "token"
+old_storage_schema = "schemas/token_v1.json"
+new_storage_schema = "schemas/token_v2.json"
+
+[[pairs]]
+old = "artifacts/oracle_v1.wasm"
+new = "artifacts/oracle_v2.wasm"
+name = "oracle"
+```
+
+The equivalent JSON fields may use ergonomic hyphenated names:
+
+```json
+{
+  "pairs": [
+    {
+      "old": "artifacts/token_v1.wasm",
+      "new": "artifacts/token_v2.wasm",
+      "name": "token",
+      "old-storage-schema": "schemas/token_v1.json",
+      "new-storage-schema": "schemas/token_v2.json"
+    }
+  ]
+}
+```
+
+Schema paths resolve relative to the manifest file that declares the pair,
+just like `old` and `new`. Both schema fields are required together. A partial,
+missing, or invalid schema is a pair-level error: it fails the batch verdict,
+but unrelated pairs continue to run. Directory scan mode remains
+interface-only because it has no schema discovery step.
+
 ### Manifest format
 
 TOML and JSON are both accepted with the same shape. A ready-to-copy template lives at [`.storage-schema.example.toml`](../.storage-schema.example.toml).
@@ -584,7 +677,9 @@ Storage findings count toward `is_safe` and therefore toward the exit code, so a
 
 Coverage is bounded by what you declare. A storage type you forget to declare is not analyzed, and the report does not pretend otherwise. If a declaration references a type that is neither declared in the manifest nor exported by the contract, that dangling reference is reported as an informational finding rather than quietly skipped.
 
-Storage schemas apply to a single contract pair and are refused in batch mode, since one manifest cannot describe several different contracts.
+In batch output, each pair reports `schema-backed`, `interface-only`, or
+`error` coverage. A passing interface-only pair certifies only its exported
+interface and environment metadata; it must not be read as storage verified.
 
 ## Detection Categories
 

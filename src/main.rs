@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 #[allow(unused_imports)]
 use std::time::Duration;
@@ -14,7 +14,7 @@ use soroban_upgrade_safeguard::{
         VerificationPolicy,
     },
     color::{should_disable_color, ColorMode},
-    diff, loader,
+    diff, loader, manifest,
     oci::{self, OciArtifactKind, OciFetchConfig, OciReference},
     parser,
     remote::{self, RemoteFetchConfig, RemoteRef},
@@ -22,7 +22,7 @@ use soroban_upgrade_safeguard::{
     report,
     rpc::RpcClientConfig,
     spec,
-    spec_json::ExtractedSpec,
+    spec_json::{ExtractedSpec, InterfaceLockfile},
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -161,6 +161,7 @@ enum RenderFormat {
                       soroban-upgrade-safeguard --manifest <MANIFEST_PATH> [OPTIONS]\n       \
                       soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR> [OPTIONS]\n       \
                       soroban-upgrade-safeguard extract <WASM> [OPTIONS]\n       \
+                      soroban-upgrade-safeguard lockfile <WASM> --output <PATH> [OPTIONS]\n       \
                       soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]\n       \
                       soroban-upgrade-safeguard init [OPTIONS]\n       \
                       soroban-upgrade-safeguard stream [OPTIONS]",
@@ -246,9 +247,18 @@ struct Args {
     #[arg(long, value_name = "HEX_HASH")]
     expected_wasm_hash: Option<String>,
 
+    /// Compare the candidate WASM against a committed interface lockfile.
+    #[arg(long, value_name = "LOCKFILE")]
+    interface_lockfile: Option<PathBuf>,
+
     /// Path to a manifest file (TOML or JSON) containing contract pairs to compare
     #[arg(long, value_name = "MANIFEST_PATH")]
     manifest: Option<PathBuf>,
+
+    /// Resolve --manifest (including its `include` chain) and print how every
+    /// setting was decided, then exit without comparing anything.
+    #[arg(long, requires = "manifest")]
+    explain_manifest: bool,
 
     /// Directory containing the old versions of the contracts for directory comparison
     #[arg(long, value_name = "OLD_DIR", requires = "new_dir")]
@@ -339,6 +349,22 @@ struct Args {
     /// reference can be pinned afterward. Off by default.
     #[arg(long)]
     allow_oci_tags: bool,
+
+    /// Path to a persistent lineage store (JSON/TOML) tracking historical versions.
+    #[arg(long, value_name = "PATH")]
+    lineage_store: Option<PathBuf>,
+
+    /// Record candidate build as a new version in the lineage store with this tag.
+    #[arg(long, value_name = "VERSION_ID")]
+    record_version: Option<String>,
+
+    /// Mark an existing historical version as retired in the lineage store.
+    #[arg(long, value_name = "VERSION_ID")]
+    retire_version: Option<String>,
+
+    /// Maximum live historical versions to validate candidate against.
+    #[arg(long, value_name = "N")]
+    max_live_versions: Option<usize>,
 }
 
 /// Build the remote-fetch policy for `https://` inputs from the top-level CLI flags.
@@ -369,6 +395,8 @@ fn oci_fetch_config(args: &Args) -> OciFetchConfig {
 enum Command {
     /// Dump a single contract's decoded spec as JSON
     Extract(ExtractArgs),
+    /// Generate or update a committed interface lockfile from one WASM build
+    Lockfile(LockfileArgs),
     /// Re-render a previously saved JSON report in another format
     Render(RenderArgs),
     /// Generate a suppression config from current findings
@@ -467,6 +495,22 @@ struct ExtractArgs {
     /// Print only the interface hash, with no other output.
     #[arg(long)]
     hash_only: bool,
+}
+
+/// `lockfile`: write a committed snapshot of one contract's exported interface.
+#[derive(ClapArgs, Debug)]
+struct LockfileArgs {
+    /// WASM file whose exported interface should be recorded.
+    #[arg(value_name = "WASM")]
+    wasm: PathBuf,
+
+    /// Destination path for the interface lockfile.
+    #[arg(long, value_name = "PATH", required = true)]
+    output: PathBuf,
+
+    /// Allow replacing an existing lockfile.
+    #[arg(long)]
+    force: bool,
 }
 
 /// `render`: turn a stored JSON report back into a human format.
@@ -573,6 +617,48 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
 
     let extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
     println!("{}", serde_json::to_string_pretty(&extracted)?);
+    Ok(())
+}
+
+/// Extract one build and write its exported interface as a lockfile.
+fn run_lockfile(args: &LockfileArgs) -> Result<()> {
+    if args.output.exists() && !args.force {
+        anyhow::bail!(
+            "{} already exists. Use --force to update it.",
+            args.output.display()
+        );
+    }
+
+    let build = loader::load_wasm(&args.wasm)
+        .map_err(|error| anyhow::anyhow!("Failed to load '{}': {error}", args.wasm.display()))?;
+    let metadata = parser::extract_metadata(&build.bytes)
+        .context("Failed to extract metadata from the lockfile source WASM")?;
+    let contract_spec = spec::ContractSpec::from_entries(&metadata.spec);
+    let extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
+    let lockfile = InterfaceLockfile::from_extracted(&extracted);
+    let mut contents = serde_json::to_vec_pretty(&lockfile)?;
+    contents.push(b'\n');
+
+    if let Some(parent) = args
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create lockfile directory '{}'.",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::write(&args.output, contents)
+        .with_context(|| format!("Failed to write lockfile '{}'.", args.output.display()))?;
+    println!(
+        "{} {} ({})",
+        if args.force { "Updated" } else { "Generated" },
+        args.output.display(),
+        contract_spec.interface_hash()
+    );
     Ok(())
 }
 
@@ -752,6 +838,7 @@ fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
                 }],
             });
             println!("{}", serde_json::to_string_pretty(&result)?);
+            std::io::stdout().flush().ok();
             std::process::exit(1);
         }
     };
@@ -812,6 +899,7 @@ fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
     });
     println!("{}", serde_json::to_string_pretty(&result)?);
     if result["verified"] != true {
+        std::io::stdout().flush().ok();
         std::process::exit(1);
     }
     Ok(())
@@ -945,7 +1033,24 @@ fn run_init(args: &InitArgs) -> Result<()> {
     let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
 
     // Generate diff
-    let diff_report = diff::compare(&old_spec, &new_spec);
+    let mut diff_report = diff::compare(&old_spec, &new_spec);
+    diff::compare_env_metadata(
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff::compare_host_imports(
+        &old_meta.host_imports,
+        &new_meta.host_imports,
+        old_meta.env_meta.as_ref(),
+        new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
+        &mut diff_report,
+    );
 
     // Collect unsuppressed findings (with empty suppression config)
     let empty_suppressions = SuppressionConfig::default();
@@ -1052,6 +1157,7 @@ fn main() -> Result<()> {
 
     match &args.command {
         Some(Command::Extract(extract_args)) => return run_extract(extract_args),
+        Some(Command::Lockfile(lockfile_args)) => return run_lockfile(lockfile_args),
         Some(Command::Render(render_args)) => return run_render(render_args),
         Some(Command::Init(init_args)) => return run_init(init_args),
         Some(Command::Attest(attest_args)) => return run_attest(attest_args),
@@ -1087,6 +1193,28 @@ fn main() -> Result<()> {
 
     if is_batch && !args.wasm_paths.is_empty() {
         anyhow::bail!("Cannot specify positional WASM paths when using batch mode (--manifest or --old-dir/--new-dir)");
+    }
+
+    if args.interface_lockfile.is_some() && is_batch {
+        anyhow::bail!("Cannot use --interface-lockfile with batch mode");
+    }
+    if args.interface_lockfile.is_some() && args.contract_id.is_some() {
+        anyhow::bail!("Cannot use --interface-lockfile with --contract-id; the lockfile supplies the baseline");
+    }
+    if args.interface_lockfile.is_some() && (args.empirical || args.empirical_file.is_some()) {
+        anyhow::bail!("Cannot use empirical validation with --interface-lockfile");
+    }
+
+    // Manifest-resolution mode: show how the composition resolved and exit,
+    // before any WASM is required. Makes a manifest reviewable on its own.
+    if args.explain_manifest {
+        let manifest_path = args
+            .manifest
+            .as_ref()
+            .expect("--explain-manifest requires --manifest (enforced by clap)");
+        let resolved = manifest::resolve(manifest_path, &cli_settings(&args))?;
+        print!("{}", resolved.explain_text());
+        return Ok(());
     }
 
     // Determine stdout format: use --format if given, or "text" as default
@@ -1158,28 +1286,44 @@ fn main() -> Result<()> {
     };
 
     if is_batch {
-        return run_batch(&args, &outputs, &suppressions, &progress);
+        // Batch mode resolves its suppression config per pair; the eager load
+        // above still runs so an unreadable --config fails before any analysis.
+        return run_batch(&args, &outputs, &progress);
     }
 
     run_single(&args, &outputs, &suppressions, &progress)
 }
 
-fn run_batch(
-    args: &Args,
-    outputs: &[OutputSpec],
-    suppressions: &SuppressionConfig,
-    progress: &dyn Fn(String),
-) -> Result<()> {
-    let (pairs, mut gaps) = if let Some(manifest_path) = &args.manifest {
-        (parse_manifest(manifest_path)?, Vec::new())
+fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> Result<()> {
+    let cli = cli_settings(args);
+
+    // Manifest mode resolves includes, defaults and per-pair overrides up front —
+    // including duplicate-identity detection, so a collision fails before any
+    // pair runs rather than mid-loop with earlier reports already on disk.
+    let (resolved_manifest, pairs, mut gaps) = if let Some(manifest_path) = &args.manifest {
+        let resolved = manifest::resolve(manifest_path, &cli)?;
+        let pairs: Vec<BatchPair> = resolved
+            .pairs
+            .iter()
+            .cloned()
+            .map(BatchPair::from)
+            .collect();
+        (Some(resolved), pairs, Vec::new())
     } else {
-        scan_directories(
+        let settings = manifest::cli_only_settings(&cli);
+        let (pairs, gaps) = scan_directories(
             args.old_dir.as_ref().unwrap(),
             args.new_dir.as_ref().unwrap(),
-        )?
+            &settings,
+        )?;
+        (None, pairs, gaps)
     };
     let remote_config = remote_fetch_config(args);
     let oci_config = oci_fetch_config(args);
+
+    // Suppression configs are shared across pairs far more often than not.
+    let mut config_cache: std::collections::HashMap<PathBuf, SuppressionConfig> =
+        std::collections::HashMap::new();
 
     progress("🔍 Soroban Upgrade Safeguard (Batch Mode)".to_string());
     progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
@@ -1189,7 +1333,7 @@ fn run_batch(
         gaps.len()
     ));
 
-    let mut results = std::collections::BTreeMap::new();
+    let mut results = Vec::new();
     let mut overall_safe = true;
     let mut seen_names = std::collections::BTreeSet::new();
     let gap_count = gaps.len();
@@ -1247,12 +1391,17 @@ fn run_batch(
                     diff::CompatibilityAxis::SourceLevel,
                     report::AxisStatus::Passed,
                 );
+                verdicts.insert(
+                    diff::CompatibilityAxis::RuntimeSurface,
+                    report::AxisStatus::Passed,
+                );
                 verdicts
             },
             gated_axes: {
                 let mut gated = std::collections::HashSet::new();
                 gated.insert(diff::CompatibilityAxis::CallAbi);
                 gated.insert(diff::CompatibilityAxis::StorageLayout);
+                gated.insert(diff::CompatibilityAxis::RuntimeSurface);
                 gated
             },
             findings_by_category: {
@@ -1321,20 +1470,25 @@ fn run_batch(
             )?;
         }
 
-        results.insert(gap.name, gap_report);
+        results.push(BatchResult::Error {
+            name: gap.name,
+            old_path: gap.old_path,
+            new_path: None,
+            old_storage_schema: None,
+            new_storage_schema: None,
+            error: "contract is missing from the new deployment".to_string(),
+            report: gap_report,
+        });
         overall_safe = false;
     }
 
     // Process each regular pair with error-handling (per-pair failures do not abort the batch)
     for (i, pair) in pairs.iter().enumerate() {
-        let default_name = format!("pair_{}", i + 1);
-        let contract_name = pair.name.clone().unwrap_or_else(|| {
-            pair.new
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.to_string())
-                .unwrap_or(default_name)
-        });
+        let contract_name = pair.name.clone();
+        let settings = &pair.settings;
+        let pair_suppressions = suppressions_for_pair(settings, &mut config_cache)?;
+        let explain = settings.explain.value;
+        let ascii = settings.ascii.value || args.ascii;
 
         if !seen_names.insert(contract_name.clone()) {
             anyhow::bail!(
@@ -1350,31 +1504,56 @@ fn run_batch(
             contract_name.bold()
         ));
 
+        let mut pair_error = None;
         let report = match (
             load_wasm_input(&pair.old, &remote_config, &oci_config, progress),
             load_wasm_input(&pair.new, &remote_config, &oci_config, progress),
         ) {
             (Ok(old_wasm), Ok(new_wasm)) => {
-                match compare_contracts(
-                    &ContractComparison {
-                        old_bytes: &old_wasm.bytes,
-                        old_path: &old_wasm.path,
-                        new_bytes: &new_wasm.bytes,
-                        new_path: &new_wasm.path,
-                        suppressions,
-                        explain: args.explain,
-                        strict: args.strict,
-                        no_timestamp: args.no_timestamp,
-                        empirical: args.empirical || args.empirical_file.is_some(),
-                        empirical_file: args.empirical_file.as_deref(),
-                        contract_id: None,
-                        rpc_url: None,
-                        rpc_headers: &args.rpc_headers,
-                    },
-                    progress,
-                ) {
+                match load_pair_storage_schemas(pair).and_then(|storage_schemas| {
+                    if let Some(storage_schemas) = storage_schemas.as_ref() {
+                        let mut report =
+                            soroban_upgrade_safeguard::compare_wasm_bytes_with_options(
+                                &old_wasm.bytes,
+                                &new_wasm.bytes,
+                                &soroban_upgrade_safeguard::CompareOptions {
+                                    suppressions: Some(&pair_suppressions),
+                                    explain,
+                                    strict: settings.strict.value,
+                                    storage_schemas: Some((
+                                        &storage_schemas.old,
+                                        &storage_schemas.new,
+                                    )),
+                                    lineage_store: None,
+                                },
+                            )?;
+                        report.set_no_timestamp(settings.no_timestamp.value);
+                        Ok(report)
+                    } else {
+                        compare_contracts(
+                            &ContractComparison {
+                                old_bytes: &old_wasm.bytes,
+                                old_path: &old_wasm.path,
+                                new_bytes: &new_wasm.bytes,
+                                new_path: &new_wasm.path,
+                                suppressions: &pair_suppressions,
+                                explain,
+                                strict: settings.strict.value,
+                                no_timestamp: settings.no_timestamp.value,
+                                empirical: args.empirical || args.empirical_file.is_some(),
+                                empirical_file: args.empirical_file.as_deref(),
+                                contract_id: None,
+                                rpc_url: None,
+                                rpc_headers: &args.rpc_headers,
+                                lineage_store: None,
+                            },
+                            progress,
+                        )
+                    }
+                }) {
                     Ok(report) => report,
                     Err(e) => {
+                        pair_error = Some(e.to_string());
                         progress(format!(
                             "  ⚠️  Comparison failed for '{}': {}",
                             contract_name,
@@ -1383,13 +1562,14 @@ fn run_batch(
                         synthesize_error_report(
                             &contract_name,
                             &e.to_string(),
-                            args.strict,
-                            args.no_timestamp,
+                            settings.strict.value,
+                            settings.no_timestamp.value,
                         )
                     }
                 }
             }
             (Err(e), _) | (_, Err(e)) => {
+                pair_error = Some(e.to_string());
                 progress(format!(
                     "  ⚠️  Failed to load contract files for '{}': {}",
                     contract_name,
@@ -1398,8 +1578,8 @@ fn run_batch(
                 synthesize_error_report(
                     &contract_name,
                     &e.to_string(),
-                    args.strict,
-                    args.no_timestamp,
+                    settings.strict.value,
+                    settings.no_timestamp.value,
                 )
             }
         };
@@ -1416,8 +1596,8 @@ fn run_batch(
         render_to_outputs(
             &report,
             &file_outputs,
-            args.explain,
-            args.ascii,
+            explain,
+            ascii,
             Some(&contract_name),
             progress,
         )?;
@@ -1426,8 +1606,8 @@ fn run_batch(
             let content = render_single(
                 &report,
                 args.format.unwrap_or(OutputFormat::Text),
-                args.explain,
-                args.ascii,
+                explain,
+                ascii,
             )?;
             write_report_file(
                 output_dir,
@@ -1437,17 +1617,39 @@ fn run_batch(
             )?;
         }
 
-        results.insert(contract_name, report);
+        if let Some(error) = pair_error {
+            results.push(BatchResult::Error {
+                name: contract_name,
+                old_path: pair.old.clone(),
+                new_path: Some(pair.new.clone()),
+                old_storage_schema: pair.old_storage_schema.clone(),
+                new_storage_schema: pair.new_storage_schema.clone(),
+                error,
+                report,
+            });
+        } else {
+            results.push(BatchResult::Success {
+                name: contract_name,
+                old_path: pair.old.clone(),
+                new_path: pair.new.clone(),
+                old_storage_schema: pair.old_storage_schema.clone(),
+                new_storage_schema: pair.new_storage_schema.clone(),
+                report,
+            });
+        }
         progress("\n----------------------------------------\n".to_string());
     }
 
     render_batch_summary(
-        &results,
-        overall_safe,
-        total,
-        args.strict,
+        &BatchSummary {
+            results: &results,
+            overall_safe,
+            total_pairs: total,
+            strict: args.strict,
+            ascii: args.ascii,
+            resolved_manifest: resolved_manifest.as_ref(),
+        },
         outputs,
-        args.ascii,
         progress,
     )?;
 
@@ -1501,12 +1703,17 @@ fn synthesize_error_report(
                 diff::CompatibilityAxis::SourceLevel,
                 report::AxisStatus::Passed,
             );
+            verdicts.insert(
+                diff::CompatibilityAxis::RuntimeSurface,
+                report::AxisStatus::Passed,
+            );
             verdicts
         },
         gated_axes: {
             let mut gated = std::collections::HashSet::new();
             gated.insert(diff::CompatibilityAxis::CallAbi);
             gated.insert(diff::CompatibilityAxis::StorageLayout);
+            gated.insert(diff::CompatibilityAxis::RuntimeSurface);
             gated
         },
         findings_by_category: {
@@ -1542,28 +1749,154 @@ fn synthesize_error_report(
     }
 }
 
-fn render_batch_summary(
-    results: &std::collections::BTreeMap<String, report::SafetyReport>,
+/// Everything the batch summary renders from.
+///
+/// Grouped into a struct rather than passed positionally, following
+/// [`ContractComparison`] — the batch verdict, the per-contract reports, and the
+/// manifest provenance are three different things and reading them by name at
+/// the call site is worth more than the brevity.
+enum BatchResult {
+    Success {
+        name: String,
+        old_path: PathBuf,
+        new_path: PathBuf,
+        old_storage_schema: Option<PathBuf>,
+        new_storage_schema: Option<PathBuf>,
+        report: report::SafetyReport,
+    },
+    Error {
+        name: String,
+        old_path: PathBuf,
+        new_path: Option<PathBuf>,
+        old_storage_schema: Option<PathBuf>,
+        new_storage_schema: Option<PathBuf>,
+        error: String,
+        report: report::SafetyReport,
+    },
+}
+
+impl BatchResult {
+    fn name(&self) -> &str {
+        match self {
+            Self::Success { name, .. } | Self::Error { name, .. } => name,
+        }
+    }
+
+    fn report(&self) -> &report::SafetyReport {
+        match self {
+            Self::Success { report, .. } | Self::Error { report, .. } => report,
+        }
+    }
+
+    fn coverage(&self) -> &str {
+        match self {
+            Self::Error { .. } => "error",
+            Self::Success { .. } => {
+                if self.report().scope().storage_analyzed() {
+                    "schema-backed"
+                } else {
+                    "interface-only"
+                }
+            }
+        }
+    }
+}
+
+struct BatchSummary<'a> {
+    results: &'a [BatchResult],
     overall_safe: bool,
     total_pairs: usize,
+    /// The run-level `--strict` flag. Per-pair strictness lives in the manifest
+    /// provenance; this is the CLI's own setting.
     strict: bool,
-    outputs: &[OutputSpec],
     ascii: bool,
+    /// `None` for directory-scan runs, which have no composition to describe.
+    resolved_manifest: Option<&'a manifest::ResolvedManifest>,
+}
+
+fn render_batch_summary(
+    summary: &BatchSummary<'_>,
+    outputs: &[OutputSpec],
     progress: &dyn Fn(String),
 ) -> Result<()> {
+    let BatchSummary {
+        results,
+        overall_safe,
+        total_pairs,
+        strict,
+        ascii,
+        resolved_manifest,
+    } = *summary;
+
     for output in outputs {
         let content = match output.format {
             OutputFormat::Json => {
-                let mut results_json = serde_json::Map::new();
-                for (name, report) in results {
-                    results_json.insert(name.clone(), serde_json::to_value(report.to_json())?);
+                let mut results_json = Vec::new();
+                for result in results {
+                    let mut entry = serde_json::json!({
+                        "name": result.name(),
+                        "coverage": result.coverage(),
+                        "report": result.report().to_json(),
+                    });
+                    let object = entry
+                        .as_object_mut()
+                        .expect("batch result entry is an object");
+                    match result {
+                        BatchResult::Success {
+                            old_path,
+                            new_path,
+                            old_storage_schema,
+                            new_storage_schema,
+                            ..
+                        } => {
+                            object.insert("old".to_string(), serde_json::json!(old_path));
+                            object.insert("new".to_string(), serde_json::json!(new_path));
+                            object.insert(
+                                "old_storage_schema".to_string(),
+                                serde_json::json!(old_storage_schema),
+                            );
+                            object.insert(
+                                "new_storage_schema".to_string(),
+                                serde_json::json!(new_storage_schema),
+                            );
+                        }
+                        BatchResult::Error {
+                            old_path,
+                            new_path,
+                            old_storage_schema,
+                            new_storage_schema,
+                            error,
+                            ..
+                        } => {
+                            object.insert("error".to_string(), serde_json::json!(error));
+                            object.insert("old".to_string(), serde_json::json!(old_path));
+                            object.insert("new".to_string(), serde_json::json!(new_path));
+                            object.insert(
+                                "old_storage_schema".to_string(),
+                                serde_json::json!(old_storage_schema),
+                            );
+                            object.insert(
+                                "new_storage_schema".to_string(),
+                                serde_json::json!(new_storage_schema),
+                            );
+                        }
+                    }
+                    results_json.push(entry);
                 }
-                let batch_json = serde_json::json!({
+                let mut batch_json = serde_json::json!({
                     "is_safe": overall_safe,
                     "strict": strict,
                     "total_pairs": total_pairs,
                     "results": results_json,
                 });
+                // Only manifest runs have a composition to describe; directory
+                // scans leave the key absent rather than emitting an empty one.
+                if let Some(resolved) = resolved_manifest {
+                    batch_json
+                        .as_object_mut()
+                        .expect("batch_json is constructed as an object")
+                        .insert("manifest".to_string(), resolved.to_json());
+                }
                 serde_json::to_string_pretty(&batch_json)?
             }
             OutputFormat::Markdown => {
@@ -1577,20 +1910,24 @@ fn render_batch_summary(
                 };
                 markdown.push_str(&format!("## Status: {}\n\n", status));
                 markdown.push_str("### Summary\n\n");
-                markdown
-                    .push_str("| Contract | Status | Critical | Warning | Info | Suppressed |\n");
-                markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- |\n");
+                markdown.push_str(
+                    "| Contract | Status | Scope | Coverage | Critical | Warning | Info | Suppressed |\n",
+                );
+                markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
-                for (name, report) in results {
+                for result in results {
+                    let report = result.report();
                     let status_str = if report.is_safe() {
                         "✅ PASSED"
                     } else {
                         "❌ FAILED"
                     };
                     markdown.push_str(&format!(
-                        "| {} | {} | {} | {} | {} | {} |\n",
-                        name,
+                        "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        result.name(),
                         status_str,
+                        report.scope().summary_line(),
+                        result.coverage(),
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
@@ -1600,8 +1937,12 @@ fn render_batch_summary(
 
                 markdown.push_str("\n---\n\n");
 
-                for (name, report) in results {
-                    markdown.push_str(&format!("## Details: {}\n\n", name));
+                for result in results {
+                    markdown.push_str(&format!("## Details: {}\n\n", result.name()));
+                    let report = result.report();
+                    if let BatchResult::Error { error, .. } = result {
+                        markdown.push_str(&format!("**Pair error**: `{}`\n\n", error));
+                    }
                     let report_md = report.generate_summary_markdown();
                     let stripped_md = report_md.replace("# Soroban Upgrade Safety Report\n\n", "");
                     markdown.push_str(&stripped_md);
@@ -1630,16 +1971,19 @@ fn render_batch_summary(
                 };
                 text.push_str(&format!("Overall Status: {}\n\n", status));
                 text.push_str("Summary of Contracts:\n");
-                for (name, report) in results {
+                for result in results {
+                    let report = result.report();
                     let status_str = if report.is_safe() {
                         "✅ PASSED".green().to_string()
                     } else {
                         "❌ FAILED".red().bold().to_string()
                     };
                     text.push_str(&format!(
-                        "  - {}: {} ({} critical, {} warnings, {} info, {} suppressed)\n",
-                        name.bold(),
+                        "  - {}: {} [{}; {}] ({} critical, {} warnings, {} info, {} suppressed)\n",
+                        result.name().bold(),
                         status_str,
+                        report.scope().summary_line(),
+                        result.coverage(),
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
@@ -1649,8 +1993,15 @@ fn render_batch_summary(
 
                 text.push_str("\n========================================\n\n");
 
-                for (name, report) in results {
-                    text.push_str(&format!("=== Contract: {} ===\n", name.bold().magenta()));
+                for result in results {
+                    let report = result.report();
+                    text.push_str(&format!(
+                        "=== Contract: {} ===\n",
+                        result.name().bold().magenta()
+                    ));
+                    if let BatchResult::Error { error, .. } = result {
+                        text.push_str(&format!("Pair error: {}\n", error));
+                    }
                     let detail = report.generate_summary_text(false);
                     if ascii {
                         text.push_str(&report::asciify_markers(&detail));
@@ -1667,8 +2018,9 @@ fn render_batch_summary(
             }
             OutputFormat::GithubActions => {
                 let mut output = String::new();
-                for (name, report) in results {
-                    output.push_str(&format!("::group::{name}\n"));
+                for result in results {
+                    output.push_str(&format!("::group::{}\n", result.name()));
+                    let report = result.report();
                     output.push_str(&render_github_actions(report));
                     output.push_str("::endgroup::\n");
                 }
@@ -1700,7 +2052,12 @@ fn run_single(
     suppressions: &SuppressionConfig,
     progress: &dyn Fn(String),
 ) -> Result<()> {
+    if args.interface_lockfile.is_some() && args.wasm_paths.len() != 1 {
+        anyhow::bail!("--interface-lockfile requires exactly one candidate WASM path");
+    }
+
     let (old_source, new_wasm_path) = match (args.wasm_paths.len(), &args.contract_id) {
+        (1, None) if args.interface_lockfile.is_some() => (None, &args.wasm_paths[0]),
         (2, None) => (None, &args.wasm_paths[1]),
         (1, Some(_)) => (args.contract_id.as_deref(), &args.wasm_paths[0]),
         (2, Some(_)) => {
@@ -1773,43 +2130,112 @@ fn run_single(
         let remote_config = remote_fetch_config(args);
         let oci_config = oci_fetch_config(args);
 
-        let old = if let Some(contract_id) = old_source {
-            let rpc_url = args.rpc_url.as_ref().unwrap();
-            loader::fetch_wasm_from_rpc_with_config(
-                contract_id,
-                &rpc_config(rpc_url, &args.rpc_headers)?,
-            )?
-        } else {
-            load_wasm_input(&args.wasm_paths[0], &remote_config, &oci_config, progress)?
-        };
-
         let new = load_wasm_input(new_wasm_path, &remote_config, &oci_config, progress)?;
 
-        if !suppressions.rules.is_empty() {
+        let mut store_opt = if let Some(ref path) = args.lineage_store {
+            let mut store = if path.exists() {
+                soroban_upgrade_safeguard::lineage::LineageStore::load_from_path(path)?
+            } else {
+                soroban_upgrade_safeguard::lineage::LineageStore::new(
+                    args.contract_id.clone(),
+                    args.contract_id.clone(),
+                )
+            };
+            if let Some(max_v) = args.max_live_versions {
+                store.policy.max_live_versions = Some(max_v);
+            }
+            if let Some(ref ret_v) = args.retire_version {
+                store.retire_version(ret_v)?;
+            }
+            Some(store)
+        } else {
+            None
+        };
+
+        let safety_report = if let Some(lockfile_path) = &args.interface_lockfile {
+            let lockfile_json = std::fs::read_to_string(lockfile_path).with_context(|| {
+                format!(
+                    "Failed to read interface lockfile '{}'.",
+                    lockfile_path.display()
+                )
+            })?;
             progress(format!(
-                "\n🔕 {} suppression rule(s) loaded",
-                suppressions.rules.len()
+                "\n🔒 Checking exported interface against {}...",
+                lockfile_path.display()
+            ));
+            soroban_upgrade_safeguard::compare_wasm_against_interface_lockfile(
+                &lockfile_json,
+                &new.bytes,
+                &soroban_upgrade_safeguard::CompareOptions {
+                    suppressions: Some(suppressions),
+                    explain: args.explain,
+                    strict: args.strict,
+                    storage_schemas: None,
+                    lineage_store: store_opt.as_ref(),
+                },
+            )?
+        } else {
+            let old = if let Some(contract_id) = old_source {
+                let rpc_url = args.rpc_url.as_ref().unwrap();
+                loader::fetch_wasm_from_rpc_with_config(
+                    contract_id,
+                    &rpc_config(rpc_url, &args.rpc_headers)?,
+                )?
+            } else {
+                load_wasm_input(&args.wasm_paths[0], &remote_config, &oci_config, progress)?
+            };
+            compare_contracts(
+                &ContractComparison {
+                    old_bytes: &old.bytes,
+                    old_path: &old.path,
+                    new_bytes: &new.bytes,
+                    new_path: &new.path,
+                    suppressions,
+                    explain: args.explain,
+                    strict: args.strict,
+                    no_timestamp: args.no_timestamp,
+                    empirical: args.empirical || args.empirical_file.is_some(),
+                    empirical_file: args.empirical_file.as_deref(),
+                    contract_id: old_source,
+                    rpc_url: args.rpc_url.as_deref(),
+                    rpc_headers: &args.rpc_headers,
+                    lineage_store: store_opt.as_ref(),
+                },
+                progress,
+            )?
+        };
+
+        if let (Some(ref mut store), Some(ref version_id), Some(ref path)) =
+            (&mut store_opt, &args.record_version, &args.lineage_store)
+        {
+            let new_meta = parser::extract_metadata(&new.bytes)?;
+            let new_spec = spec::ContractSpec::from_entries(&new_meta.spec);
+            let extracted = ExtractedSpec::new(&new.path, &new_meta, &new_spec);
+            let spec_json = canonical_json_bytes(&extracted)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok());
+
+            let record = soroban_upgrade_safeguard::lineage::LineageRecord {
+                version_id: version_id.clone(),
+                order: 0,
+                created_at: "2026-08-25T00:00:00Z".to_string(),
+                status: soroban_upgrade_safeguard::lineage::LiveStatus::Live,
+                wasm_hash: loader::sha256_hex(&new.bytes),
+                interface_hash: soroban_upgrade_safeguard::interface_hash::InterfaceHash::of_spec(
+                    &new_spec,
+                )
+                .to_hex(),
+                spec_json,
+                storage_schema: None,
+                metadata: std::collections::BTreeMap::new(),
+            };
+            store.record_version(record)?;
+            store.save_to_path(path)?;
+            progress(format!(
+                "📜 Lineage store updated and saved to {}",
+                path.display()
             ));
         }
-
-        let safety_report = compare_contracts(
-            &ContractComparison {
-                old_bytes: &old.bytes,
-                old_path: &old.path,
-                new_bytes: &new.bytes,
-                new_path: &new.path,
-                suppressions,
-                explain: args.explain,
-                strict: args.strict,
-                no_timestamp: args.no_timestamp,
-                empirical: args.empirical || args.empirical_file.is_some(),
-                empirical_file: args.empirical_file.as_deref(),
-                contract_id: old_source,
-                rpc_url: args.rpc_url.as_deref(),
-                rpc_headers: &args.rpc_headers,
-            },
-            progress,
-        )?;
 
         render_to_outputs(
             &safety_report,
@@ -2125,16 +2551,31 @@ fn load_wasm_input(
     Ok(loader::load_wasm(path)?)
 }
 
-#[derive(serde::Deserialize, Clone, Debug)]
-struct ContractPair {
+/// One pair the batch loop is about to run, with the settings it runs under.
+///
+/// Manifest mode resolves these through [`manifest::resolve`]; directory-scan
+/// mode builds them from the command line alone. Both feed the same loop, so
+/// per-pair settings need no special-casing there.
+struct BatchPair {
+    name: String,
     old: PathBuf,
     new: PathBuf,
-    name: Option<String>,
+    old_storage_schema: Option<PathBuf>,
+    new_storage_schema: Option<PathBuf>,
+    settings: manifest::ResolvedSettings,
 }
 
-#[derive(serde::Deserialize, Clone, Debug)]
-struct Manifest {
-    pairs: Vec<ContractPair>,
+impl From<manifest::ResolvedPair> for BatchPair {
+    fn from(p: manifest::ResolvedPair) -> Self {
+        Self {
+            name: p.name,
+            old: p.old,
+            new: p.new,
+            old_storage_schema: p.old_storage_schema,
+            new_storage_schema: p.new_storage_schema,
+            settings: p.settings,
+        }
+    }
 }
 
 struct ContractComparison<'a> {
@@ -2151,6 +2592,42 @@ struct ContractComparison<'a> {
     contract_id: Option<&'a str>,
     rpc_url: Option<&'a str>,
     rpc_headers: &'a [String],
+    lineage_store: Option<&'a soroban_upgrade_safeguard::lineage::LineageStore>,
+}
+
+struct PairStorageSchemas {
+    old: soroban_upgrade_safeguard::StorageSchema,
+    new: soroban_upgrade_safeguard::StorageSchema,
+}
+
+fn load_pair_storage_schemas(pair: &BatchPair) -> Result<Option<PairStorageSchemas>> {
+    match (&pair.old_storage_schema, &pair.new_storage_schema) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => anyhow::bail!(
+            "partial storage schema declaration for '{}': both old_storage_schema and new_storage_schema are required",
+            pair.name
+        ),
+        (Some(old_path), Some(new_path)) => Ok(Some(PairStorageSchemas {
+            old: load_storage_schema(old_path)?,
+            new: load_storage_schema(new_path)?,
+        })),
+    }
+}
+
+fn load_storage_schema(path: &Path) -> Result<soroban_upgrade_safeguard::StorageSchema> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read storage schema '{}'", path.display()))?;
+    let format = if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        soroban_upgrade_safeguard::SchemaFormat::Json
+    } else {
+        soroban_upgrade_safeguard::SchemaFormat::Toml
+    };
+    soroban_upgrade_safeguard::StorageSchema::from_str(&content, format)
+        .map_err(|error| anyhow::anyhow!("{}: {}", path.display(), error))
 }
 
 fn compare_contracts(
@@ -2171,6 +2648,7 @@ fn compare_contracts(
         contract_id,
         rpc_url,
         rpc_headers,
+        lineage_store,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -2215,6 +2693,11 @@ fn compare_contracts(
         &new_meta.host_imports,
         old_meta.env_meta.as_ref(),
         new_meta.env_meta.as_ref(),
+        &mut diff_report,
+    );
+    diff::compare_runtime_surfaces(
+        &old_meta.runtime_surface,
+        &new_meta.runtime_surface,
         &mut diff_report,
     );
 
@@ -2307,6 +2790,18 @@ fn compare_contracts(
         report.is_safe = false;
     }
 
+    if let Some(store) = lineage_store {
+        let lineage_report =
+            soroban_upgrade_safeguard::lineage::validate_candidate_against_lineage(
+                new_bytes,
+                &new_spec,
+                store,
+                suppressions,
+                *strict,
+            )?;
+        report.apply_lineage_report(&lineage_report, suppressions, *explain, *strict);
+    }
+
     Ok(report)
 }
 
@@ -2358,21 +2853,53 @@ fn validate_suppression_config(path: &Path) -> Result<()> {
     std::process::exit(1);
 }
 
-fn parse_manifest(path: &Path) -> Result<Vec<ContractPair>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
+/// The command-line layer of the manifest precedence chain.
+///
+/// The implicit `.safeguard.toml` lookup is passed as `default_config` rather
+/// than resolved here, so it lands at the built-in level of the chain and any
+/// manifest naming a config outranks it.
+fn cli_settings(args: &Args) -> manifest::CliSettings {
+    let default_config = (!args.no_config && args.config.is_none())
+        .then(|| PathBuf::from(DEFAULT_CONFIG_FILE))
+        .filter(|path| path.exists());
 
-    if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
-        return Ok(manifest.pairs);
+    manifest::CliSettings {
+        config: args.config.clone(),
+        default_config,
+        no_config: args.no_config,
+        strict: args.strict,
+        explain: args.explain,
+        ascii: args.ascii,
+        no_timestamp: args.no_timestamp,
     }
-    if let Ok(manifest) = serde_json::from_str::<Manifest>(&content) {
-        return Ok(manifest.pairs);
-    }
+}
 
-    anyhow::bail!(
-        "Failed to parse manifest '{}' as either TOML or JSON.",
-        path.display()
-    )
+/// Load the suppression config a pair runs under, caching by resolved path so
+/// twenty pairs sharing one config parse it once, then fold the pair's `[policy]`
+/// overrides onto it.
+fn suppressions_for_pair(
+    settings: &manifest::ResolvedSettings,
+    cache: &mut std::collections::HashMap<PathBuf, SuppressionConfig>,
+) -> Result<SuppressionConfig> {
+    let base = match settings.config.value.as_ref() {
+        Some(path) => match cache.get(path) {
+            Some(cached) => cached.clone(),
+            None => {
+                let loaded = SuppressionConfig::load_from_path(path).with_context(|| {
+                    format!(
+                        "Failed to load the suppression config '{}' named by the manifest \
+                         (origin: {})",
+                        path.display(),
+                        settings.config.origin
+                    )
+                })?;
+                cache.insert(path.to_path_buf(), loaded.clone());
+                loaded
+            }
+        },
+        None => SuppressionConfig::default(),
+    };
+    Ok(settings.apply_policy(base))
 }
 
 #[allow(dead_code)]
@@ -2384,7 +2911,8 @@ struct GapContract {
 fn scan_directories(
     old_dir: &Path,
     new_dir: &Path,
-) -> Result<(Vec<ContractPair>, Vec<GapContract>)> {
+    settings: &manifest::ResolvedSettings,
+) -> Result<(Vec<BatchPair>, Vec<GapContract>)> {
     if !old_dir.is_dir() {
         anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
     }
@@ -2397,15 +2925,26 @@ fn scan_directories(
     for entry in std::fs::read_dir(old_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("wasm") {
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+        {
             let filename = path.file_name().unwrap();
             let new_path = new_dir.join(filename);
             let name = path.file_stem().and_then(|s| s.to_str()).map(String::from);
             if new_path.exists() {
-                pairs.push(ContractPair {
+                let derived = name
+                    .clone()
+                    .unwrap_or_else(|| filename.to_string_lossy().to_string());
+                pairs.push(BatchPair {
+                    name: derived,
                     old: path,
                     new: new_path,
-                    name,
+                    old_storage_schema: None,
+                    new_storage_schema: None,
+                    settings: settings.clone(),
                 });
             } else {
                 let gap_name = name.unwrap_or_else(|| filename.to_string_lossy().to_string());

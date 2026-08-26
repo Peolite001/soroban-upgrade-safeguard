@@ -37,8 +37,9 @@ ureq = { version = "2.9", features = ["json"] }
 notify = { version = "7.0", optional = true }
 
 [dev-dependencies]
-# Property-based/fuzz testing for the decode + type-walk paths (see
-# tests/fuzz_walk.rs). Dev-only: it does not affect the shipped binary.
+# Property-based testing for the decode + type-walk paths (see
+# tests/diff_properties.rs and tests/fuzz_walk.rs). Dev-only: it does not
+# affect the shipped binary.
 proptest = "1"
 public-api = "0.52.1"
 rustdoc-json = "0.9.10"

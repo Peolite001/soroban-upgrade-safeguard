@@ -82,24 +82,51 @@ fn build_code_entry_xdr(wasm_hash: &[u8; 32], code: &[u8]) -> String {
 fn read_http_request(stream: &mut std::net::TcpStream) -> String {
     let mut request = Vec::new();
     let mut buf = [0u8; 1024];
+
     while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-        match stream.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => request.extend_from_slice(&buf[..n]),
+        let n = stream.read(&mut buf).expect("failed to read request");
+        if n == 0 {
+            return String::new();
         }
-        if request.len() > 64 * 1024 {
+        request.extend_from_slice(&buf[..n]);
+    }
+
+    let Some(header_end) = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+    else {
+        return String::new();
+    };
+
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+
+    let target_len = header_end + content_length;
+    while request.len() < target_len {
+        let n = stream.read(&mut buf).expect("failed to read request body");
+        if n == 0 {
             break;
         }
+        request.extend_from_slice(&buf[..n]);
     }
+
     String::from_utf8_lossy(&request).into_owned()
 }
 
 fn finish_http_response(stream: &mut std::net::TcpStream, response: &[u8]) {
     stream
         .write_all(response)
-        .expect("failed to write response");
-    stream.flush().expect("failed to flush");
-    thread::sleep(Duration::from_millis(25));
+        .expect("failed to write HTTP response");
+    stream.flush().expect("failed to flush HTTP response");
 }
 
 /// A tiny HTTP server that handles exactly two sequential `getLedgerEntries`
@@ -117,8 +144,7 @@ fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpLis
         for xdr in [instance_xdr, code_xdr].iter() {
             let (mut stream, _) = listener_clone.accept().expect("failed to accept");
 
-            // Read the full HTTP request (we don't need to parse it carefully)
-            let _ = read_http_request(&mut stream);
+            read_http_request(&mut stream);
 
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -155,7 +181,7 @@ fn start_mock_rpc_not_found() -> (String, Arc<TcpListener>) {
 
     thread::spawn(move || {
         let (mut stream, _) = listener_clone.accept().expect("failed to accept");
-        let _ = read_http_request(&mut stream);
+        read_http_request(&mut stream);
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",

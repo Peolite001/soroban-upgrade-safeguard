@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -15,12 +16,20 @@ fn wasm(name: &str) -> PathBuf {
         .join(name)
 }
 
+static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn temp_dir() -> PathBuf {
+    let count = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("safeguard-attestation-{nonce}"));
+    let pid = std::process::id();
+    let tid = format!("{:?}", std::thread::current().id());
+    let tid_clean: String = tid.chars().filter(|c| c.is_alphanumeric()).collect();
+    let path = std::env::temp_dir().join(format!(
+        "safeguard-attestation-{pid}-{tid_clean}-{nonce}-{count}"
+    ));
     std::fs::create_dir_all(&path).unwrap();
     path
 }
