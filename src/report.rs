@@ -1155,6 +1155,7 @@ impl SafetyReport {
             call_abi: self.call_abi.clone(),
             empirical: self.empirical,
             empirical_findings: self.empirical_findings.clone(),
+            migration: None,
         }
     }
 

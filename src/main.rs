@@ -14,7 +14,7 @@ use soroban_upgrade_safeguard::{
         VerificationPolicy,
     },
     color::{should_disable_color, ColorMode},
-    diff, loader, manifest,
+    diff, loader, manifest, migration,
     oci::{self, OciArtifactKind, OciFetchConfig, OciReference},
     parser,
     remote::{self, RemoteFetchConfig, RemoteRef},
@@ -473,6 +473,8 @@ enum Command {
     Lockfile(LockfileArgs),
     /// Re-render a previously saved JSON report in another format
     Render(RenderArgs),
+    /// Migrate a saved JSON report to the latest schema version
+    UpgradeReport(UpgradeReportArgs),
     /// Generate a suppression config from current findings
     Init(InitArgs),
     /// Create a signed DSSE in-toto attestation for a saved analysis report
@@ -613,6 +615,18 @@ struct RenderArgs {
     /// Unicode markers and decorative separators. Report content is unchanged.
     #[arg(long)]
     plain: bool,
+}
+
+/// `upgrade-report`: migrate a saved JSON report to the latest schema version.
+#[derive(ClapArgs, Debug)]
+struct UpgradeReportArgs {
+    /// Path to a JSON report, or `-` to read it from stdin.
+    #[arg(value_name = "REPORT_JSON")]
+    report: PathBuf,
+
+    /// Destination path for the upgraded report. Defaults to stdout.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 /// `init`: generate a suppression config from current findings.
@@ -1075,6 +1089,57 @@ fn run_render(args: &RenderArgs) -> Result<()> {
     Ok(())
 }
 
+/// Migrate a saved JSON report to [`crate::render::REPORT_SCHEMA_VERSION`] and
+/// write it back out as canonical JSON.
+///
+/// Deterministic and idempotent (see [`crate::migration::upgrade_to_latest`]):
+/// a document already at the latest version is re-emitted unchanged, steps
+/// and all, so running this in a pipeline on every stored report is safe
+/// regardless of which reports actually need upgrading.
+fn run_upgrade_report(args: &UpgradeReportArgs) -> Result<()> {
+    let raw = if args.report == Path::new("-") {
+        std::io::read_to_string(std::io::stdin()).context("Failed to read report from stdin")?
+    } else {
+        std::fs::read_to_string(&args.report)
+            .with_context(|| format!("Failed to read report file: {}", args.report.display()))?
+    };
+
+    let (report, record) = migration::upgrade_to_latest(&raw).with_context(|| {
+        format!(
+            "Failed to upgrade the saved report at '{}'",
+            args.report.display()
+        )
+    })?;
+
+    let json = serde_json::to_string_pretty(&report)?;
+
+    match &args.output {
+        Some(path) => {
+            std::fs::write(path, &json).with_context(|| {
+                format!("Failed to write upgraded report to '{}'", path.display())
+            })?;
+        }
+        None => println!("{json}"),
+    }
+
+    if record.steps.is_empty() {
+        eprintln!(
+            "Already at schema version {}; nothing to migrate.",
+            record.migrated_to
+        );
+    } else {
+        eprintln!(
+            "Migrated from schema version {} to {} ({} step{}).",
+            record.original_schema_version,
+            record.migrated_to,
+            record.steps.len(),
+            if record.steps.len() == 1 { "" } else { "s" }
+        );
+    }
+
+    Ok(())
+}
+
 /// Generate a suppression config from current findings.
 fn run_init(args: &InitArgs) -> Result<()> {
     use std::fs;
@@ -1255,6 +1320,7 @@ fn main() -> Result<()> {
         Some(Command::Extract(extract_args)) => return run_extract(extract_args),
         Some(Command::Lockfile(lockfile_args)) => return run_lockfile(lockfile_args),
         Some(Command::Render(render_args)) => return run_render(render_args),
+        Some(Command::UpgradeReport(upgrade_args)) => return run_upgrade_report(upgrade_args),
         Some(Command::Init(init_args)) => return run_init(init_args),
         Some(Command::Attest(attest_args)) => return run_attest(attest_args),
         Some(Command::VerifyAttestation(verify_args)) => {

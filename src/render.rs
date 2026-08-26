@@ -158,6 +158,11 @@ pub struct RenderableReport {
     pub empirical: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
+    /// Migration history, present only once this document has been through
+    /// `upgrade-report` (or [`crate::migration::upgrade_to_latest`]) at least
+    /// once. Absent on a report written directly by a live run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<crate::migration::MigrationRecord>,
 }
 
 fn default_schema_version() -> u32 {

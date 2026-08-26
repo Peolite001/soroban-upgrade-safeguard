@@ -1082,6 +1082,20 @@ should ignore unknown fields so additive changes do not break them. A firmer
 "additive changes only within a major version" guarantee is intended once the
 crate reaches 1.0.
 
+### Upgrading an older saved report
+
+A saved JSON report is a durable artifact, and `render` only reads
+[`REPORT_SCHEMA_VERSION`](../src/render.rs) directly. When a schema change
+does need an older report migrated forward, use `upgrade-report`:
+
+```bash
+soroban-upgrade-safeguard upgrade-report old_report.json --output upgraded.json
+```
+
+See [Report Schema Migrations](report_migrations.md) for the full versioning
+scheme, what a migration preserves, and how the migration history embedded
+in the upgraded document is structured.
+
 ## Reading the Report
 
 A run prints a header for each loaded contract with a one line summary of how many functions, structs, enums, unions, and error enums it contains. It then prints the safety report.
