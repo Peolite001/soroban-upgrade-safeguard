@@ -674,6 +674,306 @@ fn duplicate_pair_names_fail_before_anything_runs() {
     );
 }
 
+// ── Pair IDs ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn explicit_pair_id_is_accepted_in_a_toml_manifest_and_appears_in_batch_json() {
+    let dir = temp_dir("mc-id-toml");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "Token (v1, safe)"
+        id   = "token-safe"
+        "#,
+    );
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0);
+    let json = run.json();
+
+    let entry = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "Token (v1, safe)")
+        .expect("result entry must be present");
+    assert_eq!(entry["id"], "token-safe");
+
+    let pair = json["manifest"]["pairs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "Token (v1, safe)")
+        .expect("manifest pair provenance must be present");
+    assert_eq!(pair["id"], "token-safe");
+}
+
+#[test]
+fn explicit_pair_id_is_accepted_in_a_json_manifest() {
+    let dir = temp_dir("mc-id-json");
+    stage_wasm(&dir.join("wasm"));
+    let manifest = serde_json::json!({
+        "defaults": { "base_dir": "wasm" },
+        "pairs": [
+            { "old": "v1.wasm", "new": "v1.wasm", "name": "token", "id": "token-1" }
+        ]
+    })
+    .to_string();
+    let root = write(&dir, "root.json", &manifest);
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0);
+    let json = run.json();
+    let entry = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "token")
+        .expect("result entry must be present");
+    assert_eq!(entry["id"], "token-1");
+}
+
+#[test]
+fn omitted_pair_id_falls_back_deterministically_to_the_resolved_name() {
+    let dir = temp_dir("mc-id-fallback");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "token"
+        "#,
+    );
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0);
+    let json = run.json();
+    let entry = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "token")
+        .expect("result entry must be present");
+    // No `id` set -> falls back to the resolved `name`.
+    assert_eq!(entry["id"], "token");
+}
+
+#[test]
+fn duplicate_pair_ids_fail_before_anything_runs() {
+    let dir = temp_dir("mc-id-duplicate");
+    stage_wasm(&dir.join("wasm"));
+    let reports = dir.join("reports");
+
+    write(
+        &dir,
+        "frag.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "token-a"
+        id   = "shared"
+        "#,
+    );
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        include = ["frag.toml"]
+
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v2.wasm"
+        name = "token-b"
+        id   = "shared"
+        "#,
+    );
+
+    let run = run_in(
+        None,
+        &[
+            "--manifest",
+            root.to_str().unwrap(),
+            "--per-contract-output-dir",
+            reports.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(run.code, 1);
+
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        combined.contains("Duplicate pair id 'shared'"),
+        "error must name the collision: {combined}"
+    );
+    assert!(
+        combined.contains("frag.toml"),
+        "missing first file: {combined}"
+    );
+    assert!(
+        combined.contains("root.toml"),
+        "missing second file: {combined}"
+    );
+
+    // Detection runs ahead of execution, so no partial reports hit disk.
+    let wrote_reports = reports
+        .read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    assert!(
+        !wrote_reports,
+        "no reports may be written before the run aborts"
+    );
+}
+
+#[test]
+fn duplicate_pair_ids_fail_in_a_json_manifest_too() {
+    let dir = temp_dir("mc-id-duplicate-json");
+    stage_wasm(&dir.join("wasm"));
+    let manifest = serde_json::json!({
+        "defaults": { "base_dir": "wasm" },
+        "pairs": [
+            { "old": "v1.wasm", "new": "v1.wasm", "name": "token-a", "id": "shared" },
+            { "old": "v1.wasm", "new": "v2.wasm", "name": "token-b", "id": "shared" }
+        ]
+    })
+    .to_string();
+    let root = write(&dir, "root.json", &manifest);
+
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        combined.contains("Duplicate pair id 'shared'"),
+        "error must name the collision: {combined}"
+    );
+}
+
+#[test]
+fn invalid_pair_id_is_rejected_before_anything_runs() {
+    let dir = temp_dir("mc-id-invalid");
+    stage_wasm(&dir.join("wasm"));
+    let reports = dir.join("reports");
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "token"
+        id   = "not a valid id!"
+        "#,
+    );
+
+    let run = run_in(
+        None,
+        &[
+            "--manifest",
+            root.to_str().unwrap(),
+            "--per-contract-output-dir",
+            reports.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        combined.contains("Invalid pair id 'not a valid id!'"),
+        "error must name the offending id: {combined}"
+    );
+    assert!(
+        combined.contains(root.file_name().unwrap().to_str().unwrap())
+            || combined.contains("root.toml"),
+        "error should name the source manifest: {combined}"
+    );
+
+    let wrote_reports = reports
+        .read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    assert!(
+        !wrote_reports,
+        "no reports may be written before the run aborts"
+    );
+}
+
+#[test]
+fn empty_pair_id_is_rejected() {
+    let dir = temp_dir("mc-id-empty");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old = "v1.wasm"
+        new = "v1.wasm"
+        id  = ""
+        "#,
+    );
+
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("Invalid pair id"), "got: {combined}");
+}
+
+#[test]
+fn explain_manifest_reports_pair_ids() {
+    let dir = temp_dir("mc-id-explain");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "token"
+        id   = "token-1"
+        "#,
+    );
+
+    let run = run_in(
+        None,
+        &["--manifest", root.to_str().unwrap(), "--explain-manifest"],
+    );
+    assert_eq!(run.code, 0);
+    assert!(
+        run.stdout.contains("token-1"),
+        "explain-manifest output should show the resolved id: {}",
+        run.stdout
+    );
+}
+
 #[test]
 fn include_cycle_reports_the_chain_and_writes_nothing() {
     let dir = temp_dir("mc-cycle");

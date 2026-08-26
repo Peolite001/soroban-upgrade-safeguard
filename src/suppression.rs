@@ -361,7 +361,10 @@ fn effective_category(rule: &SuppressionRule) -> Option<&str> {
 /// whatever identifies it (category/rule_id and target) as a stand-in
 /// "source location" — the TOML parser this crate uses does not preserve
 /// spans, so a precise line/column is not available.
-fn missing_required_reasons(rules: &[SuppressionRule], policy: &RequireReasonPolicy) -> Vec<String> {
+fn missing_required_reasons(
+    rules: &[SuppressionRule],
+    policy: &RequireReasonPolicy,
+) -> Vec<String> {
     if policy.is_empty() {
         return Vec::new();
     }
@@ -371,10 +374,7 @@ fn missing_required_reasons(rules: &[SuppressionRule], policy: &RequireReasonPol
         .iter()
         .enumerate()
         .filter_map(|(index, rule)| {
-            let has_reason = rule
-                .reason
-                .as_deref()
-                .is_some_and(|r| !r.trim().is_empty());
+            let has_reason = rule.reason.as_deref().is_some_and(|r| !r.trim().is_empty());
             if has_reason {
                 return None;
             }
@@ -383,7 +383,7 @@ fn missing_required_reasons(rules: &[SuppressionRule], policy: &RequireReasonPol
                 .rule_id
                 .clone()
                 .unwrap_or_else(|| canonical_rule_id(&rule.category));
-            let requires_by_id = policy.rule_ids.iter().any(|id| *id == effective_rule_id);
+            let requires_by_id = policy.rule_ids.contains(&effective_rule_id);
 
             let requires_by_axis = effective_category(rule).is_some_and(|category| {
                 classify_finding_axes(category, None, &empty_spec, &empty_spec)
@@ -406,7 +406,7 @@ fn missing_required_reasons(rules: &[SuppressionRule], policy: &RequireReasonPol
                 .map(|t| format!(" (target '{t}')"))
                 .unwrap_or_default();
             Some(format!(
-                "rule #{} for '{identity}'{target_desc} requires a non-empty reason",
+                "require_reason: rule #{} for '{identity}'{target_desc} requires a non-empty reason",
                 index + 1,
             ))
         })
@@ -433,7 +433,7 @@ impl SuppressionConfig {
             return Err(Error::SuppressionConfig {
                 path: None,
                 details: format!(
-                    "suppression config violates its require_reason policy: {}",
+                    "suppression config violates its policy: {}",
                     missing.join("; ")
                 ),
                 source: None,
@@ -1000,7 +1000,10 @@ mod tests {
         // Defense-in-depth: a config assembled programmatically (not via
         // from_toml_str) should still be catchable via .validate().
         let mut config = SuppressionConfig::default();
-        config.require_reason.rule_ids.push("struct_field_removed".to_string());
+        config
+            .require_reason
+            .rule_ids
+            .push("struct_field_removed".to_string());
         config.rules.push(SuppressionRule::new(
             "Struct Field Removed",
             Some("Data.amount"),

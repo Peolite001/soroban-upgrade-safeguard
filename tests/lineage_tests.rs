@@ -74,11 +74,13 @@ fn test_lineage_store_persistence_json_and_toml() {
 
 #[test]
 fn test_live_version_policy_retire_and_max_live() {
-    let mut store = LineageStore::default();
-    store.policy = LiveVersionPolicy {
-        max_live_versions: Some(2),
-        retire_before_version: None,
-        allow_retired_data: false,
+    let mut store = LineageStore {
+        policy: LiveVersionPolicy {
+            max_live_versions: Some(2),
+            retire_before_version: None,
+            allow_retired_data: false,
+        },
+        ..LineageStore::default()
     };
 
     for i in 1..=4 {

@@ -22,6 +22,7 @@ policy without splitting the run, and lets several manifests share one policy
 block instead of each restating it.
 
 - [Schema](#schema)
+- [Pair IDs](#pair-ids)
 - [Precedence](#precedence)
 - [Includes](#includes)
 - [Path resolution](#path-resolution)
@@ -62,6 +63,7 @@ max_walk_depth = 128
 old  = "token_v1.wasm"
 new  = "token_v2.wasm"
 name = "token"
+id   = "token"                # optional; stable across reruns, for CI annotations
 old_storage_schema = "schemas/token_v1.json"
 new-storage-schema = "schemas/token_v2.json"
 strict = true                 # per-pair override
@@ -77,7 +79,7 @@ functions = ["transfer"]
 ```
 
 Every field a pair accepts, `[defaults]` accepts too, and vice versa — except
-`old`, `new`, and `name`, which only make sense on a pair.
+`old`, `new`, `name`, and `id`, which only make sense on a pair.
 
 | Field | Where | Meaning |
 | :--- | :--- | :--- |
@@ -91,11 +93,57 @@ Every field a pair accepts, `[defaults]` accepts too, and vice versa — except
 | `[policy]` | `[defaults]`, pair | Which compatibility axes gate the verdict. One key per axis: `gate_storage_layout`, `gate_call_abi`, `gate_event_indexer`, `gate_source_level`, `gate_runtime_surface`. |
 | `[limits]` | `[defaults]`, pair | Resource limits. Resolved and reported only. |
 | `old`, `new`, `name` | pair | The two builds and the report identity. |
+| `id` | pair | Optional stable identifier for CI annotations and reruns. See [Pair IDs](#pair-ids). |
 | `old_storage_schema`, `new_storage_schema` | pair | Optional old/new storage schemas. Both must be supplied together. |
 
 Unknown keys are a **hard error**, everywhere — top level, `[defaults]`, and on a
 pair. Composition multiplies files, and a `strictt = true` silently dropped in a
 fragment is exactly the failure this format must not allow.
+
+## Pair IDs
+
+A pair's **name** (`name`, or the file name of `new` when omitted) is meant to
+be read by a person in a report. A pair's **id** is meant to be matched by a
+script: a CI annotation, a rerun command, a dashboard correlating runs over
+time. The two are independent — a name can change for readability without
+breaking anything keyed off the id, and vice versa.
+
+```toml
+[[pairs]]
+old  = "token_v1.wasm"
+new  = "token_v2.wasm"
+name = "Token (v1 → v2)"   # free-form, for humans
+id   = "token-v1-v2"       # stable, for tooling
+```
+
+`id` is optional. When omitted, it **deterministically falls back to the
+pair's own resolved `name`** — the same value that would otherwise appear as
+the report identity, so a manifest that never sets `id` behaves exactly as it
+did before this field existed.
+
+When given explicitly, an id must be:
+
+- **non-empty**, and
+- built only from ASCII letters, digits, `-`, `_`, and `.` — no whitespace, no
+  path separators, no punctuation that could confuse a shell argument, a file
+  name, or a CI annotation.
+
+An id that fails either rule is rejected immediately, naming the offending
+value, the pair's name, and the file it was declared in — the manifest is
+never partially processed. The fallback value (derived from `name`, which has
+no charset restriction of its own) is **not** re-validated against this rule,
+so an existing manifest with an unusual `name` cannot start failing just
+because this field was added.
+
+**Ids must be unique across the whole composition**, exactly like names:
+two pairs claiming the same id — whether both explicit, or one explicit
+colliding with another's name-derived fallback — is a hard error, checked
+before any comparison runs, naming both files involved.
+
+`id` appears in `--explain-manifest` output, in the `manifest.pairs[].id` and
+`results[].id` fields of batch JSON, and is not currently surfaced in the
+Markdown/text/GitHub Actions batch renderers — use JSON output for CI tooling
+that needs to key off it.
 
 ## Precedence
 
@@ -214,7 +262,9 @@ never leaves partial reports on disk.
 | :--- | :--- |
 | Include cycle | The full chain, `a.toml → b.toml → a.toml`. |
 | Include depth > 8 | The chain and the cap. |
-| Duplicate pair identity | The name and **both** files that define it. |
+| Duplicate pair name | The name and **both** files that define it. |
+| Duplicate pair id | The id and **both** files that define it. See [Pair IDs](#pair-ids). |
+| Invalid pair id | The offending id, the pair's name, and the file it is in. |
 | Unknown field | The offending key and the file it is in. |
 | Neither TOML nor JSON | **Both** parser errors, with line and column. |
 | Missing include target | The target and the file that referred to it. |
@@ -296,6 +346,7 @@ sources:
 pairs (1):
 
   [1] token
+      id:         token
       defined in: /repo/release.toml
       old:        /repo/artifacts/token_v1.wasm
       new:        /repo/artifacts/token_v2.wasm
@@ -319,6 +370,7 @@ key, alongside `is_safe` / `strict` / `total_pairs` / `results`:
     "pairs": [
       {
         "name": "token",
+        "id": "token",
         "defined_in": "/repo/release.toml",
         "old": "/repo/artifacts/token_v1.wasm",
         "new": "/repo/artifacts/token_v2.wasm",
@@ -335,6 +387,7 @@ key, alongside `is_safe` / `strict` / `total_pairs` / `results`:
   "results": [
     {
       "name": "token",
+      "id": "token",
       "coverage": "schema-backed",
       "old": "/repo/artifacts/token_v1.wasm",
       "new": "/repo/artifacts/token_v2.wasm",
