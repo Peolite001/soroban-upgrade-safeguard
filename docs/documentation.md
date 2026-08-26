@@ -229,10 +229,10 @@ soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>
 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>
 ```
 
-  A manifest can also compose other manifests (`include`), share settings across
-  pairs (`[defaults]`), and override them per pair. See
-  [Batch Manifests](batch_manifests.md) for the schema, the precedence rules,
-  path resolution, and `--explain-manifest`.
+A manifest can also compose other manifests (`include`), share settings across
+pairs (`[defaults]`), and override them per pair. See
+[Batch Manifests](batch_manifests.md) for the schema, the precedence rules,
+path resolution, and `--explain-manifest`.
 
 - Directory scan (pair by file stem):
 
@@ -320,10 +320,7 @@ The file must be a JSON object with a single `entries` array. Each element is a 
 
 ```json
 {
-  "entries": [
-    "AAAAAQAAAA...",
-    "AAAAAQAAAB..."
-  ]
+  "entries": ["AAAAAQAAAA...", "AAAAAQAAAB..."]
 }
 ```
 
@@ -339,13 +336,13 @@ stellar contract inspect --wasm contract.wasm --output xdr-base64-array \
 
 A spec JSON file contains only the `contractspecv0` interface entries. Comparisons that require data from the full WASM binary are skipped when one or both sides is a spec file, and the report records exactly what was skipped:
 
-| Comparison | WASM vs WASM | Spec vs WASM / WASM vs Spec | Spec vs Spec |
-| :--- | :---: | :---: | :---: |
-| Exported interface (functions, types) | ✅ | ✅ | ✅ |
-| Environment metadata (`contractenvmetav0`) | ✅ | ⚠️ skipped | ⚠️ skipped |
-| Build metadata (`contractmetav0`) | ✅ | ⚠️ skipped | ⚠️ skipped |
-| Export section (binary vs spec agreement) | ✅ | ⚠️ skipped | ⚠️ skipped |
-| Import section (host-function diff) | ✅ | ⚠️ skipped | ⚠️ skipped |
+| Comparison                                 | WASM vs WASM | Spec vs WASM / WASM vs Spec | Spec vs Spec |
+| :----------------------------------------- | :----------: | :-------------------------: | :----------: |
+| Exported interface (functions, types)      |      ✅      |             ✅              |      ✅      |
+| Environment metadata (`contractenvmetav0`) |      ✅      |         ⚠️ skipped          |  ⚠️ skipped  |
+| Build metadata (`contractmetav0`)          |      ✅      |         ⚠️ skipped          |  ⚠️ skipped  |
+| Export section (binary vs spec agreement)  |      ✅      |         ⚠️ skipped          |  ⚠️ skipped  |
+| Import section (host-function diff)        |      ✅      |         ⚠️ skipped          |  ⚠️ skipped  |
 
 Skipped comparisons are reported as "not available" in the analysis scope rather than silently ignored, so the verdict is never read as broader than what actually ran. The exported interface comparison — the primary safety gate — always runs regardless of input mode.
 
@@ -381,11 +378,11 @@ inside that directory, locates the produced `.wasm` artifact via `cargo metadata
 
 #### Toolchain requirements
 
-| Requirement | How to satisfy |
-| :--- | :--- |
-| **Cargo** on `$PATH` | Install Rust via [rustup.rs](https://rustup.rs) |
-| **`wasm32-unknown-unknown` target** installed | `rustup target add wasm32-unknown-unknown` |
-| **`crate-type = ["cdylib"]`** in `[lib]` | Required for Cargo to produce a `.wasm` artifact |
+| Requirement                                   | How to satisfy                                   |
+| :-------------------------------------------- | :----------------------------------------------- |
+| **Cargo** on `$PATH`                          | Install Rust via [rustup.rs](https://rustup.rs)  |
+| **`wasm32-unknown-unknown` target** installed | `rustup target add wasm32-unknown-unknown`       |
+| **`crate-type = ["cdylib"]`** in `[lib]`      | Required for Cargo to produce a `.wasm` artifact |
 
 Both requirements are checked before the build starts. A missing target produces a clear error with the exact `rustup` command to run rather than a cryptic rustc error.
 
@@ -479,7 +476,7 @@ Credential resolution follows `docker login`/`docker pull` exactly: a plaintext 
 
 #### Caching
 
-Every fetch is keyed by the resolved *layer* digest (not the manifest digest), so a verified blob is cached content-addressed and can be served again without re-fetching. The cache lives under `--oci-cache-dir` (default: a `soroban-upgrade-safeguard/oci-cache` directory under the OS temp dir, or the path in `SOROBAN_SAFEGUARD_OCI_CACHE` if set). `--no-oci-cache` bypasses both reading and writing the cache for a single run; `--clear-oci-cache` deletes the whole cache directory and exits. The manifest itself is still fetched on every run (its digest is what determines the layer to check the cache for), but the potentially much larger blob download is skipped on a cache hit.
+Every fetch is keyed by the resolved _layer_ digest (not the manifest digest), so a verified blob is cached content-addressed and can be served again without re-fetching. The cache lives under `--oci-cache-dir` (default: a `soroban-upgrade-safeguard/oci-cache` directory under the OS temp dir, or the path in `SOROBAN_SAFEGUARD_OCI_CACHE` if set). `--no-oci-cache` bypasses both reading and writing the cache for a single run; `--clear-oci-cache` deletes the whole cache directory and exits. The manifest itself is still fetched on every run (its digest is what determines the layer to check the cache for), but the potentially much larger blob download is skipped on a cache hit.
 
 #### Provenance
 
@@ -624,15 +621,15 @@ kind = "enum"
 
 Type strings use the same Rust-like spelling the report prints, so a type named in a finding can be pasted straight back into a manifest.
 
-| Spelling | Meaning |
-| :--- | :--- |
-| `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, `u256`, `i256` | scalars |
-| `Bytes`, `String`, `Symbol`, `Address`, `Timepoint`, `Duration` | built-ins |
-| `Val`, `Error`, `()` | raw value, error, void |
-| `Option<T>`, `Vec<T>`, `Map<K, V>`, `Result<T, E>` | containers |
-| `BytesN<32>` | fixed-length bytes |
-| `(Address, u32)` | tuple |
-| `PositionState` | a user-defined type, exported or declared in the manifest |
+| Spelling                                                           | Meaning                                                   |
+| :----------------------------------------------------------------- | :-------------------------------------------------------- |
+| `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, `u256`, `i256` | scalars                                                   |
+| `Bytes`, `String`, `Symbol`, `Address`, `Timepoint`, `Duration`    | built-ins                                                 |
+| `Val`, `Error`, `()`                                               | raw value, error, void                                    |
+| `Option<T>`, `Vec<T>`, `Map<K, V>`, `Result<T, E>`                 | containers                                                |
+| `BytesN<32>`                                                       | fixed-length bytes                                        |
+| `(Address, u32)`                                                   | tuple                                                     |
+| `PositionState`                                                    | a user-defined type, exported or declared in the manifest |
 
 ### Validation and reconciliation
 
@@ -760,8 +757,8 @@ A WASM import that a contract did not need before can raise the minimum Stellar 
 
 A contract spec identifies every user-defined type by name, but a name is not an identity. Two questions have to be kept apart:
 
-- **Is this the same type as before?** — a *structural* question.
-- **What kind of thing is it?** — a *semantic* question, covered in [Type Classification](#type-classification).
+- **Is this the same type as before?** — a _structural_ question.
+- **What kind of thing is it?** — a _semantic_ question, covered in [Type Classification](#type-classification).
 
 ### Why name matching alone is not enough
 
@@ -842,16 +839,16 @@ When a classification came from the opt-in heuristic rather than a declaration, 
 
 Earlier versions folded the event guess into the category string itself. Those names are no longer emitted, but suppression configs that use them keep working — each is mapped onto its structural replacement:
 
-| Pre-1.0 category | Stable category |
-| :--- | :--- |
-| `Event Definition Removed` | `Struct Removed` |
-| `Event Field Removed` | `Struct Field Removed` |
-| `Event Field Reordered` | `Struct Field Reordered` |
-| `Event Field Type Changed` | `Struct Field Type Changed` |
-| `Event Enum Removed` | `Enum Removed` |
-| `Event Enum Case Removed` | `Enum Case Removed` |
-| `Event Enum Case Value Changed` | `Enum Case Value Changed` |
-| `Event Enum Case Added` | `Enum Case Added` |
+| Pre-1.0 category                | Stable category             |
+| :------------------------------ | :-------------------------- |
+| `Event Definition Removed`      | `Struct Removed`            |
+| `Event Field Removed`           | `Struct Field Removed`      |
+| `Event Field Reordered`         | `Struct Field Reordered`    |
+| `Event Field Type Changed`      | `Struct Field Type Changed` |
+| `Event Enum Removed`            | `Enum Removed`              |
+| `Event Enum Case Removed`       | `Enum Case Removed`         |
+| `Event Enum Case Value Changed` | `Enum Case Value Changed`   |
+| `Event Enum Case Added`         | `Enum Case Added`           |
 
 New rules should use the stable names. `Error Enum …` categories are unrelated to events and were never remapped.
 
@@ -865,56 +862,56 @@ Every detection rule has a stable `rule_id` that is independent of the human
 readable category label. The table below lists the registered rules, their
 severity, and the guidance used when `--explain` is enabled.
 
-| rule_id | Label | Severity | Guidance |
-| :--- | :--- | :--- | :--- |
-| `environment` | Environment | Info | Verify the target network supports the new protocol version and adjust tooling as needed. |
-| `function_removed` | Function Removed | Critical | Restore the function or deprecate it in client integrations. |
-| `function_documentation_changed` | Function Documentation Changed | Info | Keep downstream consumers aware of the updated docs and behavior. |
-| `function_added` | Function Added | Info | Inform integrations about the new function. |
-| `function_signature_changed` | Function Signature Changed | Critical | Update call sites and tests to match the new parameter structure. |
-| `parameter_renamed` | Parameter Renamed | Warning | Update named-argument integrations to use the new parameter name. |
-| `parameter_reordered` | Parameter Reordered | Critical | Restore the original parameter order. |
-| `parameter_type_changed` | Parameter Type Changed | Critical | Update caller arguments and SDKs to use the new type. |
-| `return_type_changed` | Return Type Changed | Critical | Update caller expectations and SDKs to the new return type. |
-| `event_definition_removed` | Event Definition Removed | Critical | Update or remove downstream event consumers. |
-| `struct_removed` | Struct Removed | Critical | Restore the struct or migrate any stored data that depends on it. |
-| `struct_documentation_changed` | Struct Documentation Changed | Info | Keep documentation aligned with the intended struct usage. |
-| `struct_added` | Struct Added | Info | Inform consumers about the new struct. |
-| `struct_field_removed` | Struct Field Removed | Critical | Restore the field or perform a storage migration. |
-| `event_field_removed` | Event Field Removed | Critical | Update indexers and consumers that expect the removed field. |
-| `struct_field_reordered` | Struct Field Reordered | Critical | Restore the original field order. |
-| `event_field_reordered` | Event Field Reordered | Critical | Update consumers to handle the new field ordering. |
-| `struct_field_type_changed` | Struct Field Type Changed | Critical | Revert the type change or migrate existing data. |
-| `event_field_type_changed` | Event Field Type Changed | Critical | Update event consumers to handle the new field type. |
-| `struct_field_added` | Struct Field Added | Warning | Ensure consumers and storage migrations handle the new field. |
-| `event_enum_removed` | Event Enum Removed | Critical | Restore the enum or update downstream event consumers. |
-| `enum_removed` | Enum Removed | Critical | Restore the enum or migrate any stored data that uses it. |
-| `enum_documentation_changed` | Enum Documentation Changed | Info | Ensure the updated docs are clear for consumers. |
-| `enum_added` | Enum Added | Info | Inform consumers about the new enum type. |
-| `enum_case_removed` | Enum Case Removed | Critical | Restore the case or migrate data that depends on it. |
-| `event_enum_case_removed` | Event Enum Case Removed | Critical | Restore the case or update event consumers. |
-| `enum_case_value_changed` | Enum Case Value Changed | Critical | Revert the value change to preserve serialization compatibility. |
-| `event_enum_case_value_changed` | Event Enum Case Value Changed | Critical | Revert the change or update event consumers. |
-| `enum_case_added` | Enum Case Added | Info | Ensure consumers can handle the new case. |
-| `event_enum_case_added` | Event Enum Case Added | Info | Update consumers to handle the new event enum case. |
-| `union_removed` | Union Removed | Critical | Restore the union or migrate data that uses it. |
-| `union_added` | Union Added | Info | Inform consumers about the new union type. |
-| `union_case_removed` | Union Case Removed | Critical | Restore the case or migrate existing data. |
-| `union_case_reordered` | Union Case Reordered | Critical | Restore the original case order. |
-| `union_case_type_changed` | Union Case Type Changed | Critical | Revert the type change or migrate data. |
-| `union_case_added` | Union Case Added | Info | Ensure consumers can handle the new union case. |
-| `error_enum_removed` | Error Enum Removed | Critical | Restore the error enum or update clients. |
-| `error_enum_added` | Error Enum Added | Info | Inform client integrations about the new error enum. |
-| `error_enum_case_removed` | Error Enum Case Removed | Critical | Restore the case or update client error handling. |
-| `error_enum_case_value_changed` | Error Enum Case Value Changed | Critical | Revert the value change to preserve error-code compatibility. |
-| `error_enum_case_added` | Error Enum Case Added | Info | Ensure clients can handle the new error case. |
-| `cascading_layout_break` | Cascading Layout Break | Critical | Resolve the underlying layout break in the referenced type. |
-| `host_import_added` | Host Import Added | Warning | Verify the target network has activated the required protocol before deploying. |
-| `host_import_removed` | Host Import Removed | Info | No action typically required. |
-| `host_import_signature_changed` | Host Import Signature Changed | Warning | Investigate why the same import now resolves to a different function type. |
-| `unknown_host_import` | Unknown Host Import | Warning | Verify the import's requirement manually; consider proposing it for the capability registry. |
-| `protocol_requirement_raised` | Protocol Requirement Raised | Warning | Confirm the target network has activated the reported protocol before deploying. |
-| `protocol_environment_mismatch` | Protocol Environment Mismatch | Critical | Rebuild with a matching SDK/toolchain version. |
+| rule_id                          | Label                          | Severity | Guidance                                                                                     |
+| :------------------------------- | :----------------------------- | :------- | :------------------------------------------------------------------------------------------- |
+| `environment`                    | Environment                    | Info     | Verify the target network supports the new protocol version and adjust tooling as needed.    |
+| `function_removed`               | Function Removed               | Critical | Restore the function or deprecate it in client integrations.                                 |
+| `function_documentation_changed` | Function Documentation Changed | Info     | Keep downstream consumers aware of the updated docs and behavior.                            |
+| `function_added`                 | Function Added                 | Info     | Inform integrations about the new function.                                                  |
+| `function_signature_changed`     | Function Signature Changed     | Critical | Update call sites and tests to match the new parameter structure.                            |
+| `parameter_renamed`              | Parameter Renamed              | Warning  | Update named-argument integrations to use the new parameter name.                            |
+| `parameter_reordered`            | Parameter Reordered            | Critical | Restore the original parameter order.                                                        |
+| `parameter_type_changed`         | Parameter Type Changed         | Critical | Update caller arguments and SDKs to use the new type.                                        |
+| `return_type_changed`            | Return Type Changed            | Critical | Update caller expectations and SDKs to the new return type.                                  |
+| `event_definition_removed`       | Event Definition Removed       | Critical | Update or remove downstream event consumers.                                                 |
+| `struct_removed`                 | Struct Removed                 | Critical | Restore the struct or migrate any stored data that depends on it.                            |
+| `struct_documentation_changed`   | Struct Documentation Changed   | Info     | Keep documentation aligned with the intended struct usage.                                   |
+| `struct_added`                   | Struct Added                   | Info     | Inform consumers about the new struct.                                                       |
+| `struct_field_removed`           | Struct Field Removed           | Critical | Restore the field or perform a storage migration.                                            |
+| `event_field_removed`            | Event Field Removed            | Critical | Update indexers and consumers that expect the removed field.                                 |
+| `struct_field_reordered`         | Struct Field Reordered         | Critical | Restore the original field order.                                                            |
+| `event_field_reordered`          | Event Field Reordered          | Critical | Update consumers to handle the new field ordering.                                           |
+| `struct_field_type_changed`      | Struct Field Type Changed      | Critical | Revert the type change or migrate existing data.                                             |
+| `event_field_type_changed`       | Event Field Type Changed       | Critical | Update event consumers to handle the new field type.                                         |
+| `struct_field_added`             | Struct Field Added             | Warning  | Ensure consumers and storage migrations handle the new field.                                |
+| `event_enum_removed`             | Event Enum Removed             | Critical | Restore the enum or update downstream event consumers.                                       |
+| `enum_removed`                   | Enum Removed                   | Critical | Restore the enum or migrate any stored data that uses it.                                    |
+| `enum_documentation_changed`     | Enum Documentation Changed     | Info     | Ensure the updated docs are clear for consumers.                                             |
+| `enum_added`                     | Enum Added                     | Info     | Inform consumers about the new enum type.                                                    |
+| `enum_case_removed`              | Enum Case Removed              | Critical | Restore the case or migrate data that depends on it.                                         |
+| `event_enum_case_removed`        | Event Enum Case Removed        | Critical | Restore the case or update event consumers.                                                  |
+| `enum_case_value_changed`        | Enum Case Value Changed        | Critical | Revert the value change to preserve serialization compatibility.                             |
+| `event_enum_case_value_changed`  | Event Enum Case Value Changed  | Critical | Revert the change or update event consumers.                                                 |
+| `enum_case_added`                | Enum Case Added                | Info     | Ensure consumers can handle the new case.                                                    |
+| `event_enum_case_added`          | Event Enum Case Added          | Info     | Update consumers to handle the new event enum case.                                          |
+| `union_removed`                  | Union Removed                  | Critical | Restore the union or migrate data that uses it.                                              |
+| `union_added`                    | Union Added                    | Info     | Inform consumers about the new union type.                                                   |
+| `union_case_removed`             | Union Case Removed             | Critical | Restore the case or migrate existing data.                                                   |
+| `union_case_reordered`           | Union Case Reordered           | Critical | Restore the original case order.                                                             |
+| `union_case_type_changed`        | Union Case Type Changed        | Critical | Revert the type change or migrate data.                                                      |
+| `union_case_added`               | Union Case Added               | Info     | Ensure consumers can handle the new union case.                                              |
+| `error_enum_removed`             | Error Enum Removed             | Critical | Restore the error enum or update clients.                                                    |
+| `error_enum_added`               | Error Enum Added               | Info     | Inform client integrations about the new error enum.                                         |
+| `error_enum_case_removed`        | Error Enum Case Removed        | Critical | Restore the case or update client error handling.                                            |
+| `error_enum_case_value_changed`  | Error Enum Case Value Changed  | Critical | Revert the value change to preserve error-code compatibility.                                |
+| `error_enum_case_added`          | Error Enum Case Added          | Info     | Ensure clients can handle the new error case.                                                |
+| `cascading_layout_break`         | Cascading Layout Break         | Critical | Resolve the underlying layout break in the referenced type.                                  |
+| `host_import_added`              | Host Import Added              | Warning  | Verify the target network has activated the required protocol before deploying.              |
+| `host_import_removed`            | Host Import Removed            | Info     | No action typically required.                                                                |
+| `host_import_signature_changed`  | Host Import Signature Changed  | Warning  | Investigate why the same import now resolves to a different function type.                   |
+| `unknown_host_import`            | Unknown Host Import            | Warning  | Verify the import's requirement manually; consider proposing it for the capability registry. |
+| `protocol_requirement_raised`    | Protocol Requirement Raised    | Warning  | Confirm the target network has activated the reported protocol before deploying.             |
+| `protocol_environment_mismatch`  | Protocol Environment Mismatch  | Critical | Rebuild with a matching SDK/toolchain version.                                               |
 
 ## Severity Levels
 
@@ -1017,10 +1014,10 @@ The optional `--expected-wasm-hash <HEX>` flag lets callers pin the expected on-
 
 ### IntegrityError Types
 
-| Error | Cause |
-|-------|-------|
+| Error                          | Cause                                                                                      |
+| ------------------------------ | ------------------------------------------------------------------------------------------ |
 | `IntegrityError[HashMismatch]` | The SHA-256 of the fetched bytecode does not match the hash in the contract instance entry |
-| `IntegrityError[KeyMismatch]` | The ledger key in the RPC response does not match the requested key |
+| `IntegrityError[KeyMismatch]`  | The ledger key in the RPC response does not match the requested key                        |
 
 ### Report Metadata
 
@@ -1152,6 +1149,7 @@ mapped to the same rule id automatically, so existing suppressions keep working.
 ### Legacy Format & Migration
 
 For backwards compatibility, old-format rules (lacking `author`, `expiry`, or `fingerprint`) will trigger a warning on `stderr` during execution for one release before becoming a hard error. To migrate an old rule:
+
 1. Run `soroban-upgrade-safeguard` with `--format json`.
 2. Copy the finding's `category` and `target`.
 3. Add `author`, `reason`, `expiry` (`YYYY-MM-DD`), and compute or copy the `fingerprint`.
@@ -1180,12 +1178,12 @@ be crashed on demand is a gate that can be bypassed.
 A single resource policy is threaded through every decode and every recursive type
 walk. Four limits, each independently configurable:
 
-| Limit | Default | Bounds |
-| :--- | :--- | :--- |
-| `max_xdr_depth` | 64 | XDR recursion depth per entry. Guards against stack overflow at decode time. |
-| `max_xdr_len` | 33554432 (32 MiB) | Bytes decoded per custom section — shared across every entry in the section, so it also caps the total decoded bytes. Guards against oversized-length allocations. |
-| `max_entries` | 100000 | Decoded spec entries, **summed across all `contractspecv0` sections** (a module may carry more than one). Env-metadata entries are budgeted separately. |
-| `max_walk_depth` | 128 | Recursion depth for the type walkers — structural equality, finding-message rendering, and cascade detection — which operate on already-decoded types. |
+| Limit            | Default           | Bounds                                                                                                                                                             |
+| :--------------- | :---------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max_xdr_depth`  | 64                | XDR recursion depth per entry. Guards against stack overflow at decode time.                                                                                       |
+| `max_xdr_len`    | 33554432 (32 MiB) | Bytes decoded per custom section — shared across every entry in the section, so it also caps the total decoded bytes. Guards against oversized-length allocations. |
+| `max_entries`    | 100000            | Decoded spec entries, **summed across all `contractspecv0` sections** (a module may carry more than one). Env-metadata entries are budgeted separately.            |
+| `max_walk_depth` | 128               | Recursion depth for the type walkers — structural equality, finding-message rendering, and cascade detection — which operate on already-decoded types.             |
 
 The distinction between `max_xdr_len` (a **per-section byte cap**) and `max_entries`
 (a **cross-section count cap**) matters: many individually valid sections cannot be
@@ -1214,6 +1212,24 @@ soroban-upgrade-safeguard old.wasm new.wasm --max-xdr-depth 128 --max-walk-depth
 
 The defaults accept every fixture and a representative corpus of real mainnet specs.
 Raise a limit only if a legitimate, unusually large contract is rejected.
+
+### Named policy profiles
+
+A single `.safeguard.toml` can also declare named policy variants -- gating,
+`strict`, `max_suppressions`, `[limits]`, and output formatting -- that share
+one file's suppressions and classification data:
+
+```toml
+[profiles.pr]
+strict = true
+```
+
+```bash
+soroban-upgrade-safeguard old.wasm new.wasm --profile pr
+```
+
+See [Named Policy Profiles](named_policy_profiles.md) for the schema,
+inheritance, precedence, and provenance.
 
 ### Behavior when a limit is exceeded
 
@@ -1262,9 +1278,9 @@ This release changes the wording of the verdict and adds a new optional input. N
 
 The status line is now explicit about the scope it covers.
 
-| Before | After |
-| :--- | :--- |
-| `✅ PASSED (No breaking changes detected)` | `✅ PASSED (No exported-interface breaking changes)` |
+| Before                                           | After                                                      |
+| :----------------------------------------------- | :--------------------------------------------------------- |
+| `✅ PASSED (No breaking changes detected)`       | `✅ PASSED (No exported-interface breaking changes)`       |
 | `❌ FAILED (Critical breaking changes detected)` | `❌ FAILED (Exported-interface breaking changes detected)` |
 
 When a storage schema is supplied, the passing wording widens to `✅ PASSED (No exported-interface or declared-storage breaks)`.
@@ -1301,6 +1317,7 @@ If your pipeline treats `is_safe: true` as "storage compatible", check `scope.st
 To ensure the analyzer's safety claims hold against real-world smart contracts rather than just hand-crafted toy fixtures, a validation corpus of real-world contract upgrade pairs is included in `tests/real_world_corpus/`.
 
 This corpus includes upgrade pairs drawn from real mainnet Soroban protocols:
+
 - **Blend Protocol**: Lending pool contract evolution (v1 -> v2).
 - **Soroswap DEX**: AMM Router contract interface cleanup.
 - **Reflector Price Oracle**: Price data struct representation upgrade.
@@ -1329,7 +1346,7 @@ It works on any WASM that embeds a standard `contractspecv0` custom section. If 
 Appending a field does not move existing fields, so old data still deserializes for the fields that were already there. The new field, however, has no stored value in old entries, so you need a migration or a default. The tool flags this so you remember to handle it. Note that appending to a declared storage **key** is Critical rather than a warning, because it changes the address of every entry.
 
 **What counts as a safe upgrade?**
-Any run that finishes with zero critical findings, *within the scope that was analyzed*. Warnings and info findings are worth reviewing but do not block deployment. Read [What a Passing Verdict Guarantees](#what-a-passing-verdict-guarantees) before treating a pass as storage compatibility.
+Any run that finishes with zero critical findings, _within the scope that was analyzed_. Warnings and info findings are worth reviewing but do not block deployment. Read [What a Passing Verdict Guarantees](#what-a-passing-verdict-guarantees) before treating a pass as storage compatibility.
 
 **Does a green run mean my upgrade is storage safe?**
 Not on its own. By default the tool analyzes only the exported interface, and it says so in the report. Storage layout is analyzed only when you supply a [storage schema](#storage-schema-analysis), and then only for the types you declared.
