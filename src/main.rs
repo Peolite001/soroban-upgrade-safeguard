@@ -263,6 +263,12 @@ struct Args {
     #[arg(long = "rpc-header", value_name = "NAME=ENV_VAR")]
     rpc_headers: Vec<String>,
 
+    /// Accept a JSON-RPC response whose `id` is missing or does not match
+    /// the request's `id`. Off by default; only use this for a provider
+    /// known not to echo request IDs correctly.
+    #[arg(long)]
+    rpc_allow_id_mismatch: bool,
+
     /// Path to a suppression config acknowledging known, intentional breaking
     /// changes. When omitted, falls back to the SOROBAN_SAFEGUARD_CONFIG
     /// environment variable, then to `.safeguard.toml` in the current
@@ -1829,6 +1835,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                                 contract_id: None,
                                 rpc_url: None,
                                 rpc_headers: &args.rpc_headers,
+                                rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
                                 lineage_store: None,
                             },
                             progress,
@@ -2471,7 +2478,8 @@ fn run_single(
                 let rpc_url = args.rpc_url.as_ref().unwrap();
                 loader::fetch_wasm_from_rpc_with_config(
                     contract_id,
-                    &rpc_config(rpc_url, &args.rpc_headers)?,
+                    &rpc_config(rpc_url, &args.rpc_headers)?
+                        .with_id_mismatch_allowed(args.rpc_allow_id_mismatch),
                 )?
             } else {
                 load_wasm_input(&args.wasm_paths[0], &remote_config, &oci_config, progress)?
@@ -2491,6 +2499,7 @@ fn run_single(
                     contract_id: old_source,
                     rpc_url: args.rpc_url.as_deref(),
                     rpc_headers: &args.rpc_headers,
+                    rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
                     lineage_store: store_opt.as_ref(),
                 },
                 progress,
@@ -2897,6 +2906,7 @@ struct ContractComparison<'a> {
     contract_id: Option<&'a str>,
     rpc_url: Option<&'a str>,
     rpc_headers: &'a [String],
+    rpc_allow_id_mismatch: bool,
     lineage_store: Option<&'a soroban_upgrade_safeguard::lineage::LineageStore>,
 }
 
@@ -2953,6 +2963,7 @@ fn compare_contracts(
         contract_id,
         rpc_url,
         rpc_headers,
+        rpc_allow_id_mismatch,
         lineage_store,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
@@ -3045,6 +3056,7 @@ fn compare_contracts(
         } else if let (Some(cid), Some(rpc)) = (contract_id, rpc_url) {
             progress("🌐 Fetching contract instance storage from RPC...".to_string());
             match rpc_config(rpc, rpc_headers).and_then(|config| {
+                let config = config.with_id_mismatch_allowed(*rpc_allow_id_mismatch);
                 loader::fetch_instance_storage_from_rpc_with_provenance(cid, &config)
                     .map_err(|e| anyhow::anyhow!(e))
             }) {

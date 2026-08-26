@@ -79,6 +79,12 @@ pub struct RpcClientConfig {
     pub url: String,
     pub headers: Vec<RpcHeader>,
     pub max_snapshot_retries: u32,
+    /// When `true`, a JSON-RPC response whose `id` is missing or does not
+    /// match the request's `id` is accepted instead of rejected. Off by
+    /// default; only turn this on for a provider that is known not to echo
+    /// request IDs correctly, since it weakens protection against a proxy
+    /// or misconfigured endpoint returning a response for the wrong request.
+    pub allow_id_mismatch: bool,
 }
 
 impl Default for RpcClientConfig {
@@ -87,6 +93,7 @@ impl Default for RpcClientConfig {
             url: String::new(),
             headers: Vec::new(),
             max_snapshot_retries: DEFAULT_MAX_SNAPSHOT_RETRIES,
+            allow_id_mismatch: false,
         }
     }
 }
@@ -97,6 +104,7 @@ impl fmt::Debug for RpcClientConfig {
             .field("url", &redact_url(&self.url))
             .field("headers", &self.headers)
             .field("max_snapshot_retries", &self.max_snapshot_retries)
+            .field("allow_id_mismatch", &self.allow_id_mismatch)
             .finish()
     }
 }
@@ -109,12 +117,21 @@ impl RpcClientConfig {
             url,
             headers: Vec::new(),
             max_snapshot_retries: DEFAULT_MAX_SNAPSHOT_RETRIES,
+            allow_id_mismatch: false,
         })
     }
 
     /// Configure maximum retries for snapshot consistency failures.
     pub fn with_max_retries(mut self, retries: u32) -> Self {
         self.max_snapshot_retries = retries;
+        self
+    }
+
+    /// Accept a JSON-RPC response whose `id` is missing or does not match
+    /// the request's `id`, for providers known not to echo it correctly.
+    /// Off by default; see [`RpcClientConfig::allow_id_mismatch`].
+    pub fn with_id_mismatch_allowed(mut self, allow: bool) -> Self {
+        self.allow_id_mismatch = allow;
         self
     }
 
