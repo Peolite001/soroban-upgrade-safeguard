@@ -369,6 +369,14 @@ struct Args {
     )]
     watch_debounce_ms: u64,
 
+    /// Path to a JSON status file that --watch mode updates atomically after
+    /// every cycle transition (start, completion, error, shutdown). Contains
+    /// only structured operational state (timestamps, cycle count, verdict),
+    /// never findings, so external build systems or service managers can
+    /// poll it cheaply to check liveness.
+    #[arg(long, value_name = "PATH", requires = "watch")]
+    watch_status_file: Option<PathBuf>,
+
     /// Suppress timestamps in report output for deterministic/snapshot testing
     #[arg(long)]
     no_timestamp: bool,
@@ -2438,7 +2446,34 @@ fn run_single(
         Ok(true)
     };
 
-    let is_safe = run_comparison(&progress)?;
+    let cycle_counter = std::cell::Cell::new(0u64);
+    let status_path = args.watch_status_file.clone();
+    let run_comparison_tracked = move |progress: &dyn Fn(String)| -> Result<bool> {
+        let cycle = cycle_counter.get() + 1;
+        cycle_counter.set(cycle);
+        let status = soroban_upgrade_safeguard::watch_status::WatchStatus::starting(cycle);
+        if let Some(ref path) = status_path {
+            if let Err(e) = status.write_to(path) {
+                eprintln!("Warning: failed to write watch status file {}: {e}", path.display());
+            }
+        }
+        let result = run_comparison(progress);
+        if let Some(ref path) = status_path {
+            let final_status = match &result {
+                Ok(is_safe) => status.clone().completed(*is_safe),
+                Err(e) => status.clone().failed(e.to_string()),
+            };
+            if let Err(write_err) = final_status.write_to(path) {
+                eprintln!(
+                    "Warning: failed to write watch status file {}: {write_err}",
+                    path.display()
+                );
+            }
+        }
+        result
+    };
+
+    let is_safe = run_comparison_tracked(&progress)?;
 
     if args.watch && !watch_paths.is_empty() {
         run_watch_mode(
@@ -2447,7 +2482,8 @@ fn run_single(
             outputs,
             suppressions,
             args.watch_debounce_ms,
-            run_comparison,
+            args.watch_status_file.as_deref(),
+            run_comparison_tracked,
         )?;
     } else if args.watch {
         eprintln!(
@@ -2610,6 +2646,7 @@ fn run_watch_mode(
     _outputs: &[OutputSpec],
     _suppressions: &SuppressionConfig,
     debounce_ms: u64,
+    status_path: Option<&Path>,
     run_comparison: impl Fn(&dyn Fn(String)) -> Result<bool>,
 ) -> Result<()> {
     use notify::Watcher;
@@ -2636,6 +2673,7 @@ fn run_watch_mode(
         "\n👀 Watch mode active (debounce: {debounce_ms}ms). Waiting for file changes... (Ctrl+C to stop)\n"
     );
 
+    let loop_result = (|| -> Result<()> {
     loop {
         match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
             Ok(_event) => {
@@ -2703,6 +2741,19 @@ fn run_watch_mode(
             }
         }
     }
+    })();
+
+    if let Some(path) = status_path {
+        let status = soroban_upgrade_safeguard::watch_status::WatchStatus::starting(0).shutdown();
+        if let Err(e) = status.write_to(path) {
+            eprintln!(
+                "Warning: failed to write watch status file {}: {e}",
+                path.display()
+            );
+        }
+    }
+
+    loop_result
 }
 
 #[cfg(not(feature = "watch"))]
@@ -2712,6 +2763,7 @@ fn run_watch_mode(
     _outputs: &[OutputSpec],
     _suppressions: &SuppressionConfig,
     _debounce_ms: u64,
+    _status_path: Option<&Path>,
     _run_comparison: impl Fn(&dyn Fn(String)) -> Result<bool>,
 ) -> Result<()> {
     eprintln!("Warning: --watch is not available in this build. Rebuild with the 'watch' feature enabled.");
