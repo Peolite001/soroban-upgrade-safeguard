@@ -20,13 +20,20 @@ const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// or not. Centralized so timeout/redirect hardening can't silently regress
 /// on one call path while being applied to another.
 pub(crate) fn default_agent() -> Agent {
+    agent_with_timeout(RPC_REQUEST_TIMEOUT)
+}
+
+/// Build an RPC agent with an explicit request timeout, sharing the same
+/// redirect hardening as [`default_agent`]. Used by callers (like the
+/// preflight check) that need a shorter timeout than the production default.
+pub(crate) fn agent_with_timeout(timeout: Duration) -> Agent {
     AgentBuilder::new()
         // Reject redirects entirely. `ureq` only strips the standard
         // Authorization header; provider-specific API-key headers would
         // otherwise be forwarded to the redirected origin.
         .redirects(0)
         .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
-        .timeout(RPC_REQUEST_TIMEOUT)
+        .timeout(timeout)
         .build()
 }
 
