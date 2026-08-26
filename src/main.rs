@@ -358,6 +358,17 @@ struct Args {
     #[arg(long)]
     watch: bool,
 
+    /// Debounce window, in milliseconds, for coalescing rapid filesystem
+    /// events in --watch mode before re-running the comparison. Bounds:
+    /// WATCH_DEBOUNCE_MIN_MS..=WATCH_DEBOUNCE_MAX_MS.
+    #[arg(
+        long,
+        value_name = "MILLISECONDS",
+        default_value_t = DEFAULT_WATCH_DEBOUNCE_MS,
+        value_parser = parse_watch_debounce_ms,
+    )]
+    watch_debounce_ms: u64,
+
     /// Suppress timestamps in report output for deterministic/snapshot testing
     #[arg(long)]
     no_timestamp: bool,
@@ -2430,7 +2441,14 @@ fn run_single(
     let is_safe = run_comparison(&progress)?;
 
     if args.watch && !watch_paths.is_empty() {
-        run_watch_mode(&watch_paths, args, outputs, suppressions, run_comparison)?;
+        run_watch_mode(
+            &watch_paths,
+            args,
+            outputs,
+            suppressions,
+            args.watch_debounce_ms,
+            run_comparison,
+        )?;
     } else if args.watch {
         eprintln!(
             "Warning: --watch requires local file paths (stdin or RPC sources not supported)"
@@ -2442,6 +2460,32 @@ fn run_single(
     }
 
     Ok(())
+}
+
+/// Lower bound for `--watch-debounce-ms`. Below this, the burst of events a
+/// build tool emits for a single logical change (e.g. write-to-temp-then-
+/// rename) would each trigger a separate re-run instead of being coalesced.
+const WATCH_DEBOUNCE_MIN_MS: u64 = 10;
+
+/// Upper bound for `--watch-debounce-ms`. Above this, watch mode would feel
+/// unresponsive to a genuine single-file edit.
+const WATCH_DEBOUNCE_MAX_MS: u64 = 60_000;
+
+/// Default debounce window, matching the fixed value watch mode used before
+/// this option existed.
+const DEFAULT_WATCH_DEBOUNCE_MS: u64 = 300;
+
+fn parse_watch_debounce_ms(s: &str) -> Result<u64, String> {
+    let ms: u64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid number of milliseconds"))?;
+    if !(WATCH_DEBOUNCE_MIN_MS..=WATCH_DEBOUNCE_MAX_MS).contains(&ms) {
+        return Err(format!(
+            "watch debounce must be between {WATCH_DEBOUNCE_MIN_MS}ms and \
+             {WATCH_DEBOUNCE_MAX_MS}ms, got {ms}ms"
+        ));
+    }
+    Ok(ms)
 }
 
 fn is_batch_mode(args: &Args) -> bool {
@@ -2565,6 +2609,7 @@ fn run_watch_mode(
     _args: &Args,
     _outputs: &[OutputSpec],
     _suppressions: &SuppressionConfig,
+    debounce_ms: u64,
     run_comparison: impl Fn(&dyn Fn(String)) -> Result<bool>,
 ) -> Result<()> {
     use notify::Watcher;
@@ -2587,9 +2632,9 @@ fn run_watch_mode(
             });
     }
 
-    eprintln!("\n👀 Watch mode active. Waiting for file changes... (Ctrl+C to stop)\n");
-
-    let debounce_ms = 300;
+    eprintln!(
+        "\n👀 Watch mode active (debounce: {debounce_ms}ms). Waiting for file changes... (Ctrl+C to stop)\n"
+    );
 
     loop {
         match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
@@ -2646,7 +2691,9 @@ fn run_watch_mode(
                     }
                 }
 
-                eprintln!("\n👀 Watch mode active. Waiting for file changes... (Ctrl+C to stop)\n");
+                eprintln!(
+                    "\n👀 Watch mode active (debounce: {debounce_ms}ms). Waiting for file changes... (Ctrl+C to stop)\n"
+                );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // No event - if this is the first run, just continue
@@ -2664,6 +2711,7 @@ fn run_watch_mode(
     _args: &Args,
     _outputs: &[OutputSpec],
     _suppressions: &SuppressionConfig,
+    _debounce_ms: u64,
     _run_comparison: impl Fn(&dyn Fn(String)) -> Result<bool>,
 ) -> Result<()> {
     eprintln!("Warning: --watch is not available in this build. Rebuild with the 'watch' feature enabled.");
@@ -3277,5 +3325,39 @@ mod tests {
         let spec: OutputSpec = "text".parse().unwrap();
         assert_eq!(spec.format, OutputFormat::Text);
         assert!(spec.path.is_none());
+    }
+
+    #[test]
+    fn watch_debounce_default_is_accepted() {
+        assert_eq!(
+            parse_watch_debounce_ms(&DEFAULT_WATCH_DEBOUNCE_MS.to_string()).unwrap(),
+            DEFAULT_WATCH_DEBOUNCE_MS
+        );
+    }
+
+    #[test]
+    fn watch_debounce_accepts_boundary_values() {
+        assert_eq!(
+            parse_watch_debounce_ms(&WATCH_DEBOUNCE_MIN_MS.to_string()).unwrap(),
+            WATCH_DEBOUNCE_MIN_MS
+        );
+        assert_eq!(
+            parse_watch_debounce_ms(&WATCH_DEBOUNCE_MAX_MS.to_string()).unwrap(),
+            WATCH_DEBOUNCE_MAX_MS
+        );
+    }
+
+    #[test]
+    fn watch_debounce_rejects_out_of_range_values() {
+        assert!(parse_watch_debounce_ms(&(WATCH_DEBOUNCE_MIN_MS - 1).to_string()).is_err());
+        assert!(parse_watch_debounce_ms(&(WATCH_DEBOUNCE_MAX_MS + 1).to_string()).is_err());
+        assert!(parse_watch_debounce_ms("0").is_err());
+    }
+
+    #[test]
+    fn watch_debounce_rejects_non_numeric_values() {
+        assert!(parse_watch_debounce_ms("fast").is_err());
+        assert!(parse_watch_debounce_ms("").is_err());
+        assert!(parse_watch_debounce_ms("-5").is_err());
     }
 }
