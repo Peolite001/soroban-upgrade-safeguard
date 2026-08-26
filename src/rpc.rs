@@ -66,6 +66,12 @@ pub struct RpcProvenance {
     pub rpc_endpoint: String,
     /// Lowercase hex SHA-256 hash of the contract's WASM code.
     pub code_hash: String,
+    /// Ledger sequence until which the sampled ledger entry is live
+    /// (`liveUntilLedgerSeq`), if the RPC reported one. `None` means either
+    /// the entry has no TTL or the endpoint did not report it; it is not an
+    /// error condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_until_ledger_seq: Option<u64>,
 }
 
 #[derive(Clone)]

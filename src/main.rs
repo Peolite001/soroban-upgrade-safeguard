@@ -3065,6 +3065,19 @@ fn compare_contracts(
                         loaded.len()
                     ));
                     entries = loaded;
+                    // Surface the sampled entry's durability (expiration) in
+                    // the report even when contract/code provenance was
+                    // never separately captured, without clobbering a
+                    // code_hash the code-fetch path may have already set.
+                    match report.rpc_provenance.as_mut() {
+                        Some(existing) => {
+                            existing.live_until_ledger_seq =
+                                storage_provenance.live_until_ledger_seq;
+                        }
+                        None => {
+                            report.rpc_provenance = Some(storage_provenance);
+                        }
+                    }
                 }
                 Err(e) => {
                     progress(format!(

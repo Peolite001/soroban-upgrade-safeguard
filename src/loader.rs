@@ -192,6 +192,25 @@ pub fn extract_latest_ledger(response: &serde_json::Value) -> Option<u64> {
     }
 }
 
+/// Extract the `liveUntilLedgerSeq` expiration field from a single
+/// `getLedgerEntries` JSON-RPC entry, if present.
+///
+/// Entries with no TTL (e.g. entry types Stellar RPC never assigns
+/// expiration to) simply omit the field, and a value in an unexpected shape
+/// is treated the same as absent: expiration is supplementary durability
+/// context for the reader, not something that should turn otherwise valid
+/// ledger data into a hard failure.
+pub fn extract_entry_expiration(entry: &serde_json::Value) -> Option<u64> {
+    let val = entry.get("liveUntilLedgerSeq")?;
+    if let Some(n) = val.as_u64() {
+        Some(n)
+    } else if let Some(s) = val.as_str() {
+        s.parse::<u64>().ok()
+    } else {
+        None
+    }
+}
+
 /// Query the Stellar network passphrase from the RPC endpoint, returning a fallback if unavailable.
 fn query_network_passphrase(rpc_url: &str, auth: Option<&RpcClientConfig>) -> String {
     if let Ok(response) = query_rpc(rpc_url, auth, "getNetwork", serde_json::json!({})) {
@@ -270,6 +289,8 @@ fn fetch_wasm_from_rpc_inner(
                 message: format!("Contract '{}' not found on-chain", contract_id),
             });
         }
+
+        let instance_expiration = extract_entry_expiration(&entries[0]);
 
         let entry_xdr_b64 = entries[0]["xdr"]
             .as_str()
@@ -445,6 +466,7 @@ fn fetch_wasm_from_rpc_inner(
             network,
             rpc_endpoint: crate::rpc::redact_url(rpc_url),
             code_hash: hex::encode(wasm_hash.0),
+            live_until_ledger_seq: instance_expiration,
         };
 
         return Ok(WasmModule {
@@ -600,6 +622,8 @@ fn fetch_instance_storage_from_rpc_with_provenance_inner(
         });
     }
 
+    let instance_expiration = extract_entry_expiration(&entries[0]);
+
     let entry_xdr_b64 = entries[0]["xdr"]
         .as_str()
         .ok_or_else(|| Error::RpcProtocol {
@@ -666,6 +690,42 @@ fn fetch_instance_storage_from_rpc_with_provenance_inner(
             network,
             rpc_endpoint: crate::rpc::redact_url(rpc_url),
             code_hash: String::new(),
+            live_until_ledger_seq: instance_expiration,
         },
     ))
+}
+
+#[cfg(test)]
+mod expiration_tests {
+    use super::extract_entry_expiration;
+
+    #[test]
+    fn extracts_numeric_expiration() {
+        let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": 555555 });
+        assert_eq!(extract_entry_expiration(&entry), Some(555555));
+    }
+
+    #[test]
+    fn extracts_string_encoded_expiration() {
+        let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": "400000" });
+        assert_eq!(extract_entry_expiration(&entry), Some(400000));
+    }
+
+    #[test]
+    fn missing_field_returns_none() {
+        let entry = serde_json::json!({ "xdr": "ignored" });
+        assert_eq!(extract_entry_expiration(&entry), None);
+    }
+
+    #[test]
+    fn malformed_field_returns_none_without_error() {
+        let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": { "nested": true } });
+        assert_eq!(extract_entry_expiration(&entry), None);
+
+        let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": "not-a-number" });
+        assert_eq!(extract_entry_expiration(&entry), None);
+
+        let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": null });
+        assert_eq!(extract_entry_expiration(&entry), None);
+    }
 }
