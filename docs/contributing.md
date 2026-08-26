@@ -194,6 +194,36 @@ cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>
 in the crate's release dependencies, so structure-aware targets can use it
 without pulling it into the shipped binary (see issue #79).
 
+## Real-World Contract Upgrade Validation Corpus
+
+To complement synthetic unit tests and fixtures, a validation corpus of real-world Soroban contract upgrade pairs is maintained in `tests/real_world_corpus/`. Drawn from deployed protocols (Blend Lending, Soroswap AMM Router, Reflector Price Oracle, SAC Token Router, Governance Escrow), this corpus exercises the analyzer against realistic contract shapes and upgrades.
+
+### Running the Corpus (Opt-In)
+
+The corpus is marked with `#[ignore]` so standard `cargo test` runs remain hermetic, fast, and offline. To run the corpus validation:
+
+```bash
+cargo test --test real_world_corpus -- --ignored
+```
+
+or with environment variable opt-in:
+
+```bash
+REAL_WORLD_CORPUS=1 cargo test --test real_world_corpus -- --ignored
+```
+
+### Refreshing and Maintaining the Corpus
+
+Binaries are compiled reproducibly and documented with provenance and open-source licenses (Apache-2.0 / MIT) in `tests/real_world_corpus/manifest.json`.
+
+To refresh or rebuild the corpus WASMs:
+
+```bash
+bash tests/real_world_corpus/refresh_corpus.sh
+```
+
+Any false positives or missed breaks revealed by the corpus should be documented in [`docs/real_world_corpus_issues.md`](real_world_corpus_issues.md) and tracked as dedicated issues rather than silently accepted.
+
 ## Benchmarking
 
 There was no performance measurement of any kind until issue #135: the tool's

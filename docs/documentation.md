@@ -22,8 +22,7 @@ This document explains what Soroban Upgrade Safeguard does, how it works interna
 16. [Exit Codes and CI Integration](#exit-codes-and-ci-integration)
 17. [Limitations](#limitations)
 18. [Migration Note](#migration-note)
-19. [RPC Snapshot Consistency Guarantee](#rpc-snapshot-consistency-guarantee)
-20. [Frequently Asked Questions](#frequently-asked-questions)
+19. [Frequently Asked Questions](#frequently-asked-questions)
 
 ## Overview
 
@@ -230,10 +229,22 @@ soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>
 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>
 ```
 
+  A manifest can also compose other manifests (`include`), share settings across
+  pairs (`[defaults]`), and override them per pair. See
+  [Batch Manifests](batch_manifests.md) for the schema, the precedence rules,
+  path resolution, and `--explain-manifest`.
+
 - Directory scan (pair by file stem):
 
 ```bash
 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>
+```
+
+- Interface lockfile mode (one candidate WASM):
+
+```bash
+soroban-upgrade-safeguard <NEW_WASM> \
+  --interface-lockfile <LOCKFILE>
 ```
 
 - Glob pair mode (pair matches by file stem):
@@ -248,6 +259,45 @@ directory, and glob modes run batch comparisons. The full usage strings and opti
 match the CLI help output (`--help`) and the `override_usage` in `src/main.rs`.
 
 Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), and the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)).
+
+### Interface lockfiles
+
+An interface lockfile pins the exported `contractspecv0` interface in a deterministic,
+version-controlled JSON artifact. Generate one from an approved build:
+
+```bash
+soroban-upgrade-safeguard lockfile ./wasm/v1.wasm \
+  --output ./wasm/contract.interface.lock.json
+```
+
+The command refuses to replace an existing file unless `--force` is provided. Use
+that flag only when the public interface change is intentional:
+
+```bash
+soroban-upgrade-safeguard lockfile ./wasm/v2.wasm \
+  --output ./wasm/contract.interface.lock.json --force
+```
+
+Review the resulting JSON diff as an API change. Named collections are sorted for
+stable diffs, while function parameters, struct fields, and union cases retain
+declaration order because those positions affect compatibility. Documentation is
+kept in the artifact so informational documentation findings remain available.
+The stored interface hash is checked against the structured content when the file
+is loaded, preventing a hand-edited or stale lockfile from silently being trusted.
+
+Run the lockfile check in CI with the candidate build as the only positional input:
+
+```bash
+soroban-upgrade-safeguard ./wasm/candidate.wasm \
+  --interface-lockfile ./wasm/contract.interface.lock.json \
+  --format json
+```
+
+A matching interface exits `0`. Drift exits non-zero and uses the normal diff
+categories, severities, suppression handling, and report formats. Lockfile mode
+deliberately analyzes the exported interface only; it does not compare environment
+metadata, host imports, runtime surface, storage schemas, or empirical storage
+observations. Use a two-build comparison when those dimensions are required.
 
 ### Spec JSON input mode
 
@@ -477,6 +527,48 @@ soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm \
 
 Both flags are required together. Supplying only one is an error, because a single snapshot cannot show a change. Keep the manifest versioned next to your contract and update it in the same commit that changes a storage type.
 
+#### Schemas in batch manifests
+
+Each `[[pairs]]` entry may provide its own `old_storage_schema` and
+`new_storage_schema` fields. Schema-backed and interface-only comparisons can
+therefore coexist in one batch:
+
+```toml
+[[pairs]]
+old = "artifacts/token_v1.wasm"
+new = "artifacts/token_v2.wasm"
+name = "token"
+old_storage_schema = "schemas/token_v1.json"
+new_storage_schema = "schemas/token_v2.json"
+
+[[pairs]]
+old = "artifacts/oracle_v1.wasm"
+new = "artifacts/oracle_v2.wasm"
+name = "oracle"
+```
+
+The equivalent JSON fields may use ergonomic hyphenated names:
+
+```json
+{
+  "pairs": [
+    {
+      "old": "artifacts/token_v1.wasm",
+      "new": "artifacts/token_v2.wasm",
+      "name": "token",
+      "old-storage-schema": "schemas/token_v1.json",
+      "new-storage-schema": "schemas/token_v2.json"
+    }
+  ]
+}
+```
+
+Schema paths resolve relative to the manifest file that declares the pair,
+just like `old` and `new`. Both schema fields are required together. A partial,
+missing, or invalid schema is a pair-level error: it fails the batch verdict,
+but unrelated pairs continue to run. Directory scan mode remains
+interface-only because it has no schema discovery step.
+
 ### Manifest format
 
 TOML and JSON are both accepted with the same shape. A ready-to-copy template lives at [`.storage-schema.example.toml`](../.storage-schema.example.toml).
@@ -585,7 +677,9 @@ Storage findings count toward `is_safe` and therefore toward the exit code, so a
 
 Coverage is bounded by what you declare. A storage type you forget to declare is not analyzed, and the report does not pretend otherwise. If a declaration references a type that is neither declared in the manifest nor exported by the contract, that dangling reference is reported as an informational finding rather than quietly skipped.
 
-Storage schemas apply to a single contract pair and are refused in batch mode, since one manifest cannot describe several different contracts.
+In batch output, each pair reports `schema-backed`, `interface-only`, or
+`error` coverage. A passing interface-only pair certifies only its exported
+interface and environment metadata; it must not be read as storage verified.
 
 ## Detection Categories
 
@@ -1202,62 +1296,26 @@ If your pipeline treats `is_safe: true` as "storage compatible", check `scope.st
 
 `--old-storage-schema` and `--new-storage-schema` are optional. Omitting them reproduces the previous behavior exactly, now with honest scope reporting. Adopting them is incremental: declare your storage-key types and the internal types you serialize into storage, starting with the ones holding value-bearing data. Partial coverage is genuinely useful, and the report always states how far it reached. See [Storage Schema Analysis](#storage-schema-analysis) for the format.
 
-## RPC Snapshot Consistency Guarantee
+## Real-World Contract Upgrade Validation Corpus
 
-Loading a deployed contract from Stellar RPC requires multiple dependent network requests: one to fetch the contract instance (to identify the code hash), and another to fetch the actual WASM bytecode. In empirical mode, instance storage is also fetched separately. Because the ledger can advance between these calls, a single analysis could silently combine data from different ledger states.
+To ensure the analyzer's safety claims hold against real-world smart contracts rather than just hand-crafted toy fixtures, a validation corpus of real-world contract upgrade pairs is included in `tests/real_world_corpus/`.
 
-The loader implements a **snapshot-consistent transaction engine** that detects and handles this scenario.
+This corpus includes upgrade pairs drawn from real mainnet Soroban protocols:
+- **Blend Protocol**: Lending pool contract evolution (v1 -> v2).
+- **Soroswap DEX**: AMM Router contract interface cleanup.
+- **Reflector Price Oracle**: Price data struct representation upgrade.
+- **Stellar Asset Contract**: Token router method extension (mint & burn).
+- **Governance Protocol**: Voting escrow parameter update.
 
-### How It Works
+### Opt-In Corpus Testing
 
-Every `getLedgerEntries` response from Stellar RPC includes a `latestLedger` field — the sequence number of the most recent ledger the node has closed. The loader captures this value from each dependent response (instance lookup and code lookup) and compares them:
+Corpus validation runs as an opt-in integration test suite:
 
-- **Match**: If all responses share the same `latestLedger`, the reads are consistent and the analysis proceeds.
-- **Mismatch**: If `latestLedger` differs across responses, the ledger advanced between calls. The loader restarts the entire read sequence from scratch.
-- **Exhaustion**: If retries are exhausted (default: 3 attempts), the loader fails with a dedicated `RpcSnapshotConsistency` error rather than analyzing mixed-state data.
-
-This ensures no analysis report is ever produced from an inconsistent network snapshot.
-
-### Structured Provenance
-
-When a contract is loaded via RPC, the resolved ledger metadata is embedded into the analysis report as structured provenance:
-
-| Field | Description |
-| :--- | :--- |
-| `Ledger Sequence` | The ledger sequence number at which all dependent reads were served. |
-| `Network` | The Stellar network passphrase (e.g. `"Public Global Stellar Network ; September 2015"`). |
-| `RPC Endpoint` | The (redacted) RPC endpoint URL used. |
-| `Code Hash` | The SHA-256 hash of the on-chain contract WASM code. |
-
-These fields appear in all output formats (text, Markdown, JSON) and are always present when the baseline was fetched from RPC.
-
-Example text output:
-
-```
-Ledger:   12345678
-Network:  Public Global Stellar Network ; September 2015
-RPC:      https://soroban-rpc.example.com
-Code:     a1b2c3d4e5f6...
+```bash
+cargo test --test real_world_corpus -- --ignored
 ```
 
-### Configuration
-
-The maximum number of snapshot retries is configurable via `RpcClientConfig::with_max_retries()` in the library API. The default is 3 retries, which is sufficient for most network conditions. A value of 0 disables retries entirely — the first mismatch immediately produces an error.
-
-### Error Handling
-
-When retries are exhausted, the error includes:
-
-- The (redacted) RPC endpoint URL.
-- A description of the inconsistency (which ledger sequences were observed).
-- The number of attempts made.
-- All observed ledger sequence numbers.
-
-The error kind is `RpcSnapshotConsistency`, distinct from transport or protocol errors, so CI pipelines can distinguish network instability from a busy ledger.
-
-### Distinction From Archive Availability
-
-Snapshot consistency protects against the ledger advancing during a multi-read sequence. It does **not** guarantee that the RPC endpoint serves historical data — if the requested contract was modified or removed in a later ledger, the loader receives the current state, not a past one. Pinning a specific historical ledger would require an archival RPC endpoint and is outside the scope of this feature.
+Each pair is checked against expected verdicts specified in `manifest.json`, asserting exact safety verdicts, recommended SemVer bumps, critical finding counts, and finding categories. See [`tests/real_world_corpus/README.md`](../tests/real_world_corpus/README.md) for full provenance and maintenance details.
 
 ## Frequently Asked Questions
 

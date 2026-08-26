@@ -57,6 +57,8 @@ pub struct PolicyConfig {
     pub gate_event_indexer: bool,
     #[serde(default = "default_false")]
     pub gate_source_level: bool,
+    #[serde(default = "default_true")]
+    pub gate_runtime_surface: bool,
 }
 
 impl Default for PolicyConfig {
@@ -66,6 +68,7 @@ impl Default for PolicyConfig {
             gate_call_abi: true,
             gate_event_indexer: false,
             gate_source_level: false,
+            gate_runtime_surface: true,
         }
     }
 }

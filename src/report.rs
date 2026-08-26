@@ -235,6 +235,156 @@ pub struct ReportSettings {
 }
 
 impl SafetyReport {
+    pub fn apply_storage_schema_comparison(
+        &mut self,
+        comparison: &crate::storage_schema::StorageSchemaComparison,
+        suppressions: &SuppressionConfig,
+        explain: bool,
+        strict: bool,
+    ) {
+        let key_types = comparison
+            .old
+            .observations
+            .iter()
+            .chain(comparison.new.observations.iter())
+            .filter(|observation| observation.key_type.is_some())
+            .count();
+        let value_types = comparison
+            .old
+            .observations
+            .iter()
+            .chain(comparison.new.observations.iter())
+            .filter(|observation| observation.value_type.is_some())
+            .count();
+        self.scope.storage_schema = StorageScopeState::Analyzed {
+            key_types,
+            value_types,
+        };
+
+        for (side, findings) in [
+            ("old", &comparison.old.findings),
+            ("new", &comparison.new.findings),
+        ] {
+            for mismatch in findings {
+                let category = "Storage Schema Mismatch".to_string();
+                let message = format!(
+                    "{} storage schema mismatch: {}",
+                    side,
+                    serde_json::to_string(mismatch)
+                        .unwrap_or_else(|_| "unserializable mismatch".to_string())
+                );
+                let finding = crate::diff::Finding {
+                    severity: crate::diff::Severity::Critical,
+                    axes: vec![crate::diff::CompatibilityAxis::StorageLayout],
+                    category: category.clone(),
+                    message,
+                    type_name: None,
+                    target: None,
+                    root_target: None,
+                };
+                let rule = suppressions.matching_rule(&finding);
+                let suppressed = rule.is_some();
+                self.critical_count += 1;
+                self.total_findings += 1;
+                if suppressed {
+                    self.suppressed_count += 1;
+                    self.suppressed_critical_count += 1;
+                }
+                if !suppressed {
+                    let storage_gated = suppressions.policy.gate_storage_layout || strict;
+                    if storage_gated {
+                        self.is_safe = false;
+                        self.axis_verdicts.insert(
+                            crate::diff::CompatibilityAxis::StorageLayout,
+                            AxisStatus::Failed,
+                        );
+                    }
+                }
+                self.findings_by_category
+                    .entry(category)
+                    .or_default()
+                    .push(ReportedFinding {
+                        rule_id: "storage_schema_mismatch".to_string(),
+                        axes: finding.axes.clone(),
+                        finding,
+                        suppressed,
+                        suppression_reason: rule.and_then(|rule| rule.reason.clone()),
+                        remediation: explain.then(|| {
+                            "Reconcile the declared schema with the compiled storage behavior."
+                                .to_string()
+                        }),
+                    });
+            }
+        }
+    }
+
+    pub fn apply_lineage_report(
+        &mut self,
+        lineage_report: &crate::lineage::LineageValidationReport,
+        suppressions: &SuppressionConfig,
+        explain: bool,
+        strict: bool,
+    ) {
+        if !lineage_report.is_safe {
+            self.is_safe = false;
+        }
+
+        for hist in &lineage_report.historical_findings {
+            let category = format!("Historical Lineage Break ({})", hist.historical_version_id);
+            let finding = hist.finding.clone();
+            let rule = suppressions.matching_rule(&finding);
+            let suppressed = rule.is_some();
+
+            match finding.severity {
+                crate::diff::Severity::Critical => {
+                    self.critical_count += 1;
+                    if suppressed {
+                        self.suppressed_critical_count += 1;
+                    }
+                }
+                crate::diff::Severity::Warning => {
+                    self.warning_count += 1;
+                    if suppressed {
+                        self.suppressed_warning_count += 1;
+                    }
+                }
+                crate::diff::Severity::Info => {
+                    self.info_count += 1;
+                    if suppressed {
+                        self.suppressed_info_count += 1;
+                    }
+                }
+            }
+
+            self.total_findings += 1;
+            if suppressed {
+                self.suppressed_count += 1;
+            } else {
+                for axis in &finding.axes {
+                    if self.gated_axes.contains(axis) || strict {
+                        self.is_safe = false;
+                        self.axis_verdicts.insert(*axis, AxisStatus::Failed);
+                    }
+                }
+            }
+
+            self.findings_by_category
+                .entry(category)
+                .or_default()
+                .push(ReportedFinding {
+                    rule_id: "historical_lineage_break".to_string(),
+                    axes: finding.axes.clone(),
+                    finding,
+                    suppressed,
+                    suppression_reason: rule.and_then(|r| r.reason.clone()),
+                    remediation: explain.then(|| {
+                        "Update candidate build to maintain backward compatibility with this historical version."
+                            .to_string()
+                    }),
+                });
+        }
+    }
+
     pub fn critical_count(&self) -> usize {
         self.critical_count
     }
@@ -341,7 +491,7 @@ impl SafetyReport {
 }
 
 /// Track what was analyzed in the report.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalysisScope {
     pub exported_interface: bool,
     pub env_metadata: bool,
@@ -394,7 +544,7 @@ impl AnalysisScope {
 }
 
 /// Whether storage schema analysis was performed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum StorageScopeState {
     #[default]
     NotAnalyzed,
@@ -526,10 +676,15 @@ impl SafetyReport {
             crate::diff::CompatibilityAxis::SourceLevel,
             AxisStatus::Passed,
         );
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::RuntimeSurface,
+            AxisStatus::Passed,
+        );
 
         let mut gated_axes = HashSet::new();
         gated_axes.insert(crate::diff::CompatibilityAxis::StorageLayout);
         gated_axes.insert(crate::diff::CompatibilityAxis::CallAbi);
+        gated_axes.insert(crate::diff::CompatibilityAxis::RuntimeSurface);
 
         Self {
             call_abi: crate::call_abi::CallAbiCompatibility::default(),
@@ -634,13 +789,18 @@ impl SafetyReport {
             crate::diff::CompatibilityAxis::SourceLevel,
             AxisStatus::Passed,
         );
+        axis_verdicts.insert(
+            crate::diff::CompatibilityAxis::RuntimeSurface,
+            AxisStatus::Passed,
+        );
 
         let mut gated_axes = HashSet::new();
-        let axes_list = vec![
+        let axes_list = [
             crate::diff::CompatibilityAxis::StorageLayout,
             crate::diff::CompatibilityAxis::CallAbi,
             crate::diff::CompatibilityAxis::EventIndexer,
             crate::diff::CompatibilityAxis::SourceLevel,
+            crate::diff::CompatibilityAxis::RuntimeSurface,
         ];
         for axis in axes_list {
             let is_gated = strict
@@ -654,6 +814,9 @@ impl SafetyReport {
                     }
                     crate::diff::CompatibilityAxis::SourceLevel => {
                         suppressions.policy.gate_source_level
+                    }
+                    crate::diff::CompatibilityAxis::RuntimeSurface => {
+                        suppressions.policy.gate_runtime_surface
                     }
                 };
             if is_gated {
@@ -765,6 +928,9 @@ impl SafetyReport {
                             }
                             crate::diff::CompatibilityAxis::SourceLevel => {
                                 suppressions.policy.gate_source_level
+                            }
+                            crate::diff::CompatibilityAxis::RuntimeSurface => {
+                                suppressions.policy.gate_runtime_surface
                             }
                         };
 
@@ -915,6 +1081,7 @@ impl SafetyReport {
         findings_by_axis.insert(crate::diff::CompatibilityAxis::CallAbi, Vec::new());
         findings_by_axis.insert(crate::diff::CompatibilityAxis::EventIndexer, Vec::new());
         findings_by_axis.insert(crate::diff::CompatibilityAxis::SourceLevel, Vec::new());
+        findings_by_axis.insert(crate::diff::CompatibilityAxis::RuntimeSurface, Vec::new());
 
         for category_findings in self.findings_by_category.values() {
             for reported in category_findings {
@@ -962,6 +1129,12 @@ impl SafetyReport {
             recommended_bump: self.recommended_bump().to_string(),
             old_interface_hash: self.old_interface_hash.map(|h| h.to_hex()),
             new_interface_hash: self.new_interface_hash.map(|h| h.to_hex()),
+            scope: self.scope.clone(),
+            storage_coverage: if self.scope.storage_analyzed() {
+                "schema-backed".to_string()
+            } else {
+                "interface-only".to_string()
+            },
             findings_by_category: self
                 .findings_by_category
                 .iter()

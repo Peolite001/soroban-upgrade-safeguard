@@ -15,6 +15,7 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 - **Suppression Config**: Acknowledge known, intentional breaking changes (e.g. a planned migration) in a `.safeguard.toml` so they no longer fail the run — while still listing them in the report.
 - **Interface Hash**: A stable, order-independent SHA-256 over the normalised spec. Two builds with the same hash expose the same interface, which makes it a cheap cache key and a direct answer to "did this change the interface?".
 - **Spec Extraction**: `extract` dumps a single build's decoded interface as JSON, so you can inspect a WASM or archive its interface without separate Stellar tooling.
+- **Interface Lockfiles**: Commit a reviewable interface snapshot and make CI fail when a candidate build drifts from it.
 - **Re-renderable Reports**: `render` turns a saved JSON report back into text or Markdown, so a stored verdict can be presented any number of ways without the original WASM files.
 - **Multi-Format Output**: Emit the same report as JSON, Markdown, and text simultaneously — each to its own file or stdout — in a single run.
 - **Watch Mode**: Continuously monitor input WASM files for changes and automatically re-run the comparison on every build.
@@ -51,6 +52,39 @@ soroban-upgrade-safeguard extract ./wasm/v1.wasm
 # Just the interface hash, for scripting and cache keys
 soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only
 ```
+
+### Pinning an interface with a lockfile
+
+Generate a lockfile from the build whose public interface you intend to protect:
+
+```bash
+soroban-upgrade-safeguard lockfile ./wasm/v1.wasm \
+  --output ./wasm/contract.interface.lock.json
+```
+
+Commit the resulting JSON file. It contains the interface hash and the structured
+functions and user-defined types, with stable ordering and without build-specific
+paths. When an interface change is intentional, regenerate it with `--force` and
+review the lockfile diff as part of the same change:
+
+```bash
+soroban-upgrade-safeguard lockfile ./wasm/v2.wasm \
+  --output ./wasm/contract.interface.lock.json --force
+```
+
+Use the committed lockfile as a CI gate for a candidate build:
+
+```bash
+soroban-upgrade-safeguard ./wasm/candidate.wasm \
+  --interface-lockfile ./wasm/contract.interface.lock.json \
+  --format json
+```
+
+The command exits successfully when the exported interface matches. A drift exits
+non-zero and reports the same categorized findings as a normal two-build comparison.
+Lockfile checks cover the exported interface only; use the regular comparison mode
+for environment metadata, host imports, runtime surface, storage schemas, or
+empirical validation.
 
 ### Re-rendering a saved report
 
@@ -140,6 +174,44 @@ Watch mode:
 - Keeps the process running regardless of comparison verdict (non-zero exit codes do NOT exit the watcher).
 - Exit with `Ctrl+C`.
 
+### Comparing many contracts at once
+
+A manifest lists the pairs one run compares:
+
+```bash
+soroban-upgrade-safeguard --manifest release.toml
+```
+
+```toml
+include = ["common/policy.toml"]   # share a policy across manifests
+
+[defaults]
+base_dir = "artifacts"             # relative paths resolve against the manifest
+strict   = false
+
+[[pairs]]
+old    = "token_v1.wasm"
+new    = "token_v2.wasm"
+name   = "token"
+old_storage_schema = "schemas/token_v1.json"
+new_storage_schema = "schemas/token_v2.json"
+strict = true                      # this one contract is held to a stricter bar
+
+[pairs.policy]
+gate_event_indexer = true
+```
+
+Settings resolve as `built-in < CLI < included defaults < root [defaults] < pair`,
+except `--strict`/`--explain`, which a manifest may enable but never disable.
+To see exactly where each value came from without running any comparison:
+
+```bash
+soroban-upgrade-safeguard --manifest release.toml --explain-manifest
+```
+
+See [Batch Manifests](docs/batch_manifests.md) for the full schema, includes,
+schema coverage rules, path rules, and JSON provenance.
+
 ### Deterministic output for snapshot testing
 
 Use `--no-timestamp` to suppress the timestamp in report provenance,
@@ -213,6 +285,7 @@ More detailed guides live in the [docs](docs/) folder:
 
 - [Documentation](docs/documentation.md): full explanation of how the analysis pipeline works, severity levels, cascading layout breaks, and CI integration.
 - [Finding Category Reference](docs/finding-categories.md): every category emitted by the tool, with severity, trigger, and remediation guidance — the exact strings to use in suppression rules.
+- [Batch Manifests](docs/batch_manifests.md): the manifest schema, composing manifests with `include`, shared `[defaults]`, per-pair overrides, precedence, and resolution provenance.
 - [Contributing](docs/contributing.md): development setup, project structure, testing, and how to add new detection rules.
 - [Signed Attestations](docs/attestations.md): DSSE signing, the in-toto predicate, offline verification, and security guidance.
 

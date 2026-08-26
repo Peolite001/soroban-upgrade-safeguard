@@ -135,6 +135,11 @@ pub struct RenderableReport {
     /// Interface hash of the new build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_interface_hash: Option<String>,
+    /// Analysis scope and storage coverage for this report.
+    #[serde(default)]
+    pub scope: crate::report::AnalysisScope,
+    #[serde(default)]
+    pub storage_coverage: String,
     /// Categories in a [`BTreeMap`] so the JSON key order is stable and
     /// diffable across runs.
     pub findings_by_category: BTreeMap<String, Vec<ReportedFinding>>,
@@ -244,17 +249,20 @@ impl RenderableReport {
         let mut block = String::new();
         block.push_str("###### Provenance\n\n");
         block.push_str(&format!(
-            "- **Tool**: `soroban-upgrade-safeguard v{}`\n",
-            self.provenance.tool_version
+            "- **Tool**: {}\n",
+            markdown_code_span(&format!(
+                "soroban-upgrade-safeguard v{}",
+                self.provenance.tool_version
+            ))
         ));
         if !self.provenance.timestamp.is_empty() {
             block.push_str(&format!(
-                "- **Timestamp**: `{}`\n",
-                self.provenance.timestamp
+                "- **Timestamp**: {}\n",
+                markdown_code_span(&self.provenance.timestamp)
             ));
         }
         for input in &self.provenance.inputs {
-            block.push_str(&format!("- **Input**: `{input}`\n"));
+            block.push_str(&format!("- **Input**: {}\n", markdown_code_span(input)));
         }
         if let Some(seq) = self.provenance.ledger_sequence {
             block.push_str(&format!("- **Ledger Sequence**: `{seq}`\n"));
@@ -305,6 +313,8 @@ impl RenderableReport {
                 .bold()
         };
         output.push_str(&format!("Status: {}\n", status));
+        output.push_str(&format!("Analysis scope: {}\n", self.scope.summary_line()));
+        output.push_str(&format!("Storage coverage: {}\n", self.storage_coverage));
 
         output.push_str("\nCompatibility Verdicts:\n");
         let axes_in_order = vec![
@@ -312,6 +322,7 @@ impl RenderableReport {
             crate::diff::CompatibilityAxis::CallAbi,
             crate::diff::CompatibilityAxis::EventIndexer,
             crate::diff::CompatibilityAxis::SourceLevel,
+            crate::diff::CompatibilityAxis::RuntimeSurface,
         ];
         for axis in axes_in_order {
             let axis_status = self
@@ -329,6 +340,7 @@ impl RenderableReport {
                 crate::diff::CompatibilityAxis::CallAbi => "Call ABI",
                 crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer",
                 crate::diff::CompatibilityAxis::SourceLevel => "Source Level",
+                crate::diff::CompatibilityAxis::RuntimeSurface => "Runtime Surface",
             };
             output.push_str(&format!("  - {:<18} {}\n", label, status_str));
         }
@@ -384,6 +396,7 @@ impl RenderableReport {
             crate::diff::CompatibilityAxis::CallAbi,
             crate::diff::CompatibilityAxis::EventIndexer,
             crate::diff::CompatibilityAxis::SourceLevel,
+            crate::diff::CompatibilityAxis::RuntimeSurface,
         ] {
             let group = match self.findings_by_axis.get(axis) {
                 Some(g) if !g.is_empty() => g,
@@ -395,6 +408,7 @@ impl RenderableReport {
                 crate::diff::CompatibilityAxis::CallAbi => "CALL ABI COMPATIBILITY",
                 crate::diff::CompatibilityAxis::EventIndexer => "EVENT & INDEXER COMPATIBILITY",
                 crate::diff::CompatibilityAxis::SourceLevel => "SOURCE LEVEL COMPATIBILITY",
+                crate::diff::CompatibilityAxis::RuntimeSurface => "RUNTIME SURFACE COMPATIBILITY",
             };
 
             output.push_str(
@@ -537,6 +551,14 @@ impl RenderableReport {
             "❌ FAILED (Critical breaking changes detected)"
         };
         output.push_str(&format!("## Status: {}\n\n", status));
+        output.push_str(&format!(
+            "**Analysis scope**: {}  \n",
+            markdown_code_span(&self.scope.summary_line())
+        ));
+        output.push_str(&format!(
+            "**Storage coverage**: {}\n\n",
+            markdown_code_span(&self.storage_coverage)
+        ));
 
         output.push_str("### Compatibility Verdicts\n\n");
         output.push_str("| Compatibility Axis | Status | Gated |\n");
@@ -547,6 +569,7 @@ impl RenderableReport {
             crate::diff::CompatibilityAxis::CallAbi,
             crate::diff::CompatibilityAxis::EventIndexer,
             crate::diff::CompatibilityAxis::SourceLevel,
+            crate::diff::CompatibilityAxis::RuntimeSurface,
         ];
 
         for axis in axes_in_order {
@@ -565,6 +588,7 @@ impl RenderableReport {
                 crate::diff::CompatibilityAxis::CallAbi => "Call ABI",
                 crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer",
                 crate::diff::CompatibilityAxis::SourceLevel => "Source Level",
+                crate::diff::CompatibilityAxis::RuntimeSurface => "Runtime Surface",
             };
             let gated = if self.gated_axes.contains(&axis) {
                 "Yes"
@@ -585,12 +609,16 @@ impl RenderableReport {
             output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
         }
         output.push_str(&format!(
-            "\n**Recommended SemVer Bump**: `{}`\n\n",
-            self.recommended_bump
+            "\n**Recommended SemVer Bump**: {}\n\n",
+            markdown_code_span(&self.recommended_bump)
         ));
         output.push_str(&self.directional_call_abi_markdown());
         for (label, value) in self.interface_hash_lines() {
-            output.push_str(&format!("**{}**: `{}`\n\n", label, value));
+            output.push_str(&format!(
+                "**{}**: {}\n\n",
+                markdown_escape_text(label),
+                markdown_code_span(&value)
+            ));
         }
         output.push_str("---\n\n");
 
@@ -607,6 +635,7 @@ impl RenderableReport {
             crate::diff::CompatibilityAxis::CallAbi,
             crate::diff::CompatibilityAxis::EventIndexer,
             crate::diff::CompatibilityAxis::SourceLevel,
+            crate::diff::CompatibilityAxis::RuntimeSurface,
         ] {
             let group = match self.findings_by_axis.get(axis) {
                 Some(g) if !g.is_empty() => g,
@@ -618,21 +647,29 @@ impl RenderableReport {
                 crate::diff::CompatibilityAxis::CallAbi => "Call ABI Compatibility",
                 crate::diff::CompatibilityAxis::EventIndexer => "Event & Indexer Compatibility",
                 crate::diff::CompatibilityAxis::SourceLevel => "Source Level Compatibility",
+                crate::diff::CompatibilityAxis::RuntimeSurface => "Runtime Surface Compatibility",
             };
 
-            output.push_str(&format!("### {}\n\n", label));
+            output.push_str(&format!("### {}\n\n", markdown_escape_text(label)));
             let mut current_category: Option<&str> = None;
             for reported in group {
                 let finding = &reported.finding;
                 if current_category != Some(finding.category.as_str()) {
                     current_category = Some(&finding.category);
-                    output.push_str(&format!("### {}\n\n", finding.category));
+                    output.push_str(&format!(
+                        "### {}\n\n",
+                        markdown_escape_text(&finding.category)
+                    ));
                 }
 
                 if reported.suppressed {
-                    output.push_str(&format!("- 🔕 **[SUPPRESSED]** {}\n", finding.message));
+                    output.push_str(&format!(
+                        "- 🔕 **[SUPPRESSED]** {}\n",
+                        markdown_escape_text(&finding.message)
+                    ));
                     if let Some(reason) = &reported.suppression_reason {
-                        output.push_str(&format!("  - ↳ reason: {}\n", reason));
+                        output
+                            .push_str(&format!("  - ↳ reason: {}\n", markdown_escape_text(reason)));
                     }
                     continue;
                 }
@@ -642,7 +679,11 @@ impl RenderableReport {
                     Severity::Warning => "🟡",
                     Severity::Info => "🔵",
                 };
-                output.push_str(&format!("- {} {}\n", emoji, finding.message));
+                output.push_str(&format!(
+                    "- {} {}\n",
+                    emoji,
+                    markdown_escape_text(&finding.message)
+                ));
                 if self.empirical {
                     if let Some(ref udt_name) = finding.type_name {
                         let matching_emp: Vec<&crate::empirical::EmpiricalFinding> = self
@@ -655,7 +696,10 @@ impl RenderableReport {
                             if has_failures {
                                 for ef in matching_emp.iter().filter(|ef| !ef.is_success) {
                                     if let Some(ref err) = ef.error {
-                                        output.push_str(&format!("  - ↳ 🔴 **[CONFIRMED]** Stored data failed to decode: `{}`\n", err));
+                                        output.push_str(&format!(
+                                            "  - ↳ 🔴 **[CONFIRMED]** Stored data failed to decode: {}\n",
+                                            markdown_code_span(err)
+                                        ));
                                     }
                                 }
                             } else {
@@ -745,17 +789,22 @@ impl RenderableReport {
                     "New client → old contract"
                 }
             };
+            let compatibility = if verdict.compatible {
+                "passed"
+            } else {
+                "failed"
+            };
             out.push_str(&format!(
-                "- **{}**: `{}`\n",
+                "- **{}**: {}\n",
                 label,
-                if verdict.compatible {
-                    "passed"
-                } else {
-                    "failed"
-                }
+                markdown_code_span(compatibility)
             ));
             for br in verdict.breaks.iter().take(8) {
-                out.push_str(&format!("  - `{}` — {}\n", br.path, br.reason));
+                out.push_str(&format!(
+                    "  - {} — {}\n",
+                    markdown_code_span(&br.path),
+                    markdown_escape_text(&br.reason)
+                ));
             }
         }
         out.push('\n');
@@ -774,6 +823,38 @@ struct SchemaProbe {
 
 fn unknown_tool_version() -> String {
     "unknown".to_string()
+}
+
+fn markdown_escape_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.replace("\r\n", "\n").replace('\r', "\n").chars() {
+        match ch {
+            '\n' => escaped.push_str("\\n"),
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '#' | '+' | '-' | '!' | '|' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn markdown_code_span(value: &str) -> String {
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.replace('\n', "\\n");
+    let mut longest_backtick_run = 0;
+    let mut current_run = 0;
+    for ch in normalized.chars() {
+        if ch == '`' {
+            current_run += 1;
+            longest_backtick_run = longest_backtick_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    let fence = "`".repeat(longest_backtick_run + 1);
+    format!("{fence}{normalized}{fence}")
 }
 
 #[cfg(test)]
@@ -992,6 +1073,40 @@ mod tests {
         assert!(markdown.contains("###### Provenance"));
         assert!(markdown.contains("soroban-upgrade-safeguard v0.1.0"));
         assert!(markdown.contains("2024-01-15T10:30:00Z"));
+    }
+
+    #[test]
+    fn markdown_escapes_sensitive_punctuation_in_findings() {
+        let diff = DiffReport {
+            findings: vec![Finding {
+                severity: Severity::Critical,
+                axes: Vec::new(),
+                category: "Function [Removed]|Changed".to_string(),
+                message: "target `name` has [brackets] | and a newline\nnext line".to_string(),
+                type_name: Some("Type|Name`With`Punctuation".to_string()),
+                target: Some("thing".to_string()),
+                root_target: None,
+            }],
+        };
+        let empty_spec = ContractSpec::default();
+        let report = SafetyReport::new_with_specs(&diff, &empty_spec, &empty_spec);
+
+        let markdown = report.generate_summary_markdown();
+
+        assert!(markdown.contains("### Function \\[Removed\\]\\|Changed"));
+        assert!(
+            markdown.contains("target \\`name\\` has \\[brackets\\] \\| and a newline\\nnext line")
+        );
+        assert!(!markdown.contains("target `name` has [brackets] | and a newline\nnext line"));
+    }
+
+    #[test]
+    fn markdown_code_spans_handle_backticks_without_breaking() {
+        let rendered = markdown_code_span("value `with` backticks");
+
+        assert!(rendered.starts_with("``"));
+        assert!(rendered.ends_with("``"));
+        assert!(rendered.contains("value `with` backticks"));
     }
 
     #[test]
