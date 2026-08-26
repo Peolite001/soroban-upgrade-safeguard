@@ -6,9 +6,29 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::time::Duration;
 
 use crate::error::Error;
 use ureq::{Agent, AgentBuilder};
+
+/// Upper bound on how long a single RPC request may take before it is
+/// aborted. Without this, a stalled or non-responding RPC endpoint would
+/// block the tool (and any caller, including CI) indefinitely.
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The single shared `ureq::Agent` builder for all RPC requests, authenticated
+/// or not. Centralized so timeout/redirect hardening can't silently regress
+/// on one call path while being applied to another.
+pub(crate) fn default_agent() -> Agent {
+    AgentBuilder::new()
+        // Reject redirects entirely. `ureq` only strips the standard
+        // Authorization header; provider-specific API-key headers would
+        // otherwise be forwarded to the redirected origin.
+        .redirects(0)
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
+        .timeout(RPC_REQUEST_TIMEOUT)
+        .build()
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RpcHeader {
@@ -140,14 +160,7 @@ impl RpcClientConfig {
 
     pub(crate) fn request_parts(&self) -> Result<(Agent, ResolvedRpcHeaders), Error> {
         let headers = self.resolve_headers()?;
-        let agent = AgentBuilder::new()
-            // Reject redirects entirely. `ureq` only strips the standard
-            // Authorization header; provider-specific API-key headers would
-            // otherwise be forwarded to the redirected origin.
-            .redirects(0)
-            .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
-            .build();
-        Ok((agent, headers))
+        Ok((default_agent(), headers))
     }
 }
 

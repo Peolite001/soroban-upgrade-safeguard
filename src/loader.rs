@@ -473,9 +473,7 @@ fn query_rpc(
     let (agent, headers) = match auth {
         Some(config) => config.request_parts()?,
         None => (
-            ureq::AgentBuilder::new()
-                .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
-                .build(),
+            crate::rpc::default_agent(),
             crate::rpc::ResolvedRpcHeaders::empty(),
         ),
     };

@@ -102,8 +102,9 @@ fn finish_http_response(stream: &mut std::net::TcpStream, response: &[u8]) {
     thread::sleep(Duration::from_millis(25));
 }
 
-/// A tiny HTTP server that handles exactly two sequential `getLedgerEntries`
-/// requests and returns pre-canned JSON-RPC responses.
+/// A tiny HTTP server that handles exactly three sequential requests
+/// (instance lookup, code lookup, then `getNetwork`) and returns pre-canned
+/// JSON-RPC responses.
 ///
 /// Returns the bound address (e.g. "127.0.0.1:PORT").
 fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpListener>) {
@@ -113,7 +114,7 @@ fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpLis
     let listener_clone = Arc::clone(&listener);
 
     thread::spawn(move || {
-        // Handle exactly 2 requests (instance lookup, then code lookup)
+        // Handle the getLedgerEntries responses (instance, then code)...
         for xdr in [instance_xdr, code_xdr].iter() {
             let (mut stream, _) = listener_clone.accept().expect("failed to accept");
 
@@ -141,6 +142,20 @@ fn start_mock_rpc(instance_xdr: String, code_xdr: String) -> (String, Arc<TcpLis
             );
             finish_http_response(&mut stream, response.as_bytes());
         }
+
+        // ...then the trailing `getNetwork` call the loader always issues to
+        // populate RPC provenance.
+        let (mut stream, _) = listener_clone.accept().expect("failed to accept");
+        let _ = read_http_request(&mut stream);
+        let body =
+            serde_json::to_string(&build_network_response("Test SDF Network ; September 2015"))
+                .unwrap();
+        let response = format!(
+            "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        finish_http_response(&mut stream, response.as_bytes());
     });
 
     (addr, listener)
@@ -430,9 +445,11 @@ fn fetch_wasm_from_rpc_happy_path() {
     let instance_xdr = build_instance_entry_xdr(&wasm_hash);
     let code_xdr = build_code_entry_xdr(&wasm_hash, &code);
 
+    let network_passphrase = "Test SDF Network ; September 2015";
     let (addr, _listener) = start_mock_rpc_with(vec![
         build_rpc_success(&instance_xdr),
         build_rpc_success(&code_xdr),
+        build_network_response(network_passphrase),
     ]);
 
     let module = fetch_wasm_from_rpc(TEST_CONTRACT_ID, &format!("http://{}", addr))
@@ -440,6 +457,13 @@ fn fetch_wasm_from_rpc_happy_path() {
 
     assert_eq!(module.path, format!("stellar://{}", TEST_CONTRACT_ID));
     assert_eq!(module.bytes, code);
+    assert_eq!(
+        module
+            .rpc_provenance
+            .expect("provenance should be set")
+            .network,
+        network_passphrase
+    );
 }
 
 #[test]
