@@ -106,19 +106,28 @@ Two rules, because one does not fit both kinds of setting.
 `config`, `policy.*`, and `limits.*`:
 
 ```
-built-in default  <  CLI flag  <  included defaults  <  root [defaults]  <  pair field
+built-in default  <  SOROBAN_SAFEGUARD_CONFIG  <  CLI flag  <  included defaults  <  root [defaults]  <  pair field
 ```
 
 The CLI sits *below* the manifest deliberately. `--config` is the run-level
 fallback; a manifest naming a config is the more specific statement, and a pair
 naming one is more specific still.
 
+`config` is the one valued setting with an environment-variable layer: the
+`SOROBAN_SAFEGUARD_CONFIG` environment variable lets a CI system set a
+suppression config path once instead of repeating `--config` on every
+invocation. It sits below `--config` itself — an explicit flag always wins —
+but above the built-in `.safeguard.toml` auto-discovery. `--explain-manifest`
+reports it with origin `env` so it's clear at a glance which layer supplied
+the path.
+
 `--no-config` is the single exception: an explicit escape hatch that outranks
 every layer and applies no suppression config to any pair.
 
 The implicit `.safeguard.toml` lookup — the file the tool has always picked up
 from the working directory when nothing named a config — sits at the *built-in*
-level, so any manifest that names its own `config` overrides it.
+level, so any manifest that names its own `config` overrides it, and so does
+`SOROBAN_SAFEGUARD_CONFIG`.
 
 ### Escalation booleans — OR-chain
 
@@ -335,9 +344,10 @@ key, alongside `is_safe` / `strict` / `total_pairs` / `results`:
 }
 ```
 
-`origin` is `built-in`, `cli`, or the path of the manifest file that set the
-value. Directory-scan runs (`--old-dir`/`--new-dir`) have no composition to
-describe and omit the `manifest` key entirely rather than emitting an empty one.
+`origin` is `built-in`, `cli`, `env` (the `SOROBAN_SAFEGUARD_CONFIG` variable),
+or the path of the manifest file that set the value. Directory-scan runs
+(`--old-dir`/`--new-dir`) have no composition to describe and omit the
+`manifest` key entirely rather than emitting an empty one.
 
 ## What is not wired up
 

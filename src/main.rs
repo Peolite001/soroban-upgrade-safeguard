@@ -26,6 +26,69 @@ use soroban_upgrade_safeguard::{
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
+/// Environment variable providing a fallback suppression config path when
+/// `--config` is not passed on the command line. See `--config`'s own help
+/// text. CI systems can set this once instead of repeating `--config` on
+/// every invocation; an explicit `--config` flag always takes precedence.
+const CONFIG_PATH_ENV_VAR: &str = "SOROBAN_SAFEGUARD_CONFIG";
+
+/// Where a resolved suppression config path came from, for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSource {
+    /// Explicit `--config <PATH>`.
+    Cli,
+    /// The `SOROBAN_SAFEGUARD_CONFIG` environment variable.
+    Env,
+    /// Auto-discovered `.safeguard.toml` in the current directory.
+    AutoDiscovered,
+}
+
+impl std::fmt::Display for ConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigSource::Cli => write!(f, "--config"),
+            ConfigSource::Env => write!(f, "{CONFIG_PATH_ENV_VAR} env var"),
+            ConfigSource::AutoDiscovered => write!(f, "auto-discovered {DEFAULT_CONFIG_FILE}"),
+        }
+    }
+}
+
+/// Resolve and load the suppression config: `--config` wins, then the
+/// `SOROBAN_SAFEGUARD_CONFIG` environment variable, then the auto-discovered
+/// `.safeguard.toml` in the current directory, else no suppressions are
+/// applied. `no_config` bypasses all of it.
+///
+/// An explicit `--config` or env-var path that is missing or malformed is an
+/// error; the auto-discovered default is silently skipped when absent
+/// (existing behavior, unchanged).
+fn load_suppressions(
+    no_config: bool,
+    cli_config: Option<&Path>,
+) -> Result<(SuppressionConfig, Option<(PathBuf, ConfigSource)>)> {
+    if no_config {
+        return Ok((SuppressionConfig::default(), None));
+    }
+    if let Some(path) = cli_config {
+        let config = SuppressionConfig::load_from_path(path)?;
+        return Ok((config, Some((path.to_path_buf(), ConfigSource::Cli))));
+    }
+    if let Some(env_path) = std::env::var_os(CONFIG_PATH_ENV_VAR) {
+        let path = PathBuf::from(env_path);
+        let config = SuppressionConfig::load_from_path(&path)?;
+        return Ok((config, Some((path, ConfigSource::Env))));
+    }
+    match SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))? {
+        Some(config) => Ok((
+            config,
+            Some((
+                PathBuf::from(DEFAULT_CONFIG_FILE),
+                ConfigSource::AutoDiscovered,
+            )),
+        )),
+        None => Ok((SuppressionConfig::default(), None)),
+    }
+}
+
 /// Output format for the safety report.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum OutputFormat {
@@ -200,12 +263,14 @@ struct Args {
     rpc_headers: Vec<String>,
 
     /// Path to a suppression config acknowledging known, intentional breaking
-    /// changes. When omitted, `.safeguard.toml` in the current directory is
-    /// used if present; otherwise no suppressions are applied.
+    /// changes. When omitted, falls back to the SOROBAN_SAFEGUARD_CONFIG
+    /// environment variable, then to `.safeguard.toml` in the current
+    /// directory if present; otherwise no suppressions are applied.
     #[arg(long, value_name = "CONFIG")]
     config: Option<PathBuf>,
 
-    /// Do not load any suppression config, including the default .safeguard.toml.
+    /// Do not load any suppression config, including SOROBAN_SAFEGUARD_CONFIG
+    /// and the default .safeguard.toml.
     #[arg(long, conflicts_with = "config")]
     no_config: bool,
 
@@ -230,6 +295,15 @@ struct Args {
     /// render emoji. Applies to text and Markdown output, single and batch.
     #[arg(long)]
     ascii: bool,
+
+    /// Fully plain output for log processors: implies --no-color and --ascii,
+    /// and also strips the remaining decorative Unicode (guidance arrows,
+    /// box-drawing separators) that --ascii alone leaves in place. Applies to
+    /// text and Markdown output, single and batch. Report content (severity,
+    /// targets, scope, remediation) is unchanged.
+    #[arg(long)]
+    plain: bool,
+
     /// Suppress decorative and progress output; the report and exit code are unchanged.
     #[arg(long)]
     quiet: bool,
@@ -466,10 +540,12 @@ struct StreamArgs {
     /// Treat warnings as errors globally (jobs may override).
     #[arg(long)]
     strict: bool,
-    /// Do not load .safeguard.toml automatically.
+    /// Do not load a suppression config automatically, including
+    /// SOROBAN_SAFEGUARD_CONFIG and the default .safeguard.toml.
     #[arg(long)]
     no_config: bool,
-    /// Path to a suppression config.
+    /// Path to a suppression config. Falls back to SOROBAN_SAFEGUARD_CONFIG,
+    /// then to `.safeguard.toml` in the current directory if present.
     #[arg(long, value_name = "CONFIG")]
     config: Option<PathBuf>,
 }
@@ -532,6 +608,11 @@ struct RenderArgs {
     /// Do not color output
     #[arg(long)]
     no_color: bool,
+
+    /// Fully plain output for log processors: implies --no-color and strips
+    /// Unicode markers and decorative separators. Report content is unchanged.
+    #[arg(long)]
+    plain: bool,
 }
 
 /// `init`: generate a suppression config from current findings.
@@ -912,15 +993,10 @@ fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
 fn run_stream(args: &StreamArgs) -> Result<()> {
     use soroban_upgrade_safeguard::jsonl::{self, OutputOrder, StreamConfig};
 
-    let suppressions = if args.no_config {
-        SuppressionConfig::default()
-    } else {
-        match &args.config {
-            Some(path) => SuppressionConfig::load_from_path(path)?,
-            None => SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?
-                .unwrap_or_default(),
-        }
-    };
+    let (suppressions, config_source) = load_suppressions(args.no_config, args.config.as_deref())?;
+    if let Some((path, source)) = &config_source {
+        eprintln!("Suppression config: {} (source: {source})", path.display());
+    }
 
     let output_order = if args.input_order {
         OutputOrder::InputOrder
@@ -952,7 +1028,7 @@ fn run_render(args: &RenderArgs) -> Result<()> {
     };
 
     if should_disable_color(
-        args.no_color,
+        args.no_color || args.plain,
         ColorMode::Auto,
         std::env::var_os("NO_COLOR").is_some(),
         std::io::stdout().is_terminal(),
@@ -968,8 +1044,28 @@ fn run_render(args: &RenderArgs) -> Result<()> {
     })?;
 
     match args.format {
-        RenderFormat::Text => println!("{}", report.to_text(args.explain)),
-        RenderFormat::Markdown => println!("{}", report.to_markdown()),
+        RenderFormat::Text => {
+            let text = report.to_text(args.explain);
+            println!(
+                "{}",
+                if args.plain {
+                    report::plainify(&text)
+                } else {
+                    text
+                }
+            );
+        }
+        RenderFormat::Markdown => {
+            let markdown = report.to_markdown();
+            println!(
+                "{}",
+                if args.plain {
+                    report::plainify(&markdown)
+                } else {
+                    markdown
+                }
+            );
+        }
     }
 
     if !report.is_safe {
@@ -1169,7 +1265,7 @@ fn main() -> Result<()> {
     }
 
     if should_disable_color(
-        args.no_color,
+        args.no_color || args.plain,
         args.color,
         std::env::var_os("NO_COLOR").is_some(),
         std::io::stdout().is_terminal(),
@@ -1275,15 +1371,13 @@ fn main() -> Result<()> {
         }
     };
 
-    let suppressions = if args.no_config {
-        SuppressionConfig::default()
-    } else {
-        match &args.config {
-            Some(path) => SuppressionConfig::load_from_path(path)?,
-            None => SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))?
-                .unwrap_or_default(),
-        }
-    };
+    let (suppressions, config_source) = load_suppressions(args.no_config, args.config.as_deref())?;
+    if let Some((path, source)) = &config_source {
+        progress(format!(
+            "Suppression config: {} (source: {source})",
+            path.display()
+        ));
+    }
 
     if is_batch {
         // Batch mode resolves its suppression config per pair; the eager load
@@ -1451,6 +1545,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             &file_outputs,
             args.explain,
             args.ascii,
+            args.plain,
             Some(&gap.name),
             progress,
         )?;
@@ -1461,6 +1556,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                 args.format.unwrap_or(OutputFormat::Text),
                 args.explain,
                 args.ascii,
+                args.plain,
             )?;
             write_report_file(
                 output_dir,
@@ -1489,6 +1585,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         let pair_suppressions = suppressions_for_pair(settings, &mut config_cache)?;
         let explain = settings.explain.value;
         let ascii = settings.ascii.value || args.ascii;
+        let plain = args.plain;
 
         if !seen_names.insert(contract_name.clone()) {
             anyhow::bail!(
@@ -1598,6 +1695,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             &file_outputs,
             explain,
             ascii,
+            plain,
             Some(&contract_name),
             progress,
         )?;
@@ -1608,6 +1706,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                 args.format.unwrap_or(OutputFormat::Text),
                 explain,
                 ascii,
+                plain,
             )?;
             write_report_file(
                 output_dir,
@@ -1647,6 +1746,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             total_pairs: total,
             strict: args.strict,
             ascii: args.ascii,
+            plain: args.plain,
             resolved_manifest: resolved_manifest.as_ref(),
         },
         outputs,
@@ -1810,6 +1910,7 @@ struct BatchSummary<'a> {
     /// provenance; this is the CLI's own setting.
     strict: bool,
     ascii: bool,
+    plain: bool,
     /// `None` for directory-scan runs, which have no composition to describe.
     resolved_manifest: Option<&'a manifest::ResolvedManifest>,
 }
@@ -1825,6 +1926,7 @@ fn render_batch_summary(
         total_pairs,
         strict,
         ascii,
+        plain,
         resolved_manifest,
     } = *summary;
 
@@ -1951,9 +2053,7 @@ fn render_batch_summary(
 
                 // Convert the summary status markers this arm added directly
                 // (the inner detail sections were already rendered ASCII above).
-                if ascii {
-                    markdown = report::asciify_markers(&markdown);
-                }
+                markdown = destyle_text(markdown, ascii, plain);
                 markdown
             }
             OutputFormat::Text => {
@@ -2003,18 +2103,10 @@ fn render_batch_summary(
                         text.push_str(&format!("Pair error: {}\n", error));
                     }
                     let detail = report.generate_summary_text(false);
-                    if ascii {
-                        text.push_str(&report::asciify_markers(&detail));
-                    } else {
-                        text.push_str(&detail);
-                    }
+                    text.push_str(&destyle_text(detail, ascii, plain));
                     text.push_str("========================================\n\n");
                 }
-                if ascii {
-                    report::asciify_markers(&text)
-                } else {
-                    text
-                }
+                destyle_text(text, ascii, plain)
             }
             OutputFormat::GithubActions => {
                 let mut output = String::new();
@@ -2242,6 +2334,7 @@ fn run_single(
             outputs,
             args.explain,
             args.ascii,
+            args.plain,
             None,
             progress,
         )?;
@@ -2279,11 +2372,12 @@ fn render_to_outputs(
     outputs: &[OutputSpec],
     explain: bool,
     ascii: bool,
+    plain: bool,
     contract_name: Option<&str>,
     progress: &dyn Fn(String),
 ) -> Result<()> {
     for output in outputs {
-        let content = render_single(report, output.format, explain, ascii)?;
+        let content = render_single(report, output.format, explain, ascii, plain)?;
         emit_output(output, &content)?;
 
         if let Some(ref path) = output.path {
@@ -2296,32 +2390,37 @@ fn render_to_outputs(
     Ok(())
 }
 
+/// Apply `--ascii`/`--plain` marker and separator substitution to rendered
+/// text/Markdown. `plain` implies (and supersedes) `ascii`.
+fn destyle_text(text: String, ascii: bool, plain: bool) -> String {
+    if plain {
+        report::plainify(&text)
+    } else if ascii {
+        report::asciify_markers(&text)
+    } else {
+        text
+    }
+}
+
 fn render_single(
     report: &report::SafetyReport,
     format: OutputFormat,
     explain: bool,
     ascii: bool,
+    plain: bool,
 ) -> Result<String> {
     // JSON carries the severity as a field rather than as a marker glyph, and
     // the GitHub Actions workflow-command syntax is already plain ASCII, so
-    // `--ascii` only affects the human-readable formats.
+    // `--ascii`/`--plain` only affect the human-readable formats.
     match format {
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&report.to_json())?),
         OutputFormat::Markdown => {
             let markdown = report.generate_summary_markdown();
-            Ok(if ascii {
-                report::asciify_markers(&markdown)
-            } else {
-                markdown
-            })
+            Ok(destyle_text(markdown, ascii, plain))
         }
         OutputFormat::Text => {
             let text = report.generate_summary_text(explain);
-            Ok(if ascii {
-                report::asciify_markers(&text)
-            } else {
-                text
-            })
+            Ok(destyle_text(text, ascii, plain))
         }
         OutputFormat::GithubActions => Ok(render_github_actions(report)),
     }
@@ -2805,6 +2904,20 @@ fn compare_contracts(
     Ok(report)
 }
 
+/// Render `err` together with its full `source()` chain, so nested detail —
+/// like a `require_reason` policy violation, or the underlying TOML parser's
+/// own complaint — is never swallowed behind a generic top-level message.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(s) = source {
+        message.push_str(": ");
+        message.push_str(&s.to_string());
+        source = s.source();
+    }
+    message
+}
+
 /// Validate a suppression config in isolation and exit with a status that
 /// reflects the outcome: `0` when the config is valid, `1` when it is malformed
 /// or names a category the tool never emits. Requires no WASM inputs.
@@ -2815,7 +2928,7 @@ fn validate_suppression_config(path: &Path) -> Result<()> {
     let config = match SuppressionConfig::load_from_path(path) {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("{}", format!("❌ {e}").red().bold());
+            eprintln!("{}", format!("❌ {}", error_chain(&e)).red().bold());
             std::process::exit(1);
         }
     };
@@ -2859,12 +2972,14 @@ fn validate_suppression_config(path: &Path) -> Result<()> {
 /// than resolved here, so it lands at the built-in level of the chain and any
 /// manifest naming a config outranks it.
 fn cli_settings(args: &Args) -> manifest::CliSettings {
-    let default_config = (!args.no_config && args.config.is_none())
+    let env_config = std::env::var_os(CONFIG_PATH_ENV_VAR).map(PathBuf::from);
+    let default_config = (!args.no_config && args.config.is_none() && env_config.is_none())
         .then(|| PathBuf::from(DEFAULT_CONFIG_FILE))
         .filter(|path| path.exists());
 
     manifest::CliSettings {
         config: args.config.clone(),
+        env_config,
         default_config,
         no_config: args.no_config,
         strict: args.strict,

@@ -18,6 +18,15 @@
 #   - enum cases ........... "Enum.case"              e.g. "StatusEvent.Paused"
 #
 # Omit `target` to match only findings that have no target (e.g. "Environment").
+#
+# Uncomment to require a non-blank `reason` for suppressions matching selected
+# rule IDs and/or compatibility axes — for findings risky enough that an
+# unexplained suppression isn't reviewable. Omitting this table (the default)
+# leaves `reason` optional everywhere, as above.
+#
+# [require_reason]
+# rule_ids = ["struct_field_removed"]
+# axes     = ["storage_layout"]
 
 [[suppress]]
 category = "Struct Field Removed"

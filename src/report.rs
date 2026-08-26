@@ -635,6 +635,15 @@ pub fn asciify_markers(text: &str) -> String {
         .replace('⚠', "[WARNING]")
 }
 
+/// Strip the decorative Unicode `asciify_markers` intentionally leaves alone
+/// (the `↳` guidance/reason arrow, and the `─` box-drawing separator around
+/// the provenance block), for output that must be fully plain: no color, no
+/// Unicode markers, no decorative separators. Callers combine this with
+/// disabling color (see `--plain`); it does not touch color itself.
+pub fn plainify(text: &str) -> String {
+    asciify_markers(text).replace('↳', "->").replace('─', "-")
+}
+
 impl SafetyReport {
     pub fn new(diff: &DiffReport) -> Self {
         Self::with_suppressions(

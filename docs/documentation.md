@@ -1107,10 +1107,31 @@ can point at a different file with `--config <PATH>`:
 soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm --config .safeguard.toml
 ```
 
-If no `--config` is given and `.safeguard.toml` is absent, nothing is
-suppressed and the tool behaves exactly as it always has. If you pass
-`--config` explicitly and the file is missing or malformed, that is a hard
-error rather than a silent no-op, so a typo never quietly disables suppression.
+When `--config` is not given, the `SOROBAN_SAFEGUARD_CONFIG` environment
+variable is used instead if set — handy for CI systems that would rather
+configure a path once (e.g. in a workflow's `env:` block) than repeat
+`--config` on every invocation:
+
+```bash
+export SOROBAN_SAFEGUARD_CONFIG=/config/.safeguard.toml
+soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm
+```
+
+An explicit `--config` flag always takes precedence over the environment
+variable. Whichever source resolved a path is echoed back as a diagnostic
+(`Suppression config: <path> (source: ...)`) so a run's logs make clear where
+the config came from; in `--manifest` mode the same information is available
+per pair via `--explain-manifest`, where the config setting's `origin` is
+`cli`, `env`, `built-in`, or the manifest file that set it.
+
+If neither `--config` nor `SOROBAN_SAFEGUARD_CONFIG` is given and
+`.safeguard.toml` is absent, nothing is suppressed and the tool behaves
+exactly as it always has. If you pass `--config` explicitly, or
+`SOROBAN_SAFEGUARD_CONFIG` names a path, and that file is missing or
+malformed, that is a hard error rather than a silent no-op, so a typo never
+quietly disables suppression — the same way it always has for `--config`.
+Only the auto-discovered `.safeguard.toml` default stays optional: if it
+simply isn't there, the tool proceeds with no suppressions.
 
 Each `[[suppress]]` entry acknowledges exactly one finding. The stable key is
 `rule_id`, and the legacy `category` field is still accepted as a compatibility
@@ -1145,6 +1166,34 @@ mapped to the same rule id automatically, so existing suppressions keep working.
   where `<normalized_message>` has all consecutive whitespace collapsed to single spaces and leading/trailing whitespace removed. If the finding content changes or drifts, the fingerprint will mismatch and suppression stops applying.
 - **Expiry**: evaluated against the current system date (`YYYY-MM-DD`). Expired rules trigger a hard failure during config loading.
 - **Targetless Wildcards**: omitting `target` matches only targetless findings (e.g., `Environment`). This requires explicit opt-in (`allow_targetless = true`) and is capped at a ceiling of 3 rules.
+
+### Requiring a reason for risky suppressions
+
+`reason` is optional by default. For findings risky enough that an
+unexplained suppression isn't reviewable, an optional `[require_reason]`
+table names the rule IDs and/or compatibility axes that must carry a
+non-blank `reason`:
+
+```toml
+[require_reason]
+rule_ids = ["struct_field_removed"]
+axes     = ["storage_layout"]
+
+[[suppress]]
+rule_id = "struct_field_removed"
+target  = "ConfigData.threshold"
+reason  = "Planned storage migration in v2 drops the unused threshold field."
+```
+
+A config that omits `[require_reason]` (or leaves both lists empty) behaves
+exactly as before. When present, a rule matching by rule ID or by classified
+axis whose `reason` is missing or whitespace-only is rejected as a hard load
+error, naming the offending rule's position in the config — enforced on every
+normal run, not only under `--validate-config`. Axis matching is evaluated
+statically (without a specific contract pair's diff context): exact for most
+categories, but struct/enum/union field- and case-level categories are only
+guaranteed to match the `storage_layout` axis this way; use `rule_ids` for
+precise per-category coverage.
 
 ### Legacy Format & Migration
 
