@@ -1,9 +1,20 @@
 //! Suppression configuration for known, intentional breaking changes.
 //!
-//! Some breaking changes are deliberate and already accounted for (for example
-//! a planned storage migration). A suppression config lets a team whitelist
-//! specific, reviewed findings so they no longer fail the run — while keeping
-//! them visible in the report as explicitly acknowledged.
+//! Some breaking changes are deliberate and accepted as-is. A suppression
+//! config lets a team whitelist specific, reviewed findings so they no longer
+//! fail the run — while keeping them visible in the report as explicitly
+//! acknowledged.
+//!
+//! ## Suppression is not the answer for a break you fixed
+//!
+//! A suppression asserts that a human looked at a finding. It does not assert
+//! that anything was done about it, and nothing here verifies that anything
+//! was. When the real answer is "we ship a migration that reads the old layout
+//! and rewrites it", declare that instead: [`crate::contract_migration`] associates a
+//! migration with the findings it resolves and *checks* that it covers every
+//! affected type. Reach for suppression when no migration applies — an
+//! interface break a caller must absorb, an environment change, a removal
+//! nothing stored — not as the routine response to a breaking change.
 //!
 //! ## File format (`.safeguard.toml`)
 //!
@@ -162,6 +173,21 @@ pub struct SuppressionConfig {
     #[serde(default, rename = "suppress")]
     #[cfg(not(feature = "unstable"))]
     pub(crate) rules: Vec<SuppressionRule>,
+
+    /// The declared data migrations, one `[[migration]]` table per entry.
+    ///
+    /// Suppression and migration are separate axes and never substitute for
+    /// each other: a suppression says a human accepted a break, a migration
+    /// says code handles it and is verified against the findings. See
+    /// [`crate::contract_migration`].
+    #[serde(default, rename = "migration")]
+    #[cfg(feature = "unstable")]
+    pub migrations: Vec<crate::contract_migration::MigrationDeclaration>,
+    /// The declared data migrations, one `[[migration]]` table per entry. See
+    /// [`crate::contract_migration`].
+    #[serde(default, rename = "migration")]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) migrations: Vec<crate::contract_migration::MigrationDeclaration>,
 
     /// Gating policy for compatibility axes.
     #[serde(default)]
@@ -647,6 +673,7 @@ mod tests {
             type_name: target.map(|t| t.split('.').next().unwrap().to_string()),
             target: target.map(|t| t.to_string()),
             root_target: None,
+            change: None,
         }
     }
 

@@ -114,7 +114,12 @@ fn resolve_ancestor_config(enabled: bool) -> Result<Option<PathBuf>> {
         multiple => {
             let list = multiple
                 .iter()
-                .map(|p| format!("  - {}", loader::normalize_path_display(&p.display().to_string())))
+                .map(|p| {
+                    format!(
+                        "  - {}",
+                        loader::normalize_path_display(&p.display().to_string())
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             anyhow::bail!(
@@ -1500,6 +1505,7 @@ fn run_init(args: &InitArgs) -> Result<()> {
         false,
         &old_spec,
         &new_spec,
+        None,
     );
 
     // Extract findings from the report
@@ -1869,6 +1875,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                             type_name: None,
                             target: Some(gap.name.clone()),
                             root_target: None,
+                            change: None,
                         },
                         axes: vec![diff::CompatibilityAxis::CallAbi],
                         suppressed: false,
@@ -1878,10 +1885,15 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                              the --suppressions file if removal is intentional.",
                             gap.name
                         )),
+                        migrated_by: None,
                     }],
                 );
                 map
             },
+            migrated_count: 0,
+            migration_status:
+                soroban_upgrade_safeguard::contract_migration::MigrationStatus::NotApplicable,
+            migration_diagnostics: Vec::new(),
             empirical: false,
             empirical_findings: Vec::new(),
             settings: report::ReportSettings::default(),
@@ -1992,6 +2004,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                                         &storage_schemas.new,
                                     )),
                                     lineage_store: None,
+                                    contract: Some(contract_name.as_str()),
                                 },
                             )?;
                         report.set_no_timestamp(settings.no_timestamp.value);
@@ -2014,6 +2027,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                                 rpc_headers: &args.rpc_headers,
                                 rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
                                 lineage_store: None,
+                                contract: Some(contract_name.as_str()),
                             },
                             progress,
                         )
@@ -2215,6 +2229,7 @@ fn synthesize_error_report(
                         type_name: None,
                         target: Some(name.to_string()),
                         root_target: None,
+                        change: None,
                     },
                     axes: vec![diff::CompatibilityAxis::CallAbi],
                     suppressed: false,
@@ -2222,10 +2237,15 @@ fn synthesize_error_report(
                     remediation: Some(
                         "Check the contract paths and ensure both WASM files exist and are valid Soroban contracts.".to_string()
                     ),
+                    migrated_by: None,
                 }],
             );
             map
         },
+        migrated_count: 0,
+        migration_status:
+            soroban_upgrade_safeguard::contract_migration::MigrationStatus::NotApplicable,
+        migration_diagnostics: Vec::new(),
         empirical: false,
         empirical_findings: Vec::new(),
         settings: report::ReportSettings::default(),
@@ -2550,10 +2570,11 @@ fn render_batch_summary(
 
                 markdown.push_str("### Summary\n\n");
                 markdown.push_str(
-                    "| Contract | Status | Scope | Coverage | Critical | Warning | Info | Suppressed | Labels |\n",
+                    "| Contract | Status | Scope | Coverage | Critical | Warning | Info | Migrated | Suppressed | Labels |\n",
                 );
-                markdown
-                    .push_str("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
+                markdown.push_str(
+                    "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n",
+                );
 
                 for result in results {
                     let report = result.report();
@@ -2563,7 +2584,7 @@ fn render_batch_summary(
                         "❌ FAILED"
                     };
                     markdown.push_str(&format!(
-                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                         result.name(),
                         status_str,
                         report.scope().summary_line(),
@@ -2571,6 +2592,7 @@ fn render_batch_summary(
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
+                        report.migrated_count(),
                         report.suppressed_count(),
                         format_labels(result.labels(), "-")
                     ));
@@ -2633,7 +2655,7 @@ fn render_batch_summary(
                         format!(" {{{}}}", format_labels(result.labels(), ""))
                     };
                     text.push_str(&format!(
-                        "  - {}: {} [{}; {}] ({} critical, {} warnings, {} info, {} suppressed){}\n",
+                        "  - {}: {} [{}; {}] ({} critical, {} warnings, {} info, {} migrated, {} suppressed){}\n",
                         result.name().bold(),
                         status_str,
                         report.scope().summary_line(),
@@ -2641,6 +2663,7 @@ fn render_batch_summary(
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
+                        report.migrated_count(),
                         report.suppressed_count(),
                         labels_suffix
                     ));
@@ -2768,9 +2791,23 @@ fn run_single(
         Vec::new()
     };
 
+    // Name the contract by the new build's file stem so a config shared across
+    // contracts can scope a migration with `contracts = [..]`.
+    let contract_name = Path::new(new_wasm_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(String::from);
+
     let run_comparison = |progress: &dyn Fn(String)| -> Result<bool> {
         progress("🔍 Soroban Upgrade Safeguard".to_string());
         progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+
+        if !suppressions.migrations.is_empty() {
+            progress(format!(
+                "🔧 {} declared migration(s) loaded",
+                suppressions.migrations.len()
+            ));
+        }
 
         progress(format!(
             "\n{}",
@@ -2828,6 +2865,7 @@ fn run_single(
                     strict: args.strict,
                     storage_schemas: None,
                     lineage_store: store_opt.as_ref(),
+                    contract: contract_name.as_deref(),
                 },
             )?
             .with_symlinks(None, new.symlink.clone())
@@ -2865,6 +2903,7 @@ fn run_single(
                     rpc_headers: &args.rpc_headers,
                     rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
                     lineage_store: store_opt.as_ref(),
+                    contract: contract_name.as_deref(),
                 },
                 progress,
             )?
@@ -2929,7 +2968,10 @@ fn run_single(
         let status = soroban_upgrade_safeguard::watch_status::WatchStatus::starting(cycle);
         if let Some(ref path) = status_path {
             if let Err(e) = status.write_to(path) {
-                eprintln!("Warning: failed to write watch status file {}: {e}", path.display());
+                eprintln!(
+                    "Warning: failed to write watch status file {}: {e}",
+                    path.display()
+                );
             }
         }
         let result = run_comparison(progress);
@@ -3257,90 +3299,90 @@ fn run_watch_mode(
     );
 
     let loop_result = (|| -> Result<()> {
-    loop {
-        if watch_shutdown_requested() {
-            eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
-            return Ok(());
-        }
+        loop {
+            if watch_shutdown_requested() {
+                eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+                return Ok(());
+            }
 
-        match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
-            Ok(_event) => {
-                // Brief debounce window: wait for more events
-                loop {
-                    match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(_) => {}
-                        Err(mpsc::RecvTimeoutError::Timeout) => break,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            return Err(anyhow::anyhow!("File watcher channel disconnected"));
-                        }
-                    }
-                    if watch_shutdown_requested() {
-                        break;
-                    }
-                }
-
-                if watch_shutdown_requested() {
-                    eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
-                    return Ok(());
-                }
-
-                // Check that watched files exist before re-running
-                let all_exist = watch_paths.iter().all(|p| p.exists());
-                if !all_exist {
-                    eprintln!("⚠️  Watched file(s) missing, waiting for them to reappear...");
-                    // Poll until files exist or timeout
-                    let start = std::time::Instant::now();
-                    let timeout = Duration::from_secs(30);
+            match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
+                Ok(_event) => {
+                    // Brief debounce window: wait for more events
                     loop {
-                        if watch_paths.iter().all(|p| p.exists()) {
-                            break;
+                        match rx.recv_timeout(Duration::from_millis(50)) {
+                            Ok(_) => {}
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                return Err(anyhow::anyhow!("File watcher channel disconnected"));
+                            }
                         }
                         if watch_shutdown_requested() {
-                            eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
-                            return Ok(());
-                        }
-                        if start.elapsed() > timeout {
-                            eprintln!("⚠️  Timed out waiting for files to reappear");
                             break;
                         }
-                        std::thread::sleep(Duration::from_millis(200));
                     }
-                }
 
-                // Clear terminal
-                print!("\x1B[2J\x1B[H");
+                    if watch_shutdown_requested() {
+                        eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+                        return Ok(());
+                    }
 
-                let progress = |line: String| {
-                    eprintln!("{line}");
-                };
-
-                eprintln!("🔄 Change detected, re-running comparison...\n");
-
-                match run_comparison(&progress) {
-                    Ok(safe) => {
-                        if safe {
-                            eprintln!("\n✅ Comparison passed");
-                        } else {
-                            eprintln!("\n❌ Comparison failed (breaking changes detected)");
+                    // Check that watched files exist before re-running
+                    let all_exist = watch_paths.iter().all(|p| p.exists());
+                    if !all_exist {
+                        eprintln!("⚠️  Watched file(s) missing, waiting for them to reappear...");
+                        // Poll until files exist or timeout
+                        let start = std::time::Instant::now();
+                        let timeout = Duration::from_secs(30);
+                        loop {
+                            if watch_paths.iter().all(|p| p.exists()) {
+                                break;
+                            }
+                            if watch_shutdown_requested() {
+                                eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+                                return Ok(());
+                            }
+                            if start.elapsed() > timeout {
+                                eprintln!("⚠️  Timed out waiting for files to reappear");
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(200));
                         }
                     }
-                    Err(e) => {
-                        eprintln!("\n⚠️  Error during comparison: {e:#}");
-                    }
-                }
 
-                eprintln!(
+                    // Clear terminal
+                    print!("\x1B[2J\x1B[H");
+
+                    let progress = |line: String| {
+                        eprintln!("{line}");
+                    };
+
+                    eprintln!("🔄 Change detected, re-running comparison...\n");
+
+                    match run_comparison(&progress) {
+                        Ok(safe) => {
+                            if safe {
+                                eprintln!("\n✅ Comparison passed");
+                            } else {
+                                eprintln!("\n❌ Comparison failed (breaking changes detected)");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("\n⚠️  Error during comparison: {e:#}");
+                        }
+                    }
+
+                    eprintln!(
                     "\n👀 Watch mode active (debounce: {debounce_ms}ms). Waiting for file changes... (Ctrl+C or SIGTERM to stop)\n"
                 );
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // No event - if this is the first run, just continue
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(anyhow::anyhow!("File watcher channel disconnected"));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // No event - if this is the first run, just continue
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow::anyhow!("File watcher channel disconnected"));
+                }
             }
         }
-    }
     })();
 
     if let Some(path) = status_path {
@@ -3493,6 +3535,9 @@ struct ContractComparison<'a> {
     rpc_headers: &'a [String],
     rpc_allow_id_mismatch: bool,
     lineage_store: Option<&'a soroban_upgrade_safeguard::lineage::LineageStore>,
+    /// The contract's name, used to scope migrations declared with
+    /// `contracts = [..]` in a config shared across several contracts.
+    contract: Option<&'a str>,
 }
 
 struct PairStorageSchemas {
@@ -3550,6 +3595,7 @@ fn compare_contracts(
         rpc_headers,
         rpc_allow_id_mismatch,
         lineage_store,
+        contract,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -3609,6 +3655,7 @@ fn compare_contracts(
         *strict,
         &old_spec,
         &new_spec,
+        *contract,
     )
     .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
 
@@ -4072,7 +4119,10 @@ mod ancestor_config_tests {
 
         assert_eq!(
             find_ancestor_configs(&nested),
-            vec![mid.join(DEFAULT_CONFIG_FILE), root.join(DEFAULT_CONFIG_FILE)]
+            vec![
+                mid.join(DEFAULT_CONFIG_FILE),
+                root.join(DEFAULT_CONFIG_FILE)
+            ]
         );
     }
 

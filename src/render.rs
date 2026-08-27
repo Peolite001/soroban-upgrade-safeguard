@@ -173,6 +173,17 @@ pub struct RenderableReport {
     /// once. Absent on a report written directly by a live run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration: Option<crate::migration::MigrationRecord>,
+    /// Findings covered by a verified data migration. See
+    /// [`crate::contract_migration`] — not to be confused with [`Self::migration`]
+    /// above, which is this *report document's own* schema-version history.
+    #[serde(default)]
+    pub migrated_count: usize,
+    /// Whether the upgrade is fully, partly, or not at all migrated.
+    #[serde(default)]
+    pub migration_status: crate::contract_migration::MigrationStatus,
+    /// Declared migrations that did not verify, and coverage gaps.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub migration_diagnostics: Vec<crate::contract_migration::MigrationDiagnostic>,
 }
 
 fn default_schema_version() -> u32 {
@@ -999,6 +1010,7 @@ mod tests {
             message: message.to_string(),
             type_name: None,
             target: Some("thing".to_string()),
+            change: None,
             root_target: None,
         }
     }
@@ -1058,6 +1070,7 @@ mod tests {
             false,
             &empty_spec,
             &empty_spec,
+            None,
         );
 
         let json = serde_json::to_string(&live.to_renderable()).unwrap();
@@ -1212,6 +1225,7 @@ mod tests {
                 message: "target `name` has [brackets] | and a newline\nnext line".to_string(),
                 type_name: Some("Type|Name`With`Punctuation".to_string()),
                 target: Some("thing".to_string()),
+                change: None,
                 root_target: None,
             }],
         };

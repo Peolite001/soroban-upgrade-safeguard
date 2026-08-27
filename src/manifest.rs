@@ -1036,7 +1036,7 @@ impl ResolvedManifest {
             "sources": self
                 .sources
                 .iter()
-                .map(display_path)
+                .map(|p| display_path(p))
                 .collect::<Vec<_>>(),
             "pairs": self.pairs.iter().map(ResolvedPair::to_json).collect::<Vec<_>>(),
             "dependencies": self.dependencies,

@@ -3,6 +3,12 @@
 //! Library for analyzing and validating Soroban smart-contract upgrades on the
 //! Stellar network. It detects breaking changes in storage layout, function
 //! signatures, and event schemas before an upgrade is deployed.
+//!
+//! A breaking change has two independent axes in the output: whether a human
+//! *acknowledged* it ([`suppression`]) and whether a migration *handles* it
+//! ([`contract_migration`]). They are reported separately and never collapse
+//! into one another.
+
 #[cfg(feature = "unstable")]
 pub mod attestation;
 #[cfg(not(feature = "unstable"))]
@@ -84,6 +90,11 @@ mod manifest;
 pub mod mapper;
 #[cfg(not(feature = "unstable"))]
 mod mapper;
+
+#[cfg(feature = "unstable")]
+pub mod contract_migration;
+#[cfg(not(feature = "unstable"))]
+mod contract_migration;
 
 #[cfg(feature = "unstable")]
 pub mod migration;
@@ -285,6 +296,10 @@ pub struct CompareOptions<'a> {
     pub strict: bool,
     pub storage_schemas: Option<(&'a StorageSchema, &'a StorageSchema)>,
     pub lineage_store: Option<&'a lineage::LineageStore>,
+    /// The contract's name, used to scope migrations declared with
+    /// `contracts = [..]` in a `.safeguard.toml` shared across several
+    /// contracts. `None` matches only migrations with no `contracts` key.
+    pub contract: Option<&'a str>,
 }
 
 /// Compare two Soroban contract builds supplied as raw WASM byte slices with options.
@@ -333,6 +348,7 @@ pub fn compare_wasm_bytes_with_options(
         options.strict,
         &old_spec,
         &new_spec,
+        options.contract,
     );
     safety_report.scope.exported_interface = true;
     safety_report.scope.env_metadata = old_meta.env_meta.is_some() || new_meta.env_meta.is_some();
@@ -401,6 +417,7 @@ pub fn compare_wasm_against_interface_lockfile(
         options.strict,
         &old_spec,
         &new_spec,
+        options.contract,
     )
     .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
     report.scope.exported_interface = true;

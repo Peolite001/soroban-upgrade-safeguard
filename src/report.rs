@@ -1,3 +1,4 @@
+use crate::contract_migration::{FindingCoverage, MigrationDiagnostic, MigrationStatus};
 use crate::diff::{DiffReport, Finding, Severity};
 use crate::interface_hash::InterfaceHash;
 use crate::render::{RenderableReport, REPORT_SCHEMA_VERSION};
@@ -56,6 +57,18 @@ pub struct ReportedFinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg(not(feature = "unstable"))]
     pub(crate) remediation: Option<String>,
+
+    /// The verified migration that covers this finding, if one does. See
+    /// [`crate::contract_migration`]. A suppression records that a human
+    /// accepted a break; this records that a declared migration was checked
+    /// to actually handle it — the two are kept visibly distinct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(feature = "unstable")]
+    pub migrated_by: Option<FindingCoverage>,
+    /// See the `unstable`-feature `migrated_by` field above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) migrated_by: Option<FindingCoverage>,
 }
 
 impl ReportedFinding {
@@ -77,6 +90,11 @@ impl ReportedFinding {
 
     pub fn remediation(&self) -> Option<&str> {
         self.remediation.as_deref()
+    }
+
+    /// The verified migration that covers this finding, if one does.
+    pub fn migrated_by(&self) -> Option<&FindingCoverage> {
+        self.migrated_by.as_ref()
     }
 }
 
@@ -118,6 +136,28 @@ pub struct SafetyReport {
     pub suppressed_info_count: usize,
     #[cfg(not(feature = "unstable"))]
     pub(crate) suppressed_info_count: usize,
+
+    /// Number of findings covered by a verified migration. See
+    /// [`crate::contract_migration`].
+    #[cfg(feature = "unstable")]
+    pub migrated_count: usize,
+    /// See the `unstable`-feature `migrated_count` field above.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) migrated_count: usize,
+
+    /// Whether the upgrade is fully, partly, or not at all migrated.
+    #[cfg(feature = "unstable")]
+    pub migration_status: MigrationStatus,
+    /// See the `unstable`-feature `migration_status` field above.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) migration_status: MigrationStatus,
+
+    /// Declared migrations that did not verify, and coverage gaps.
+    #[cfg(feature = "unstable")]
+    pub migration_diagnostics: Vec<MigrationDiagnostic>,
+    /// See the `unstable`-feature `migration_diagnostics` field above.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) migration_diagnostics: Vec<MigrationDiagnostic>,
 
     #[cfg(feature = "unstable")]
     pub total_findings: usize,
@@ -295,6 +335,7 @@ impl SafetyReport {
                     message,
                     type_name: None,
                     target: None,
+                    change: None,
                     root_target: None,
                 };
                 let rule = suppressions.matching_rule(&finding);
@@ -328,6 +369,7 @@ impl SafetyReport {
                             "Reconcile the declared schema with the compiled storage behavior."
                                 .to_string()
                         }),
+                        migrated_by: None,
                     });
             }
         }
@@ -396,6 +438,7 @@ impl SafetyReport {
                         "Update candidate build to maintain backward compatibility with this historical version."
                             .to_string()
                     }),
+                    migrated_by: None,
                 });
         }
     }
@@ -426,6 +469,21 @@ impl SafetyReport {
 
     pub fn suppressed_info_count(&self) -> usize {
         self.suppressed_info_count
+    }
+
+    /// Number of findings covered by a verified migration.
+    pub fn migrated_count(&self) -> usize {
+        self.migrated_count
+    }
+
+    /// Whether the upgrade is fully, partly, or not at all migrated.
+    pub fn migration_status(&self) -> MigrationStatus {
+        self.migration_status
+    }
+
+    /// Declared migrations that did not verify, and coverage gaps.
+    pub fn migration_diagnostics(&self) -> &[MigrationDiagnostic] {
+        &self.migration_diagnostics
     }
 
     pub fn total_findings(&self) -> usize {
@@ -682,6 +740,7 @@ impl SafetyReport {
             false,
             old_spec,
             new_spec,
+            None,
         )
     }
 
@@ -719,6 +778,9 @@ impl SafetyReport {
             suppressed_critical_count: 0,
             suppressed_warning_count: 0,
             suppressed_info_count: 0,
+            migrated_count: 0,
+            migration_status: MigrationStatus::NotApplicable,
+            migration_diagnostics: Vec::new(),
             total_findings: 0,
             is_safe: true,
             findings_by_category: HashMap::new(),
@@ -765,8 +827,15 @@ impl SafetyReport {
         policy: &crate::limits::ResourcePolicy,
     ) -> Self {
         let empty = crate::spec::ContractSpec::default();
-        let mut report =
-            Self::with_suppressions_with_specs(diff, suppressions, explain, strict, &empty, &empty);
+        let mut report = Self::with_suppressions_with_specs(
+            diff,
+            suppressions,
+            explain,
+            strict,
+            &empty,
+            &empty,
+            None,
+        );
         report.settings = ReportSettings {
             strict,
             explain,
@@ -787,6 +856,7 @@ impl SafetyReport {
         strict: bool,
         old_spec: &crate::spec::ContractSpec,
         new_spec: &crate::spec::ContractSpec,
+        contract: Option<&str>,
     ) -> Self {
         let mut critical_count = 0;
         let mut warning_count = 0;
@@ -795,11 +865,25 @@ impl SafetyReport {
         let mut suppressed_critical_count = 0;
         let mut suppressed_warning_count = 0;
         let mut suppressed_info_count = 0;
+        let mut migrated_count = 0;
+        // Denominator and numerator for the migration verdict: breaking
+        // findings that need remediation, and those a migration actually
+        // handles. Suppressed findings are excluded from both — an upgrade
+        // that suppresses everything has migrated nothing.
+        let mut needing_migration = 0;
+        let mut migrated_breaking = 0;
         let mut findings_by_category: HashMap<String, Vec<ReportedFinding>> = HashMap::new();
         let mut critical_root_count = 0;
         let mut cascade_critical_count = 0;
         let call_abi = crate::call_abi::compare(old_spec, new_spec);
         let mut unsuppressed_call_abi_finding = false;
+
+        // Verify declared migrations against the findings up front. Coverage
+        // (including cascade inheritance via `root_target`) is then looked up
+        // per finding by index in the main loop below. See
+        // [`crate::contract_migration`].
+        let migration_audit =
+            crate::contract_migration::audit(&diff.findings, &suppressions.migrations, contract);
 
         let mut axis_verdicts = HashMap::new();
         axis_verdicts.insert(
@@ -859,7 +943,7 @@ impl SafetyReport {
             }
         }
 
-        for finding in &diff.findings {
+        for (index, finding) in diff.findings.iter().enumerate() {
             let is_cascade = finding.root_target.is_some();
             match finding.severity {
                 Severity::Critical => critical_count += 1,
@@ -875,18 +959,35 @@ impl SafetyReport {
                 rule.is_some()
             };
 
+            // A migration is a stronger claim than an acknowledgement: it says
+            // code handles the break and was checked, not just that a human
+            // accepted it. When a finding somehow has both, it reads as
+            // migrated, and does not also count toward suppression totals.
+            let migrated_by = migration_audit.coverage_of(index).cloned();
+            let suppressed = suppressed && migrated_by.is_none();
+
             if is_cascade && finding.severity == Severity::Critical {
                 cascade_critical_count += 1;
             } else if finding.severity == Severity::Critical {
                 critical_root_count += 1;
             }
 
-            if suppressed {
+            if migrated_by.is_some() {
+                migrated_count += 1;
+            } else if suppressed {
                 suppressed_count += 1;
                 match finding.severity {
                     Severity::Critical => suppressed_critical_count += 1,
                     Severity::Warning => suppressed_warning_count += 1,
                     Severity::Info => suppressed_info_count += 1,
+                }
+            }
+
+            let breaking = matches!(finding.severity, Severity::Critical | Severity::Warning);
+            if breaking && !suppressed {
+                needing_migration += 1;
+                if migrated_by.is_some() {
+                    migrated_breaking += 1;
                 }
             }
 
@@ -932,8 +1033,11 @@ impl SafetyReport {
             // `Info` findings describe backwards-compatible additions (a new
             // function, a new union case), so they are never allowed to move an
             // axis off `Passed`. `Warning` findings only fail under `--strict`;
-            // a `Critical` fails whenever its axis is gated.
+            // a `Critical` fails whenever its axis is gated. A finding covered
+            // by a verified migration is handled, not merely accepted, and so
+            // is excluded here exactly like a suppressed one.
             if !suppressed
+                && migrated_by.is_none()
                 && finding.severity != Severity::Info
                 && finding.category != "Environment"
             {
@@ -990,8 +1094,13 @@ impl SafetyReport {
                     finding: finding.clone(),
                     axes,
                     suppressed,
-                    suppression_reason: rule.and_then(|r| r.reason.clone()),
+                    suppression_reason: if suppressed {
+                        rule.and_then(|r| r.reason.clone())
+                    } else {
+                        None
+                    },
                     remediation,
+                    migrated_by,
                 });
         }
 
@@ -1021,6 +1130,9 @@ impl SafetyReport {
             suppressed_critical_count,
             suppressed_warning_count,
             suppressed_info_count,
+            migrated_count,
+            migration_status: MigrationStatus::classify(needing_migration, migrated_breaking),
+            migration_diagnostics: migration_audit.diagnostics().to_vec(),
             total_findings: diff.findings.len(),
             is_safe,
             findings_by_category,
@@ -1196,6 +1308,9 @@ impl SafetyReport {
             empirical: self.empirical,
             empirical_findings: self.empirical_findings.clone(),
             migration: None,
+            migrated_count: self.migrated_count,
+            migration_status: self.migration_status,
+            migration_diagnostics: self.migration_diagnostics.clone(),
         }
     }
 
@@ -1328,12 +1443,14 @@ mod tests {
                     message: String::new(),
                     type_name: None,
                     target: None,
+                    change: None,
                     root_target: None,
                 },
                 axes: Vec::new(),
                 suppressed: false,
                 suppression_reason: None,
                 remediation: None,
+                migrated_by: None,
             }
         }
 
@@ -1346,6 +1463,9 @@ mod tests {
             suppressed_critical_count: 0,
             suppressed_warning_count: 0,
             suppressed_info_count: 0,
+            migrated_count: 0,
+            migration_status: MigrationStatus::NotApplicable,
+            migration_diagnostics: Vec::new(),
             total_findings: 0,
             is_safe: true,
             findings_by_category: HashMap::new(),
@@ -1410,6 +1530,7 @@ mod tests {
             message: "Type 'Data' field 'amount' changed from i64 to i128".to_string(),
             type_name: Some("Data".to_string()),
             target: Some("Data.amount".to_string()),
+            change: None,
             root_target: None,
         });
         diff.findings.push(Finding {
@@ -1420,6 +1541,7 @@ mod tests {
                 .to_string(),
             type_name: Some("Outer".to_string()),
             target: Some("Outer".to_string()),
+            change: None,
             root_target: Some("Data".to_string()),
         });
 
@@ -1430,6 +1552,7 @@ mod tests {
             false,
             &crate::spec::ContractSpec::default(),
             &crate::spec::ContractSpec::default(),
+            None,
         );
 
         assert_eq!(report.critical_root_count, 1);
@@ -1448,6 +1571,7 @@ mod tests {
             message: "Type 'Data' field 'amount' changed".to_string(),
             type_name: Some("Data".to_string()),
             target: Some("Data.amount".to_string()),
+            change: None,
             root_target: None,
         });
         diff.findings.push(Finding {
@@ -1457,6 +1581,7 @@ mod tests {
             message: "Type 'Outer' layout is broken".to_string(),
             type_name: Some("Outer".to_string()),
             target: Some("Outer".to_string()),
+            change: None,
             root_target: Some("Data".to_string()),
         });
 
@@ -1477,6 +1602,7 @@ mod tests {
             false,
             &crate::spec::ContractSpec::default(),
             &crate::spec::ContractSpec::default(),
+            None,
         );
 
         let root_finding = report
@@ -1507,6 +1633,7 @@ mod tests {
             message: "Type 'Data' field 'amount' changed".to_string(),
             type_name: Some("Data".to_string()),
             target: Some("Data.amount".to_string()),
+            change: None,
             root_target: None,
         });
         diff.findings.push(Finding {
@@ -1516,6 +1643,7 @@ mod tests {
             message: "Type 'Outer' layout is broken".to_string(),
             type_name: Some("Outer".to_string()),
             target: Some("Outer".to_string()),
+            change: None,
             root_target: Some("Data".to_string()),
         });
 
@@ -1535,6 +1663,7 @@ mod tests {
             false,
             &crate::spec::ContractSpec::default(),
             &crate::spec::ContractSpec::default(),
+            None,
         );
 
         let root_finding = &report

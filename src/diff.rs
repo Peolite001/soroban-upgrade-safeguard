@@ -125,6 +125,29 @@ pub struct Finding {
     /// `None` for direct (non-cascade) findings.
     #[cfg(not(feature = "unstable"))]
     pub(crate) root_target: Option<String>,
+
+    /// A compact, structural description of *how* the entity changed — the
+    /// old→new detail that `category` alone does not capture, for example
+    /// `"U64 -> I128"`, `"2 -> 3"`, or `"position 1: 'a' -> 'b'"`.
+    ///
+    /// This is the fingerprint a declared migration (see
+    /// [`crate::contract_migration`]) pins itself to: a claim naming this
+    /// value keeps covering the finding only while the underlying change is
+    /// still the one the migration was written against, so a claim goes
+    /// stale rather than matching indefinitely once the change differs.
+    ///
+    /// Deliberately *not* derived from [`Self::message`]: message wording
+    /// varies with classification and tool version, and a fingerprint that
+    /// moved for either reason would be worthless. `None` when the category
+    /// alone fully describes the change (a pure removal or addition has no
+    /// old→new detail to pin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(feature = "unstable")]
+    pub change: Option<String>,
+    /// See the `unstable`-feature `change` field above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) change: Option<String>,
 }
 
 impl Finding {
@@ -157,6 +180,11 @@ impl Finding {
     pub fn root_target(&self) -> Option<&str> {
         self.root_target.as_deref()
     }
+
+    /// Get the structural old→new change fingerprint, if any.
+    pub fn change(&self) -> Option<&str> {
+        self.change.as_deref()
+    }
 }
 
 impl Finding {
@@ -186,6 +214,7 @@ impl Finding {
             type_name,
             target,
             root_target,
+            change: None,
         }
     }
 }
@@ -291,7 +320,9 @@ fn references_type_inner(
             }
             false
         }
-        ScSpecTypeDef::Option(opt) => references_type_inner(&opt.value_type, target_name, spec, visited),
+        ScSpecTypeDef::Option(opt) => {
+            references_type_inner(&opt.value_type, target_name, spec, visited)
+        }
         ScSpecTypeDef::Result(res) => {
             references_type_inner(&res.ok_type, target_name, spec, visited)
                 || references_type_inner(&res.error_type, target_name, spec, visited)
@@ -510,6 +541,7 @@ pub fn compare_env_metadata(
                 message,
                 type_name: None,
                 target: Some(target),
+                change: None,
                 root_target: None,
             });
         }
@@ -646,6 +678,7 @@ fn push_unknown_host_import(module: &str, name: &str, added: bool, report: &mut 
         ),
         type_name: None,
         target: Some(format!("{module}::{name}")),
+        change: None,
         root_target: None,
     });
 }
@@ -693,6 +726,7 @@ pub fn compare_host_imports(
                     ),
                     type_name: None,
                     target: Some(cap.capability_id.to_string()),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -716,6 +750,7 @@ pub fn compare_host_imports(
                     ),
                     type_name: None,
                     target: Some(cap.capability_id.to_string()),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -759,6 +794,7 @@ pub fn compare_host_imports(
             ),
             type_name: None,
             target: Some(target),
+            change: None,
             root_target: None,
         });
     }
@@ -781,6 +817,7 @@ pub fn compare_host_imports(
                 ),
                 type_name: None,
                 target: None,
+                change: None,
                 root_target: None,
             });
         }
@@ -827,6 +864,7 @@ fn check_protocol_environment_mismatch(
         ),
         type_name: None,
         target: None,
+        change: None,
         root_target: None,
     });
 }
@@ -852,6 +890,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                     ),
                     type_name: None,
                     target: Some(name.clone()),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -878,6 +917,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                         message,
                         type_name: None,
                         target: Some(name.clone()),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -895,6 +935,7 @@ fn compare_functions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRe
                 message: format!("New function '{}' added.", name),
                 type_name: None,
                 target: Some(name.clone()),
+                change: None,
                 root_target: None,
             });
         }
@@ -927,6 +968,7 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            change: None,
             root_target: None,
         });
         return; // No point comparing individual params if count differs
@@ -958,6 +1000,7 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            change: None,
             root_target: None,
         });
 
@@ -1002,6 +1045,7 @@ fn check_function_signature(
                         ),
                         type_name: None,
                         target: Some(format!("{}.{}", name, p_name)),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -1024,6 +1068,7 @@ fn check_function_signature(
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -1059,6 +1104,7 @@ fn check_function_signature(
                     ),
                     type_name: None,
                     target: Some(format!("{}.{}", name, old_name)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -1082,6 +1128,7 @@ fn check_function_signature(
             ),
             type_name: None,
             target: Some(name.to_string()),
+            change: None,
             root_target: None,
         });
     } else {
@@ -1112,6 +1159,7 @@ fn check_function_signature(
                     message: format!("Function '{}': return type {} {}.", name, i, detail),
                     type_name: None,
                     target: Some(name.to_string()),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -1146,6 +1194,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -1172,6 +1221,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -1189,6 +1239,7 @@ fn compare_structs(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepo
                 message: format!("New struct '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                change: None,
                 root_target: None,
             });
         }
@@ -1229,6 +1280,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                change: None,
                 root_target: None,
             });
         }
@@ -1256,6 +1308,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                change: None,
                 root_target: None,
             });
         }
@@ -1297,6 +1350,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                change: None,
                 root_target: None,
             });
         }
@@ -1317,6 +1371,7 @@ fn check_struct_fields(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, new_field.name)),
+                change: None,
                 root_target: None,
             });
         }
@@ -1344,6 +1399,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -1370,6 +1426,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                         message,
                         type_name: Some(name.clone()),
                         target: Some(name.clone()),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -1387,6 +1444,7 @@ fn compare_enums(old: &ContractSpec, new: &ContractSpec, report: &mut DiffReport
                 message: format!("New enum '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                change: None,
                 root_target: None,
             });
         }
@@ -1426,6 +1484,7 @@ fn check_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -1449,6 +1508,7 @@ fn check_enum_cases(
                         ),
                         type_name: Some(name.to_string()),
                         target: Some(format!("{}.{}", name, old_name)),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -1475,6 +1535,7 @@ fn check_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, new_name)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -1497,6 +1558,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -1515,6 +1577,7 @@ fn compare_unions(old: &ContractSpec, new: &ContractSpec, report: &mut DiffRepor
                 message: format!("New union '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                change: None,
                 root_target: None,
             });
         }
@@ -1548,6 +1611,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                change: None,
                 root_target: None,
             });
         }
@@ -1569,6 +1633,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                change: None,
                 root_target: None,
             });
         }
@@ -1602,6 +1667,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, old_name)),
+                change: None,
                 root_target: None,
             });
         }
@@ -1621,6 +1687,7 @@ fn check_union_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, union_case_name(new_case))),
+                change: None,
                 root_target: None,
             });
         }
@@ -1675,6 +1742,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
                     ),
                     type_name: Some(name.clone()),
                     target: Some(name.clone()),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -1693,6 +1761,7 @@ fn compare_error_enums(old: &ContractSpec, new: &ContractSpec, report: &mut Diff
                 message: format!("New error enum '{}' added.", name),
                 type_name: Some(name.clone()),
                 target: Some(name.clone()),
+                change: None,
                 root_target: None,
             });
         }
@@ -1724,6 +1793,7 @@ fn check_error_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -1741,6 +1811,7 @@ fn check_error_enum_cases(
                     ),
                     type_name: Some(name.to_string()),
                     target: Some(format!("{}.{}", name, old_name)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -1761,6 +1832,7 @@ fn check_error_enum_cases(
                 ),
                 type_name: Some(name.to_string()),
                 target: Some(format!("{}.{}", name, new_name)),
+                change: None,
                 root_target: None,
             });
         }
@@ -1908,6 +1980,7 @@ pub fn detect_type_kind_changes(old: &ContractSpec, new: &ContractSpec, report: 
             ),
             type_name: Some(name.clone()),
             target: Some(name),
+            change: None,
             root_target: None,
         });
     }
@@ -1957,6 +2030,7 @@ fn detect_cascading_layout_breaks(old: &ContractSpec, report: &mut DiffReport) {
                         ),
                         type_name: Some(dep.clone()),
                         target: Some(dep.clone()),
+                        change: None,
                         root_target: Some(root.clone()),
                     });
                 }
@@ -2233,6 +2307,7 @@ mod tests {
                 .to_string(),
             type_name: Some("Child".to_string()),
             target: Some("Child".to_string()),
+            change: None,
             root_target: None,
         });
 
@@ -2268,6 +2343,7 @@ mod tests {
             message: "Function 'do_stuff' was removed.".to_string(),
             type_name: None,
             target: Some("do_stuff".to_string()),
+            change: None,
             root_target: None,
         });
 
