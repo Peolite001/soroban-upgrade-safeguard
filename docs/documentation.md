@@ -395,6 +395,29 @@ file, an unreadable manifest, a broken symlink) still shows the path exactly
 as given, unmodified, since that is what the reader needs to locate the real
 file on their own filesystem.
 
+### Hash-only extraction
+
+```bash
+soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only
+```
+
+`extract --hash-only` prints nothing but the interface hash — no surrounding
+JSON report document, just the bare hex digest on its own line. The digest is
+the same order-independent SHA-256 the tool uses everywhere else (lockfiles,
+`--interface-lockfile` checks): it covers the analyzed WASM's exported
+interface — its functions and user-defined types — not the raw WASM bytes,
+so two builds that differ only in compiler version, doc comments, or section
+ordering still hash identically. See [Interface Hash](../src/interface_hash.rs)
+for exactly what is and is not covered.
+
+Because the output is a single line with nothing else on stdout, it's suited
+to capturing directly in a script — for a cache key, or a cheap "did the
+interface change?" check without running a full comparison:
+
+```bash
+hash="$(soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only)"
+```
+
 ### Interface lockfiles
 
 An interface lockfile pins the exported `contractspecv0` interface in a deterministic,
