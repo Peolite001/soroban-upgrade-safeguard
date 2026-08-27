@@ -262,6 +262,32 @@ match the CLI help output (`--help`) and the `override_usage` in `src/main.rs`.
 
 Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)), and `--no-symlinks` for local paths (see [Local file inputs](#local-file-inputs)).
 
+### Directory scan
+
+```bash
+soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>
+```
+
+Every file in `<OLD_DIR>` whose extension case-insensitively matches `.wasm`
+is looked up by its exact filename in `<NEW_DIR>`, producing three kinds of
+outcome:
+
+- **Matched** (same filename present in both directories): the pair is
+  compared exactly like a two-build comparison and folded into the batch
+  results.
+- **Old-only** (present in `<OLD_DIR>`, missing from `<NEW_DIR>`): recorded as
+  a Critical `contract-missing-from-new` finding — removing a deployed
+  contract from the new build would break every client that depends on it.
+  This is not merely a warning: it unconditionally sets the batch's overall
+  verdict to unsafe (non-zero exit), the same as any other Critical finding,
+  regardless of `--strict`.
+- **New-only** (present in `<NEW_DIR>` only): directory scan only enumerates
+  `<OLD_DIR>` to find contracts to pair, so a file that exists solely in
+  `<NEW_DIR>` is not currently detected — it produces no pair, no finding,
+  and no warning, and is silently excluded from the batch. If you need every
+  newly added artifact accounted for explicitly, list pairs in a
+  [manifest](batch_manifests.md) instead.
+
 ### Local file inputs
 
 A local WASM path is followed transparently whether it is a direct file or a
