@@ -168,6 +168,32 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
   --output json:ci-report.json
 ```
 
+### Quiet output
+
+`--quiet` suppresses everything the tool narrates *about* the run: the banner and
+separator lines, the per-file loading and spec-summary lines, config-discovery
+notes, batch pair headers, and the `report written to <path>` confirmations.
+
+It does not remove anything from the report. Every format you selected is still
+produced in full, with the same findings, to the same destination. The verdict
+and the exit code are also unchanged — `--quiet` only decides what gets narrated,
+never what gets analyzed, reported, or gated on.
+
+```bash
+# CI: only the JSON report reaches the log, with no surrounding progress text
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --format json --quiet
+
+# Still exits non-zero on breaking changes, so this remains a working gate
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --quiet --output json:report.json || echo "upgrade rejected"
+```
+
+Note that progress output already avoids stdout whenever stdout carries a
+machine-readable report — with `--format json` it is written to stderr instead.
+`--quiet` goes further and silences it on both streams, which is what you want
+when a CI log should contain the report and nothing else.
+
 ### Watch mode
 
 Re-run the comparison automatically when input WASM files change:
