@@ -1008,8 +1008,13 @@ pub fn cli_only_settings(cli: &CliSettings) -> ResolvedSettings {
 /// only "as either TOML or JSON", which is undebuggable once includes multiply
 /// the number of candidate files.
 fn parse_file(path: &Path) -> Result<RawManifest> {
-    let content = std::fs::read_to_string(path)
+    let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
+    // Windows tooling commonly saves UTF-8 files with a leading BOM, which
+    // neither TOML nor JSON has syntax for; strip it before parsing (and
+    // before the format sniff below, which would otherwise see the BOM
+    // instead of the manifest's real first character).
+    let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
 
     if content.trim().is_empty() {
         bail!(
@@ -1042,11 +1047,11 @@ fn parse_file(path: &Path) -> Result<RawManifest> {
         .is_some_and(|e| e.eq_ignore_ascii_case("json"))
         || content.trim_start().starts_with(['{', '[']);
 
-    let toml_error = match toml::from_str::<RawManifest>(&content) {
+    let toml_error = match toml::from_str::<RawManifest>(content) {
         Ok(manifest) => return Ok(manifest),
         Err(e) => e.to_string(),
     };
-    let json_error = match serde_json::from_str::<RawManifest>(&content) {
+    let json_error = match serde_json::from_str::<RawManifest>(content) {
         Ok(manifest) => return Ok(manifest),
         Err(e) => format!("{e}"),
     };

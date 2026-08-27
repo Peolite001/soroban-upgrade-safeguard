@@ -3273,6 +3273,26 @@ fn emit_output(spec: &OutputSpec, content: &str) -> Result<()> {
     match &spec.path {
         Some(path) => {
             write_atomically(path, content.as_bytes())?;
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create output directory '{}'.", parent.display())
+                })?;
+            }
+            let temp_path = path.with_extension(format!(
+                "{}.tmp",
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("tmp")
+            ));
+            std::fs::write(&temp_path, content).with_context(|| {
+                format!("Failed to write output file '{}'.", temp_path.display())
+            })?;
+            std::fs::rename(&temp_path, path).with_context(|| {
+                format!(
+                    "Failed to move written output into place at '{}'.",
+                    path.display()
+                )
+            })?;
         }
         None => {
             println!("{content}");
@@ -4144,6 +4164,20 @@ fn validate_template(template: &str) -> Result<()> {
         anyhow::bail!("Template '{}' resolves to an invalid empty or dot-only filename", template);
     }
 
+    std::fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "Failed to create output directory '{}'.",
+            output_dir.display()
+        )
+    })?;
+    std::fs::write(&temp_path, content)
+        .with_context(|| format!("Failed to write output file '{}'.", temp_path.display()))?;
+    std::fs::rename(&temp_path, &output_path).with_context(|| {
+        format!(
+            "Failed to move written output into place at '{}'.",
+            output_path.display()
+        )
+    })?;
     Ok(())
 }
 

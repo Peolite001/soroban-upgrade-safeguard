@@ -446,12 +446,15 @@ impl SuppressionConfig {
     /// Load a config from an explicit path. Errors if the file is missing or
     /// malformed — callers that pass a path are asserting it should exist.
     pub fn load_from_path(path: &Path) -> Result<Self, Error> {
-        let contents = fs::read_to_string(path).map_err(|e| Error::SuppressionConfig {
+        let raw = fs::read_to_string(path).map_err(|e| Error::SuppressionConfig {
             path: Some(path.to_path_buf()),
             details: format!("Failed to read suppression config '{}'", path.display()),
             source: Some(Box::new(e)),
         })?;
-        Self::from_toml_str(&contents).map_err(|e| Error::SuppressionConfig {
+        // Strip a leading UTF-8 BOM (common from Windows tooling); TOML has
+        // no syntax for it and would otherwise fail on the first character.
+        let contents = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+        Self::from_toml_str(contents).map_err(|e| Error::SuppressionConfig {
             path: Some(path.to_path_buf()),
             details: format!("Invalid suppression config '{}'", path.display()),
             source: Some(Box::new(e)),
