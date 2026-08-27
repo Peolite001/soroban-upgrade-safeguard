@@ -224,13 +224,17 @@ impl ResolvedConfig {
 
         // 2. Load file if present
         let file_config = if let Some(path) = &config_file_path {
-            let content = std::fs::read_to_string(path).with_context(|| {
+            let raw = std::fs::read_to_string(path).with_context(|| {
                 format!(
                     "Failed to read suppression config file '{}'",
                     path.display()
                 )
             })?;
-            let parsed: FileConfig = toml::from_str(&content)
+            // Windows tooling commonly saves UTF-8 files with a leading BOM,
+            // which TOML has no syntax for; strip it before parsing so it
+            // doesn't surface as a confusing "unexpected character" error.
+            let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+            let parsed: FileConfig = toml::from_str(content)
                 .with_context(|| format!("Invalid suppression config file '{}'", path.display()))?;
             Some(parsed)
         } else {
