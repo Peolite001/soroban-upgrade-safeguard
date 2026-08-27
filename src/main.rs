@@ -358,6 +358,25 @@ struct Args {
     #[arg(long)]
     watch: bool,
 
+    /// Debounce window, in milliseconds, for coalescing rapid filesystem
+    /// events in --watch mode before re-running the comparison. Bounds:
+    /// WATCH_DEBOUNCE_MIN_MS..=WATCH_DEBOUNCE_MAX_MS.
+    #[arg(
+        long,
+        value_name = "MILLISECONDS",
+        default_value_t = DEFAULT_WATCH_DEBOUNCE_MS,
+        value_parser = parse_watch_debounce_ms,
+    )]
+    watch_debounce_ms: u64,
+
+    /// Path to a JSON status file that --watch mode updates atomically after
+    /// every cycle transition (start, completion, error, shutdown). Contains
+    /// only structured operational state (timestamps, cycle count, verdict),
+    /// never findings, so external build systems or service managers can
+    /// poll it cheaply to check liveness.
+    #[arg(long, value_name = "PATH", requires = "watch")]
+    watch_status_file: Option<PathBuf>,
+
     /// Suppress timestamps in report output for deterministic/snapshot testing
     #[arg(long)]
     no_timestamp: bool,
@@ -2427,10 +2446,45 @@ fn run_single(
         Ok(true)
     };
 
-    let is_safe = run_comparison(&progress)?;
+    let cycle_counter = std::cell::Cell::new(0u64);
+    let status_path = args.watch_status_file.clone();
+    let run_comparison_tracked = move |progress: &dyn Fn(String)| -> Result<bool> {
+        let cycle = cycle_counter.get() + 1;
+        cycle_counter.set(cycle);
+        let status = soroban_upgrade_safeguard::watch_status::WatchStatus::starting(cycle);
+        if let Some(ref path) = status_path {
+            if let Err(e) = status.write_to(path) {
+                eprintln!("Warning: failed to write watch status file {}: {e}", path.display());
+            }
+        }
+        let result = run_comparison(progress);
+        if let Some(ref path) = status_path {
+            let final_status = match &result {
+                Ok(is_safe) => status.clone().completed(*is_safe),
+                Err(e) => status.clone().failed(e.to_string()),
+            };
+            if let Err(write_err) = final_status.write_to(path) {
+                eprintln!(
+                    "Warning: failed to write watch status file {}: {write_err}",
+                    path.display()
+                );
+            }
+        }
+        result
+    };
+
+    let is_safe = run_comparison_tracked(&progress)?;
 
     if args.watch && !watch_paths.is_empty() {
-        run_watch_mode(&watch_paths, args, outputs, suppressions, run_comparison)?;
+        run_watch_mode(
+            &watch_paths,
+            args,
+            outputs,
+            suppressions,
+            args.watch_debounce_ms,
+            args.watch_status_file.as_deref(),
+            run_comparison_tracked,
+        )?;
     } else if args.watch {
         eprintln!(
             "Warning: --watch requires local file paths (stdin or RPC sources not supported)"
@@ -2442,6 +2496,32 @@ fn run_single(
     }
 
     Ok(())
+}
+
+/// Lower bound for `--watch-debounce-ms`. Below this, the burst of events a
+/// build tool emits for a single logical change (e.g. write-to-temp-then-
+/// rename) would each trigger a separate re-run instead of being coalesced.
+const WATCH_DEBOUNCE_MIN_MS: u64 = 10;
+
+/// Upper bound for `--watch-debounce-ms`. Above this, watch mode would feel
+/// unresponsive to a genuine single-file edit.
+const WATCH_DEBOUNCE_MAX_MS: u64 = 60_000;
+
+/// Default debounce window, matching the fixed value watch mode used before
+/// this option existed.
+const DEFAULT_WATCH_DEBOUNCE_MS: u64 = 300;
+
+fn parse_watch_debounce_ms(s: &str) -> Result<u64, String> {
+    let ms: u64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid number of milliseconds"))?;
+    if !(WATCH_DEBOUNCE_MIN_MS..=WATCH_DEBOUNCE_MAX_MS).contains(&ms) {
+        return Err(format!(
+            "watch debounce must be between {WATCH_DEBOUNCE_MIN_MS}ms and \
+             {WATCH_DEBOUNCE_MAX_MS}ms, got {ms}ms"
+        ));
+    }
+    Ok(ms)
 }
 
 fn is_batch_mode(args: &Args) -> bool {
@@ -2558,6 +2638,50 @@ fn emit_output(spec: &OutputSpec, content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Set from the SIGTERM handler; polled by the watch loop at safe points
+/// (between cycles, never mid-write) so shutdown never truncates a report or
+/// the status file. `AtomicBool::store`/`load` are async-signal-safe, which
+/// is why the handler does nothing else.
+#[cfg(all(feature = "watch", unix))]
+static WATCH_SIGTERM_RECEIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(feature = "watch", unix))]
+extern "C" fn handle_watch_sigterm(_signum: libc::c_int) {
+    WATCH_SIGTERM_RECEIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install a SIGTERM handler that only records that a signal arrived,
+/// overriding the default disposition (immediate termination, which could
+/// otherwise cut off a report or status-file write that was in progress).
+/// The watch loop itself decides when it is safe to actually stop.
+#[cfg(all(feature = "watch", unix))]
+fn install_watch_sigterm_handler() {
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            handle_watch_sigterm as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+#[cfg(all(feature = "watch", not(unix)))]
+fn install_watch_sigterm_handler() {
+    // SIGTERM is a POSIX signal; there is no equivalent to intercept here.
+    // On these platforms watch mode still exits via Ctrl+C, or is stopped by
+    // the OS/service manager's default kill behavior for the process.
+}
+
+#[cfg(all(feature = "watch", unix))]
+fn watch_shutdown_requested() -> bool {
+    WATCH_SIGTERM_RECEIVED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(all(feature = "watch", not(unix)))]
+fn watch_shutdown_requested() -> bool {
+    false
+}
+
 /// Watch mode: monitor input files and re-run on changes.
 #[cfg(feature = "watch")]
 fn run_watch_mode(
@@ -2565,11 +2689,15 @@ fn run_watch_mode(
     _args: &Args,
     _outputs: &[OutputSpec],
     _suppressions: &SuppressionConfig,
+    debounce_ms: u64,
+    status_path: Option<&Path>,
     run_comparison: impl Fn(&dyn Fn(String)) -> Result<bool>,
 ) -> Result<()> {
     use notify::Watcher;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    install_watch_sigterm_handler();
 
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res| {
@@ -2587,11 +2715,17 @@ fn run_watch_mode(
             });
     }
 
-    eprintln!("\n👀 Watch mode active. Waiting for file changes... (Ctrl+C to stop)\n");
+    eprintln!(
+        "\n👀 Watch mode active (debounce: {debounce_ms}ms). Waiting for file changes... (Ctrl+C or SIGTERM to stop)\n"
+    );
 
-    let debounce_ms = 300;
-
+    let loop_result = (|| -> Result<()> {
     loop {
+        if watch_shutdown_requested() {
+            eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+            return Ok(());
+        }
+
         match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
             Ok(_event) => {
                 // Brief debounce window: wait for more events
@@ -2603,6 +2737,14 @@ fn run_watch_mode(
                             return Err(anyhow::anyhow!("File watcher channel disconnected"));
                         }
                     }
+                    if watch_shutdown_requested() {
+                        break;
+                    }
+                }
+
+                if watch_shutdown_requested() {
+                    eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+                    return Ok(());
                 }
 
                 // Check that watched files exist before re-running
@@ -2615,6 +2757,10 @@ fn run_watch_mode(
                     loop {
                         if watch_paths.iter().all(|p| p.exists()) {
                             break;
+                        }
+                        if watch_shutdown_requested() {
+                            eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+                            return Ok(());
                         }
                         if start.elapsed() > timeout {
                             eprintln!("⚠️  Timed out waiting for files to reappear");
@@ -2646,7 +2792,9 @@ fn run_watch_mode(
                     }
                 }
 
-                eprintln!("\n👀 Watch mode active. Waiting for file changes... (Ctrl+C to stop)\n");
+                eprintln!(
+                    "\n👀 Watch mode active (debounce: {debounce_ms}ms). Waiting for file changes... (Ctrl+C or SIGTERM to stop)\n"
+                );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // No event - if this is the first run, just continue
@@ -2656,6 +2804,19 @@ fn run_watch_mode(
             }
         }
     }
+    })();
+
+    if let Some(path) = status_path {
+        let status = soroban_upgrade_safeguard::watch_status::WatchStatus::starting(0).shutdown();
+        if let Err(e) = status.write_to(path) {
+            eprintln!(
+                "Warning: failed to write watch status file {}: {e}",
+                path.display()
+            );
+        }
+    }
+
+    loop_result
 }
 
 #[cfg(not(feature = "watch"))]
@@ -2664,6 +2825,8 @@ fn run_watch_mode(
     _args: &Args,
     _outputs: &[OutputSpec],
     _suppressions: &SuppressionConfig,
+    _debounce_ms: u64,
+    _status_path: Option<&Path>,
     _run_comparison: impl Fn(&dyn Fn(String)) -> Result<bool>,
 ) -> Result<()> {
     eprintln!("Warning: --watch is not available in this build. Rebuild with the 'watch' feature enabled.");
@@ -3277,5 +3440,39 @@ mod tests {
         let spec: OutputSpec = "text".parse().unwrap();
         assert_eq!(spec.format, OutputFormat::Text);
         assert!(spec.path.is_none());
+    }
+
+    #[test]
+    fn watch_debounce_default_is_accepted() {
+        assert_eq!(
+            parse_watch_debounce_ms(&DEFAULT_WATCH_DEBOUNCE_MS.to_string()).unwrap(),
+            DEFAULT_WATCH_DEBOUNCE_MS
+        );
+    }
+
+    #[test]
+    fn watch_debounce_accepts_boundary_values() {
+        assert_eq!(
+            parse_watch_debounce_ms(&WATCH_DEBOUNCE_MIN_MS.to_string()).unwrap(),
+            WATCH_DEBOUNCE_MIN_MS
+        );
+        assert_eq!(
+            parse_watch_debounce_ms(&WATCH_DEBOUNCE_MAX_MS.to_string()).unwrap(),
+            WATCH_DEBOUNCE_MAX_MS
+        );
+    }
+
+    #[test]
+    fn watch_debounce_rejects_out_of_range_values() {
+        assert!(parse_watch_debounce_ms(&(WATCH_DEBOUNCE_MIN_MS - 1).to_string()).is_err());
+        assert!(parse_watch_debounce_ms(&(WATCH_DEBOUNCE_MAX_MS + 1).to_string()).is_err());
+        assert!(parse_watch_debounce_ms("0").is_err());
+    }
+
+    #[test]
+    fn watch_debounce_rejects_non_numeric_values() {
+        assert!(parse_watch_debounce_ms("fast").is_err());
+        assert!(parse_watch_debounce_ms("").is_err());
+        assert!(parse_watch_debounce_ms("-5").is_err());
     }
 }

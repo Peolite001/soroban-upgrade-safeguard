@@ -90,8 +90,7 @@ impl fmt::Debug for RpcClientConfig {
 
 impl RpcClientConfig {
     pub fn new(url: impl Into<String>) -> Result<Self, Error> {
-        let url = url.into();
-        validate_url(&url)?;
+        let url = normalize_url(&url.into())?;
         Ok(Self {
             url,
             headers: Vec::new(),
@@ -193,13 +192,111 @@ pub fn validate_header_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_url(url: &str) -> Result<(), Error> {
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(Error::RpcAuthConfig {
-            details: "RPC URL must use http:// or https://".into(),
-        });
+/// Normalize safe, semantics-preserving variations of an RPC URL: a default
+/// port for the scheme (`:443` on `https://`, `:80` on `http://`) and an
+/// empty or root-only path both collapse to the same canonical form, so that
+/// equivalent URLs produce identical provenance and replay-bundle identity.
+/// Lowercases the scheme and host (both are case-insensitive per RFC 3986);
+/// everything else — path segments beyond the root, query, fragment,
+/// userinfo — is passed through unchanged since altering it could change
+/// what the server actually receives.
+///
+/// Returns a descriptive [`Error::RpcAuthConfig`] that always names the
+/// original, user-facing value when the URL cannot be parsed or normalized.
+pub fn normalize_url(url: &str) -> Result<String, Error> {
+    let malformed = |details: String| Error::RpcAuthConfig {
+        details: format!("RPC URL '{url}' {details}"),
+    };
+
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| malformed("is missing a scheme (expected http:// or https://)".into()))?;
+    let scheme_lower = scheme.to_ascii_lowercase();
+    if scheme_lower != "http" && scheme_lower != "https" {
+        return Err(malformed("must use http:// or https://".into()));
     }
-    Ok(())
+
+    let (authority_and_path, query_and_fragment) = match rest.find(['?', '#']) {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+
+    let (authority, path) = match authority_and_path.find('/') {
+        Some(idx) => (&authority_and_path[..idx], &authority_and_path[idx..]),
+        None => (authority_and_path, ""),
+    };
+    if authority.is_empty() {
+        return Err(malformed("is missing a host".into()));
+    }
+
+    let (userinfo, host_port) = match authority.rfind('@') {
+        Some(idx) => (&authority[..=idx], &authority[idx + 1..]),
+        None => ("", authority),
+    };
+    if host_port.is_empty() {
+        return Err(malformed("is missing a host".into()));
+    }
+
+    let (host, port) = split_host_port(host_port, url)?;
+    if host.is_empty() {
+        return Err(malformed("is missing a host".into()));
+    }
+
+    let default_port = if scheme_lower == "https" { "443" } else { "80" };
+    let host_lower = host.to_ascii_lowercase();
+    let normalized_authority = match port {
+        Some(p) if p == default_port => host_lower,
+        Some(p) => format!("{host_lower}:{p}"),
+        None => host_lower,
+    };
+
+    // An empty path and a bare "/" both mean "the root", per RFC 3986 §6.2.3.
+    let normalized_path = if path.is_empty() || path == "/" {
+        ""
+    } else {
+        path
+    };
+
+    Ok(format!(
+        "{scheme_lower}://{userinfo}{normalized_authority}{normalized_path}{query_and_fragment}"
+    ))
+}
+
+/// Split a `host:port` or bracketed `[ipv6]:port` authority component into
+/// its host and optional port, validating that any port is numeric.
+fn split_host_port<'a>(
+    host_port: &'a str,
+    original_url: &str,
+) -> Result<(&'a str, Option<&'a str>), Error> {
+    let malformed = |details: String| Error::RpcAuthConfig {
+        details: format!("RPC URL '{original_url}' {details}"),
+    };
+
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| malformed("has an unterminated IPv6 host literal".into()))?;
+        let host = &host_port[..=end + 1];
+        let after = &rest[end + 1..];
+        return match after.strip_prefix(':') {
+            Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+                Ok((host, Some(p)))
+            }
+            Some("") => Err(malformed("has an empty port".into())),
+            Some(_) => Err(malformed("has a non-numeric port".into())),
+            None => Ok((host, None)),
+        };
+    }
+
+    match host_port.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && !p.is_empty() => {
+            Ok((h, Some(p)))
+        }
+        Some((_, "")) => Err(malformed("has an empty port".into())),
+        Some(("", _)) => Err(malformed("is missing a host".into())),
+        Some(_) => Err(malformed("has a non-numeric port".into())),
+        None => Ok((host_port, None)),
+    }
 }
 
 pub fn redact_url(url: &str) -> String {
@@ -234,5 +331,113 @@ mod tests {
             redact_url("https://user:pass@example.test/rpc?key=secret"),
             "https://[REDACTED]example.test/rpc"
         );
+    }
+
+    #[test]
+    fn normalize_https_collapses_default_port_and_root_path() {
+        assert_eq!(
+            normalize_url("https://example.test:443/").unwrap(),
+            "https://example.test"
+        );
+        assert_eq!(
+            normalize_url("https://example.test").unwrap(),
+            "https://example.test"
+        );
+    }
+
+    #[test]
+    fn normalize_local_http_collapses_default_port_and_empty_path() {
+        assert_eq!(
+            normalize_url("http://127.0.0.1:80").unwrap(),
+            "http://127.0.0.1"
+        );
+        assert_eq!(
+            normalize_url("http://127.0.0.1/").unwrap(),
+            "http://127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_non_default_ports() {
+        assert_eq!(
+            normalize_url("https://example.test:8443/rpc").unwrap(),
+            "https://example.test:8443/rpc"
+        );
+        assert_eq!(
+            normalize_url("http://127.0.0.1:8080").unwrap(),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_non_root_paths_exactly() {
+        // Only the empty/root path is collapsed; a deeper path is left
+        // untouched, including its trailing slash, since stripping it could
+        // change what the server receives.
+        assert_eq!(
+            normalize_url("https://example.test/rpc/").unwrap(),
+            "https://example.test/rpc/"
+        );
+        assert_eq!(
+            normalize_url("https://example.test/rpc").unwrap(),
+            "https://example.test/rpc"
+        );
+    }
+
+    #[test]
+    fn normalize_lowercases_scheme_and_host_only() {
+        assert_eq!(
+            normalize_url("HTTPS://Example.TEST:443/RPC?Key=Value").unwrap(),
+            "https://example.test/RPC?Key=Value"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_userinfo_query_and_fragment() {
+        assert_eq!(
+            normalize_url("https://user:pass@example.test:443/?token=secret#frag").unwrap(),
+            "https://user:pass@example.test?token=secret#frag"
+        );
+    }
+
+    #[test]
+    fn normalize_handles_bracketed_ipv6_hosts() {
+        assert_eq!(
+            normalize_url("http://[::1]:80/rpc").unwrap(),
+            "http://[::1]/rpc"
+        );
+        assert_eq!(
+            normalize_url("http://[::1]:8080").unwrap(),
+            "http://[::1]:8080"
+        );
+    }
+
+    #[test]
+    fn normalize_is_idempotent() {
+        let once = normalize_url("HTTPS://Example.test:443/rpc/").unwrap();
+        let twice = normalize_url(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn normalize_rejects_malformed_urls() {
+        let cases = [
+            "example.test/rpc",       // no scheme
+            "ftp://example.test",     // unsupported scheme
+            "https://",               // no host
+            "https:///rpc",           // no host, path only
+            "https://example.test:abc/rpc", // non-numeric port
+            "https://:8080/rpc",      // empty host with port
+            "http://[::1/rpc",        // unterminated IPv6 literal
+        ];
+        for case in cases {
+            let err = normalize_url(case)
+                .expect_err(&format!("expected '{case}' to be rejected as malformed"));
+            assert_eq!(err.kind(), crate::error::ErrorKind::RpcAuthConfig);
+            assert!(
+                err.to_string().contains(case),
+                "error for '{case}' should include the original value, got: {err}"
+            );
+        }
     }
 }

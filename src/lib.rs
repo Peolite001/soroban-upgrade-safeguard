@@ -165,6 +165,11 @@ pub mod lineage;
 #[cfg(not(feature = "unstable"))]
 pub mod lineage;
 
+#[cfg(feature = "unstable")]
+pub mod watch_status;
+#[cfg(not(feature = "unstable"))]
+mod watch_status;
+
 // Stable public API exports at the root
 pub use crate::attestation::{
     sign_statement, verify_artifacts, verify_signatures, ArtifactDigest, AttestationSigner,
