@@ -9,6 +9,9 @@ pub mod attestation;
 mod attestation;
 
 #[cfg(feature = "unstable")]
+pub mod budget;
+#[cfg(not(feature = "unstable"))]
+mod budget;
 pub mod bundle;
 #[cfg(not(feature = "unstable"))]
 mod bundle;

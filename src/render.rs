@@ -168,6 +168,9 @@ pub struct RenderableReport {
     pub empirical: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
+    /// Configured compatibility budgets ([`crate::budget`]) that were exceeded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_violations: Vec<crate::budget::BudgetViolation>,
     /// Migration history, present only once this document has been through
     /// `upgrade-report` (or [`crate::migration::upgrade_to_latest`]) at least
     /// once. Absent on a report written directly by a live run.
@@ -665,6 +668,24 @@ impl RenderableReport {
             output.push_str("Limits: Stellar RPC does not support wildcard ledger enumeration. Coverage is bounded to instance storage or offline files.\n");
         }
 
+        if !self.budget_violations.is_empty() {
+            output.push_str("\n");
+            output.push_str(
+                &"========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            output.push_str(&"    COMPATIBILITY BUDGETS\n".bold().red().to_string());
+            output.push_str(
+                &"========================================\n"
+                    .bold()
+                    .to_string(),
+            );
+            for violation in &self.budget_violations {
+                output.push_str(&format!("🔴 {violation}\n").red().to_string());
+            }
+        }
+
         output
     }
 
@@ -867,6 +888,18 @@ impl RenderableReport {
             output.push_str(&format!("- **Decoded Successfully**: {}\n", successes));
             output.push_str(&format!("- **Failed to Decode**: {}\n", failures));
             output.push_str("- **Limits**: Stellar RPC does not support wildcard ledger enumeration. Coverage is bounded to instance storage or offline files.\n\n");
+        }
+
+        if !self.budget_violations.is_empty() {
+            output.push_str("### 🔴 Compatibility Budgets Exceeded\n\n");
+            output.push_str("| Scope | Metric | Measured | Limit |\n|---|---|---|---|\n");
+            for violation in &self.budget_violations {
+                output.push_str(&format!(
+                    "| `{}` | {:?} | {} | {} |\n",
+                    violation.scope, violation.metric, violation.measured, violation.limit
+                ));
+            }
+            output.push('\n');
         }
 
         output

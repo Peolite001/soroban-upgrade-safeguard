@@ -172,6 +172,21 @@ pub struct SuppressionConfig {
     #[cfg(not(feature = "unstable"))]
     pub(crate) policy: PolicyConfig,
 
+    /// Per-axis and per-rule compatibility budgets. Parsed from raw
+    /// `[[budget]]` tables and validated by [`Self::load_from_path`] /
+    /// [`Self::from_toml_str`] via [`crate::budget::BudgetConfig::from_file_entries`].
+    #[serde(default, rename = "budget")]
+    raw_budget: Vec<crate::budget::BudgetEntryFile>,
+    /// The validated form of `raw_budget`. Always `Some` on a config that
+    /// successfully parsed via [`Self::from_toml_str`] / [`Self::load_from_path`];
+    /// `None` only for a config built directly with [`SuppressionConfig::default`]
+    /// (which has no budgets to validate).
+    #[serde(skip)]
+    #[cfg(feature = "unstable")]
+    pub budgets: crate::budget::BudgetConfig,
+    #[serde(skip)]
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) budgets: crate::budget::BudgetConfig,
     /// Rule IDs / axes for which a matching suppression must carry a
     /// non-blank reason. See [`RequireReasonPolicy`].
     #[serde(default)]
@@ -195,6 +210,9 @@ impl SuppressionConfig {
         &self.policy
     }
 
+    /// Get the validated compatibility budgets.
+    pub fn budgets(&self) -> &crate::budget::BudgetConfig {
+        &self.budgets
     /// Get the require-reason policy.
     pub fn require_reason(&self) -> &RequireReasonPolicy {
         &self.require_reason
@@ -322,7 +340,11 @@ impl SuppressionRule {
     }
 }
 
-fn canonical_rule_id(category: &str) -> String {
+/// Normalize a finding category string into the stable, snake_case rule ID
+/// used by [`crate::report::ReportedFinding::rule_id`] and by
+/// [`crate::budget`]'s `rule`-scoped budgets, so both name a rule the same
+/// way.
+pub(crate) fn canonical_rule_id(category: &str) -> String {
     category
         .chars()
         .map(|c| {
@@ -422,23 +444,21 @@ impl SuppressionConfig {
     /// and batch/manifest mode alike — rejects an unreasoned suppression on
     /// a normal run, not only under `--validate-config`.
     pub fn from_toml_str(contents: &str) -> Result<Self, Error> {
-        let config: Self = toml::from_str(contents).map_err(|e| Error::SuppressionConfig {
-            path: None,
-            details: "Failed to parse suppression config as TOML".to_string(),
-            source: Some(Box::new(e)),
-        })?;
-
-        let missing = missing_required_reasons(&config.rules, &config.require_reason);
-        if !missing.is_empty() {
-            return Err(Error::SuppressionConfig {
+        let mut config: SuppressionConfig =
+            toml::from_str(contents).map_err(|e| Error::SuppressionConfig {
                 path: None,
-                details: format!(
-                    "suppression config violates its policy: {}",
-                    missing.join("; ")
-                ),
-                source: None,
-            });
-        }
+                details: "Failed to parse suppression config as TOML".to_string(),
+                source: Some(Box::new(e)),
+            })?;
+
+        config.budgets = crate::budget::BudgetConfig::from_file_entries(
+            std::mem::take(&mut config.raw_budget),
+        )
+        .map_err(|errors| Error::SuppressionConfig {
+            path: None,
+            details: format!("Invalid [[budget]] configuration: {}", errors.join("; ")),
+            source: None,
+        })?;
 
         Ok(config)
     }
