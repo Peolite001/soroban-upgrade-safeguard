@@ -2714,7 +2714,11 @@ fn render_batch_summary(
                 output.format.to_string().to_lowercase()
             ));
         } else if let Some(path) = &output.path {
-            progress(format!("  batch report written to {}", path.display()));
+            progress(format!(
+                "  {} batch report written to {}",
+                output.format,
+                path.display()
+            ));
         }
     }
 
@@ -3046,7 +3050,7 @@ fn render_to_outputs(
             let label = contract_name
                 .map(|n| format!("{}.{}", n, output.format.file_extension()))
                 .unwrap_or_else(|| path.to_string_lossy().to_string());
-            progress(format!("  report written to {}", label));
+            progress(format!("  {} report written to {}", output.format, label));
         }
     }
     Ok(())
