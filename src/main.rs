@@ -3181,8 +3181,10 @@ fn render_github_actions(report: &report::SafetyReport) -> String {
 fn emit_output(spec: &OutputSpec, content: &str) -> Result<()> {
     match &spec.path {
         Some(path) => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create output directory '{}'.", parent.display())
+                })?;
             }
             let temp_path = path.with_extension(format!(
                 "{}.tmp",
@@ -3190,8 +3192,15 @@ fn emit_output(spec: &OutputSpec, content: &str) -> Result<()> {
                     .and_then(|ext| ext.to_str())
                     .unwrap_or("tmp")
             ));
-            std::fs::write(&temp_path, content)?;
-            std::fs::rename(&temp_path, path)?;
+            std::fs::write(&temp_path, content).with_context(|| {
+                format!("Failed to write output file '{}'.", temp_path.display())
+            })?;
+            std::fs::rename(&temp_path, path).with_context(|| {
+                format!(
+                    "Failed to move written output into place at '{}'.",
+                    path.display()
+                )
+            })?;
         }
         None => {
             println!("{content}");
@@ -4023,9 +4032,20 @@ fn write_report_file(
             .unwrap_or("tmp")
     ));
 
-    std::fs::create_dir_all(output_dir)?;
-    std::fs::write(&temp_path, content)?;
-    std::fs::rename(&temp_path, &output_path)?;
+    std::fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "Failed to create output directory '{}'.",
+            output_dir.display()
+        )
+    })?;
+    std::fs::write(&temp_path, content)
+        .with_context(|| format!("Failed to write output file '{}'.", temp_path.display()))?;
+    std::fs::rename(&temp_path, &output_path).with_context(|| {
+        format!(
+            "Failed to move written output into place at '{}'.",
+            output_path.display()
+        )
+    })?;
     Ok(())
 }
 
