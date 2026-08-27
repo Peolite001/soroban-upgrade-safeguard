@@ -262,6 +262,45 @@ match the CLI help output (`--help`) and the `override_usage` in `src/main.rs`.
 
 Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)), and `--no-symlinks` for local paths (see [Local file inputs](#local-file-inputs)).
 
+### Report output destinations
+
+By default a report is printed to stdout in the format chosen by `--format`
+(`text` if `--format` is omitted). `--output` adds an explicit destination and
+can be repeated to emit the same report as several formats/files in one run
+(see [Multiple output formats](../README.md#multiple-output-formats) for
+worked examples):
+
+```bash
+# stdout only, text (the default — no --output needed)
+soroban-upgrade-safeguard old.wasm new.wasm
+
+# format-only destination: still stdout, just a different format
+soroban-upgrade-safeguard old.wasm new.wasm --output json
+
+# FORMAT:PATH: write that format to a file instead of stdout
+soroban-upgrade-safeguard old.wasm new.wasm --output json:report.json
+
+# repeat --output for multiple destinations in one run
+soroban-upgrade-safeguard old.wasm new.wasm \
+  --output json:report.json \
+  --output markdown:report.md
+```
+
+A bare path passed to `--output` (no `FORMAT:` prefix, e.g. `--output
+report.txt`) is a file destination whose format comes from `--format`,
+falling back to `text` if `--format` is also omitted. Any parent directories
+in an `--output` file path that don't already exist are created
+automatically.
+
+Decorative and progress lines (headers, per-file "report written to ..."
+notices, suppression-config diagnostics) are ordinarily printed to stdout
+alongside a `text` report. But whenever stdout would otherwise carry a clean,
+parseable document — because the stdout format is `json`, `markdown`, or
+`github-actions`, or because any `--output` targets a file in addition to
+stdout — progress lines are written to stderr instead, so stdout stays safe
+to pipe or redirect into a file without decorative noise mixed in. `--quiet`
+suppresses these lines entirely, on either stream.
+
 ### Directory scan
 
 ```bash
