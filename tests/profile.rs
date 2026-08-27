@@ -468,3 +468,86 @@ fn example_profiles_config_parses_and_resolves_every_profile() {
     let resolved = ResolvedConfig::resolve(base_args(example)).unwrap();
     assert_eq!(resolved.profile.selected.as_deref(), Some("dev"));
 }
+
+// ── Checked-in local development profile ─────────────────────────────────────
+//
+// Smoke tests for the .safeguard.dev.toml profile shipped with the repo.
+// This proves from a clean checkout that the profile (1) parses as a valid
+// suppression/profiles config, (2) resolves every declared named profile,
+// (3) auto-selects 'dev' via default_profile, and (4) runs against the
+// documented v1/v2 fixture WASMs without error through the library entry
+// point — exactly the workflow documented in the profile's header comments.
+
+#[test]
+fn dev_profile_parses_declared_profiles_and_defaults_to_dev() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_safeguard_env();
+
+    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".safeguard.dev.toml");
+    assert!(
+        dev_path.exists(),
+        "expected the checked-in dev profile at {}",
+        dev_path.display()
+    );
+
+    for name in ["dev", "pr", "golden"] {
+        let args = Args {
+            profile: Some(name.to_string()),
+            ..base_args(dev_path.clone())
+        };
+        let resolved = ResolvedConfig::resolve(args)
+            .unwrap_or_else(|e| panic!("dev profile '{name}' failed to resolve: {e}"));
+        assert_eq!(resolved.profile.selected.as_deref(), Some(name));
+    }
+
+    let resolved = ResolvedConfig::resolve(base_args(dev_path)).unwrap();
+    assert_eq!(
+        resolved.profile.selected.as_deref(),
+        Some("dev"),
+        "default_profile must auto-select 'dev' on a bare dev-profile load"
+    );
+    assert!(resolved.explain, "dev profile root must enable explain");
+    assert_eq!(resolved.format, OutputFormat::Text);
+}
+
+#[test]
+fn dev_profile_runs_against_documented_v1_v2_fixture_clean_checkout_smoke() {
+    use soroban_upgrade_safeguard::{compare_wasm_files_with_options, CompareOptions};
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    clear_safeguard_env();
+
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dev_path = repo.join(".safeguard.dev.toml");
+    let old_wasm = repo.join("tests").join("wasm").join("v1.wasm");
+    let new_wasm = repo.join("tests").join("wasm").join("v2.wasm");
+
+    assert!(dev_path.exists(), "dev profile must be checked in");
+    assert!(old_wasm.exists(), "v1 fixture missing: {}", old_wasm.display());
+    assert!(new_wasm.exists(), "v2 fixture missing: {}", new_wasm.display());
+
+    let args = Args {
+        wasm_paths: vec![old_wasm.clone(), new_wasm.clone()],
+        config: Some(dev_path),
+        ..Args::default()
+    };
+    let resolved = ResolvedConfig::resolve(args)
+        .expect("resolving CLI args against the dev profile must succeed");
+    assert_eq!(resolved.profile.selected.as_deref(), Some("dev"));
+
+    let opts = CompareOptions {
+        suppressions: Some(&resolved.suppressions),
+        explain: resolved.explain,
+        strict: resolved.strict,
+        storage_schemas: None,
+        lineage_store: None,
+    };
+    let report = compare_wasm_files_with_options(&old_wasm, &new_wasm, &opts)
+        .expect("comparing v1 vs v2 with the dev profile must not error");
+    // Smoke: the report must be structurally well-formed (totals add up).
+    assert_eq!(
+        report.total_findings(),
+        report.critical_count() + report.warning_count() + report.info_count(),
+        "finding counts must sum consistently with the dev-profile run"
+    );
+}
