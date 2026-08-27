@@ -184,6 +184,21 @@ pub struct SafetyReport {
     #[cfg(not(feature = "unstable"))]
     pub(crate) rpc_provenance: Option<crate::rpc::RpcProvenance>,
 
+    /// Symlink resolution for the old build, if its input path was one. See
+    /// [`crate::loader::SymlinkResolution`].
+    #[cfg(feature = "unstable")]
+    pub old_symlink: Option<crate::loader::SymlinkResolution>,
+    /// Symlink resolution for the old build, if its input path was one.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) old_symlink: Option<crate::loader::SymlinkResolution>,
+
+    /// Symlink resolution for the new build, if its input path was one.
+    #[cfg(feature = "unstable")]
+    pub new_symlink: Option<crate::loader::SymlinkResolution>,
+    /// Symlink resolution for the new build, if its input path was one.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) new_symlink: Option<crate::loader::SymlinkResolution>,
+
     #[cfg(feature = "unstable")]
     pub metrics: Option<BuildMetrics>,
     #[cfg(not(feature = "unstable"))]
@@ -735,6 +750,8 @@ impl SafetyReport {
             empirical: false,
             empirical_findings: Vec::new(),
             rpc_provenance: None,
+            old_symlink: None,
+            new_symlink: None,
             settings: ReportSettings::default(),
         }
     }
@@ -1022,6 +1039,8 @@ impl SafetyReport {
             empirical: false,
             empirical_findings: Vec::new(),
             rpc_provenance: None,
+            old_symlink: None,
+            new_symlink: None,
             settings: ReportSettings {
                 strict,
                 explain,
@@ -1033,6 +1052,19 @@ impl SafetyReport {
     pub fn with_interface_hashes(mut self, old: InterfaceHash, new: InterfaceHash) -> Self {
         self.old_interface_hash = Some(old);
         self.new_interface_hash = Some(new);
+        self
+    }
+
+    /// Attach symlink resolution recorded while loading the old/new inputs.
+    /// Either or both may be `None` when that input was a direct file (or a
+    /// non-local source).
+    pub fn with_symlinks(
+        mut self,
+        old: Option<crate::loader::SymlinkResolution>,
+        new: Option<crate::loader::SymlinkResolution>,
+    ) -> Self {
+        self.old_symlink = old;
+        self.new_symlink = new;
         self
     }
 
@@ -1129,6 +1161,10 @@ impl SafetyReport {
                     .rpc_provenance
                     .as_ref()
                     .and_then(|p| p.live_until_ledger_seq),
+                symlinks: [self.old_symlink.clone(), self.new_symlink.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
             },
             is_safe: self.is_safe,
             strict: self.strict,
@@ -1169,6 +1205,13 @@ impl SafetyReport {
 
     pub fn generate_summary_text(&self, explain: bool) -> String {
         self.to_renderable().to_text(explain)
+    }
+
+    /// Like [`Self::generate_summary_text`], with finding messages
+    /// word-wrapped to `width` columns when given. See
+    /// [`crate::render::RenderableReport::to_text_with_width`].
+    pub fn generate_summary_text_with_width(&self, explain: bool, width: Option<usize>) -> String {
+        self.to_renderable().to_text_with_width(explain, width)
     }
 
     pub fn generate_summary_markdown(&self) -> String {
@@ -1315,6 +1358,8 @@ mod tests {
             old_spec_summary: None,
             new_spec_summary: None,
             rpc_provenance: None,
+            old_symlink: None,
+            new_symlink: None,
             scope: AnalysisScope::default(),
             metrics: None,
             axis_verdicts: HashMap::new(),

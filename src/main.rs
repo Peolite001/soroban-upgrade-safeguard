@@ -18,7 +18,7 @@ use soroban_upgrade_safeguard::{
     oci::{self, OciArtifactKind, OciFetchConfig, OciReference},
     parser, preflight,
     remote::{self, RemoteFetchConfig, RemoteRef},
-    render::RenderableReport,
+    render::{self, RenderableReport},
     report,
     rpc::RpcClientConfig,
     spec,
@@ -41,6 +41,8 @@ enum ConfigSource {
     Env,
     /// Auto-discovered `.safeguard.toml` in the current directory.
     AutoDiscovered,
+    /// Found in an ancestor directory via `--search-parent-config`.
+    AncestorSearch,
 }
 
 impl std::fmt::Display for ConfigSource {
@@ -49,21 +51,96 @@ impl std::fmt::Display for ConfigSource {
             ConfigSource::Cli => write!(f, "--config"),
             ConfigSource::Env => write!(f, "{CONFIG_PATH_ENV_VAR} env var"),
             ConfigSource::AutoDiscovered => write!(f, "auto-discovered {DEFAULT_CONFIG_FILE}"),
+            ConfigSource::AncestorSearch => write!(f, "--search-parent-config"),
+        }
+    }
+}
+
+/// Whether `dir` is the workspace boundary ancestor search must not go past:
+/// a directory containing a `.git` entry. Checked with a plain path join
+/// rather than `.is_dir()`/`.is_file()` specifically, since a git worktree
+/// or submodule uses a `.git` *file* (a pointer to the real git dir)
+/// where a normal checkout uses a directory — either one marks the same
+/// boundary. Inclusive: this directory is itself still searched before the
+/// walk stops.
+fn is_workspace_boundary(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
+/// Search `start`'s ancestors — not `start` itself, which the plain
+/// auto-discovered-default tier already covers — for `.safeguard.toml`,
+/// stopping at the workspace boundary ([`is_workspace_boundary`]) or the
+/// filesystem root, whichever comes first. Returns every candidate found,
+/// nearest to `start` first; purely lexical (`Path::parent`), so it cannot
+/// loop even if a symlink appears in the chain.
+fn find_ancestor_configs(start: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut dir = start.to_path_buf();
+    loop {
+        if dir != start {
+            let candidate = dir.join(DEFAULT_CONFIG_FILE);
+            if candidate.exists() {
+                found.push(candidate);
+            }
+        }
+        if is_workspace_boundary(&dir) {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    found
+}
+
+/// Resolve the `--search-parent-config` tier: `enabled` gates it entirely
+/// (the search never runs otherwise), and it is only ever consulted by
+/// [`load_suppressions`] after `--config`, the env var, and the current
+/// directory have all come up empty.
+///
+/// More than one candidate along the ancestor chain is rejected outright —
+/// silently picking the nearest would make the effective config depend on
+/// exactly which subdirectory the tool happened to be run from, which is the
+/// ambiguity this option exists to resolve, not reproduce one level up.
+fn resolve_ancestor_config(enabled: bool) -> Result<Option<PathBuf>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let cwd = std::env::current_dir().context("Failed to read the current directory")?;
+    match find_ancestor_configs(&cwd).as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        multiple => {
+            let list = multiple
+                .iter()
+                .map(|p| format!("  - {}", loader::normalize_path_display(&p.display().to_string())))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!(
+                "Ambiguous --search-parent-config: found {} candidate suppression configs \
+                 between '{}' and the workspace boundary:\n{list}\n\
+                 Pass --config explicitly to choose one.",
+                multiple.len(),
+                loader::normalize_path_display(&cwd.display().to_string())
+            );
         }
     }
 }
 
 /// Resolve and load the suppression config: `--config` wins, then the
 /// `SOROBAN_SAFEGUARD_CONFIG` environment variable, then the auto-discovered
-/// `.safeguard.toml` in the current directory, else no suppressions are
+/// `.safeguard.toml` in the current directory, then (with
+/// `search_parent_config`) an ancestor directory, else no suppressions are
 /// applied. `no_config` bypasses all of it.
 ///
-/// An explicit `--config` or env-var path that is missing or malformed is an
-/// error; the auto-discovered default is silently skipped when absent
-/// (existing behavior, unchanged).
+/// An explicit `--config`, env-var, or ancestor-search path that is missing
+/// or malformed is an error; the current-directory default is silently
+/// skipped when absent (existing behavior, unchanged).
 fn load_suppressions(
     no_config: bool,
     cli_config: Option<&Path>,
+    search_parent_config: bool,
 ) -> Result<(SuppressionConfig, Option<(PathBuf, ConfigSource)>)> {
     if no_config {
         return Ok((SuppressionConfig::default(), None));
@@ -77,16 +154,20 @@ fn load_suppressions(
         let config = SuppressionConfig::load_from_path(&path)?;
         return Ok((config, Some((path, ConfigSource::Env))));
     }
-    match SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))? {
-        Some(config) => Ok((
+    if let Some(config) = SuppressionConfig::load_optional(Path::new(DEFAULT_CONFIG_FILE))? {
+        return Ok((
             config,
             Some((
                 PathBuf::from(DEFAULT_CONFIG_FILE),
                 ConfigSource::AutoDiscovered,
             )),
-        )),
-        None => Ok((SuppressionConfig::default(), None)),
+        ));
     }
+    if let Some(path) = resolve_ancestor_config(search_parent_config)? {
+        let config = SuppressionConfig::load_from_path(&path)?;
+        return Ok((config, Some((path, ConfigSource::AncestorSearch))));
+    }
+    Ok((SuppressionConfig::default(), None))
 }
 
 /// Output format for the safety report.
@@ -272,14 +353,25 @@ struct Args {
     /// Path to a suppression config acknowledging known, intentional breaking
     /// changes. When omitted, falls back to the SOROBAN_SAFEGUARD_CONFIG
     /// environment variable, then to `.safeguard.toml` in the current
-    /// directory if present; otherwise no suppressions are applied.
+    /// directory if present, then (with --search-parent-config) an ancestor
+    /// directory; otherwise no suppressions are applied.
     #[arg(long, value_name = "CONFIG")]
     config: Option<PathBuf>,
 
-    /// Do not load any suppression config, including SOROBAN_SAFEGUARD_CONFIG
-    /// and the default .safeguard.toml.
+    /// Do not load any suppression config, including SOROBAN_SAFEGUARD_CONFIG,
+    /// the default .safeguard.toml, and --search-parent-config.
     #[arg(long, conflicts_with = "config")]
     no_config: bool,
+
+    /// When no config resolved from --config, SOROBAN_SAFEGUARD_CONFIG, or
+    /// the current directory, search ancestor directories for a
+    /// .safeguard.toml, stopping at the workspace boundary (a directory
+    /// containing .git) or the filesystem root. Off by default: without
+    /// this flag, only the current directory is checked. More than one
+    /// candidate along the way is a hard error — pass --config to
+    /// disambiguate rather than have the tool guess.
+    #[arg(long, conflicts_with = "no_config")]
+    search_parent_config: bool,
 
     /// Validate a suppression config without analyzing WASM inputs.
     #[arg(long, value_name = "CONFIG")]
@@ -311,6 +403,15 @@ struct Args {
     #[arg(long)]
     plain: bool,
 
+    /// Word-wrap finding messages in text output to this many columns,
+    /// overriding detection entirely. When omitted, width is detected only
+    /// when stdout is a terminal: the COLUMNS environment variable if set
+    /// and valid, else 80. Piped/redirected output is left unwrapped unless
+    /// this flag is given. Never affects JSON or Markdown output, which have
+    /// no line-width concept.
+    #[arg(long, value_name = "COLUMNS")]
+    width: Option<usize>,
+
     /// Suppress decorative and progress output; the report and exit code are unchanged.
     #[arg(long)]
     quiet: bool,
@@ -323,6 +424,13 @@ struct Args {
     /// Without this flag only HTTPS URLs are accepted.
     #[arg(long)]
     allow_http_local: bool,
+
+    /// Reject a local WASM input path that is a symlink (or resolves through
+    /// one) instead of following it. Off by default: a symlinked input is
+    /// followed and the resolved target recorded in the report's provenance.
+    /// For pipelines where an input must be a direct file.
+    #[arg(long)]
+    no_symlinks: bool,
 
     /// Expected SHA-256 hash (hex) of the on-chain WASM baseline.
     #[arg(long, value_name = "HEX_HASH")]
@@ -578,13 +686,19 @@ struct StreamArgs {
     #[arg(long)]
     strict: bool,
     /// Do not load a suppression config automatically, including
-    /// SOROBAN_SAFEGUARD_CONFIG and the default .safeguard.toml.
+    /// SOROBAN_SAFEGUARD_CONFIG, the default .safeguard.toml, and
+    /// --search-parent-config.
     #[arg(long)]
     no_config: bool,
     /// Path to a suppression config. Falls back to SOROBAN_SAFEGUARD_CONFIG,
-    /// then to `.safeguard.toml` in the current directory if present.
+    /// then to `.safeguard.toml` in the current directory if present, then
+    /// (with --search-parent-config) an ancestor directory.
     #[arg(long, value_name = "CONFIG")]
     config: Option<PathBuf>,
+    /// Search ancestor directories for `.safeguard.toml` when nothing more
+    /// specific resolved one. See the top-level flag of the same name.
+    #[arg(long, conflicts_with = "no_config")]
+    search_parent_config: bool,
 }
 
 /// `extract`: decode one build and emit its interface.
@@ -650,6 +764,14 @@ struct RenderArgs {
     /// Unicode markers and decorative separators. Report content is unchanged.
     #[arg(long)]
     plain: bool,
+
+    /// Word-wrap finding messages in text output to this many columns,
+    /// overriding detection entirely. When omitted, width is detected only
+    /// when stdout is a terminal: the COLUMNS environment variable if set
+    /// and valid, else 80. Piped/redirected output is left unwrapped unless
+    /// this flag is given. Has no effect on --format markdown.
+    #[arg(long, value_name = "COLUMNS")]
+    width: Option<usize>,
 }
 
 /// `upgrade-report`: migrate a saved JSON report to the latest schema version.
@@ -735,6 +857,7 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
             path,
             &RemoteFetchConfig::default(),
             &OciFetchConfig::default(),
+            false,
             &|line| {
                 eprintln!("{line}");
             },
@@ -1157,7 +1280,11 @@ fn run_verify_attestation(args: &VerifyAttestationArgs) -> Result<()> {
 fn run_stream(args: &StreamArgs) -> Result<()> {
     use soroban_upgrade_safeguard::jsonl::{self, OutputOrder, StreamConfig};
 
-    let (suppressions, config_source) = load_suppressions(args.no_config, args.config.as_deref())?;
+    let (suppressions, config_source) = load_suppressions(
+        args.no_config,
+        args.config.as_deref(),
+        args.search_parent_config,
+    )?;
     if let Some((path, source)) = &config_source {
         eprintln!("Suppression config: {} (source: {source})", path.display());
     }
@@ -1209,7 +1336,8 @@ fn run_render(args: &RenderArgs) -> Result<()> {
 
     match args.format {
         RenderFormat::Text => {
-            let text = report.to_text(args.explain);
+            let width = resolve_text_width(args.width, std::io::stdout().is_terminal());
+            let text = report.to_text_with_width(args.explain, width);
             println!(
                 "{}",
                 if args.plain {
@@ -1525,7 +1653,7 @@ fn main() -> Result<()> {
             .manifest
             .as_ref()
             .expect("--explain-manifest requires --manifest (enforced by clap)");
-        let resolved = manifest::resolve(manifest_path, &cli_settings(&args))?;
+        let resolved = manifest::resolve(manifest_path, &cli_settings(&args)?)?;
         print!("{}", resolved.explain_text());
         return Ok(());
     }
@@ -1588,7 +1716,11 @@ fn main() -> Result<()> {
         }
     };
 
-    let (suppressions, config_source) = load_suppressions(args.no_config, args.config.as_deref())?;
+    let (suppressions, config_source) = load_suppressions(
+        args.no_config,
+        args.config.as_deref(),
+        args.search_parent_config,
+    )?;
     if let Some((path, source)) = &config_source {
         progress(format!(
             "Suppression config: {} (source: {source})",
@@ -1606,7 +1738,7 @@ fn main() -> Result<()> {
 }
 
 fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> Result<()> {
-    let cli = cli_settings(args);
+    let cli = cli_settings(args)?;
 
     // Manifest mode resolves includes, defaults and per-pair overrides up front —
     // including duplicate-identity detection, so a collision fails before any
@@ -1631,6 +1763,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
     };
     let remote_config = remote_fetch_config(args);
     let oci_config = oci_fetch_config(args);
+    let width = resolve_text_width(args.width, std::io::stdout().is_terminal());
 
     // Suppression configs are shared across pairs far more often than not.
     let mut config_cache: std::collections::HashMap<PathBuf, SuppressionConfig> =
@@ -1680,6 +1813,8 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             critical_root_count: 1,
             cascade_critical_count: 0,
             rpc_provenance: None,
+            old_symlink: None,
+            new_symlink: None,
             old_interface_hash: None,
             new_interface_hash: None,
             no_timestamp: args.no_timestamp,
@@ -1763,6 +1898,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             args.explain,
             args.ascii,
             args.plain,
+            width,
             Some(&gap.name),
             progress,
         )?;
@@ -1774,6 +1910,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                 args.explain,
                 args.ascii,
                 args.plain,
+                width,
             )?;
             write_report_file(
                 output_dir,
@@ -1824,8 +1961,20 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
 
         let mut pair_error = None;
         let report = match (
-            load_wasm_input(&pair.old, &remote_config, &oci_config, progress),
-            load_wasm_input(&pair.new, &remote_config, &oci_config, progress),
+            load_wasm_input(
+                &pair.old,
+                &remote_config,
+                &oci_config,
+                args.no_symlinks,
+                progress,
+            ),
+            load_wasm_input(
+                &pair.new,
+                &remote_config,
+                &oci_config,
+                args.no_symlinks,
+                progress,
+            ),
         ) {
             (Ok(old_wasm), Ok(new_wasm)) => {
                 match load_pair_storage_schemas(pair).and_then(|storage_schemas| {
@@ -1870,7 +2019,9 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                         )
                     }
                 }) {
-                    Ok(report) => report,
+                    Ok(report) => {
+                        report.with_symlinks(old_wasm.symlink.clone(), new_wasm.symlink.clone())
+                    }
                     Err(e) => {
                         pair_error = Some(e.to_string());
                         progress(format!(
@@ -1884,6 +2035,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                             settings.strict.value,
                             settings.no_timestamp.value,
                         )
+                        .with_symlinks(old_wasm.symlink.clone(), new_wasm.symlink.clone())
                     }
                 }
             }
@@ -1918,6 +2070,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             explain,
             ascii,
             plain,
+            width,
             Some(&contract_name),
             progress,
         )?;
@@ -1929,6 +2082,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                 explain,
                 ascii,
                 plain,
+                width,
             )?;
             write_report_file(
                 output_dir,
@@ -1973,6 +2127,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             strict: args.strict,
             ascii: args.ascii,
             plain: args.plain,
+            width,
             resolved_manifest: resolved_manifest.as_ref(),
         },
         outputs,
@@ -2007,6 +2162,8 @@ fn synthesize_error_report(
         critical_root_count: 1,
         cascade_critical_count: 0,
         rpc_provenance: None,
+        old_symlink: None,
+        new_symlink: None,
         old_interface_hash: None,
         new_interface_hash: None,
         no_timestamp,
@@ -2269,6 +2426,9 @@ struct BatchSummary<'a> {
     strict: bool,
     ascii: bool,
     plain: bool,
+    /// Resolved wrap width for text-format finding messages; see
+    /// [`resolve_text_width`]. Has no effect on JSON or Markdown output.
+    width: Option<usize>,
     /// `None` for directory-scan runs, which have no composition to describe.
     resolved_manifest: Option<&'a manifest::ResolvedManifest>,
 }
@@ -2285,6 +2445,7 @@ fn render_batch_summary(
         strict,
         ascii,
         plain,
+        width,
         resolved_manifest,
     } = *summary;
 
@@ -2313,15 +2474,15 @@ fn render_batch_summary(
                             new_storage_schema,
                             ..
                         } => {
-                            object.insert("old".to_string(), serde_json::json!(old_path));
-                            object.insert("new".to_string(), serde_json::json!(new_path));
+                            object.insert("old".to_string(), json_path(old_path));
+                            object.insert("new".to_string(), json_path(new_path));
                             object.insert(
                                 "old_storage_schema".to_string(),
-                                serde_json::json!(old_storage_schema),
+                                json_path_opt(old_storage_schema.as_deref()),
                             );
                             object.insert(
                                 "new_storage_schema".to_string(),
-                                serde_json::json!(new_storage_schema),
+                                json_path_opt(new_storage_schema.as_deref()),
                             );
                         }
                         BatchResult::Error {
@@ -2333,15 +2494,15 @@ fn render_batch_summary(
                             ..
                         } => {
                             object.insert("error".to_string(), serde_json::json!(error));
-                            object.insert("old".to_string(), serde_json::json!(old_path));
-                            object.insert("new".to_string(), serde_json::json!(new_path));
+                            object.insert("old".to_string(), json_path(old_path));
+                            object.insert("new".to_string(), json_path_opt(new_path.as_deref()));
                             object.insert(
                                 "old_storage_schema".to_string(),
-                                serde_json::json!(old_storage_schema),
+                                json_path_opt(old_storage_schema.as_deref()),
                             );
                             object.insert(
                                 "new_storage_schema".to_string(),
-                                serde_json::json!(new_storage_schema),
+                                json_path_opt(new_storage_schema.as_deref()),
                             );
                         }
                     }
@@ -2499,7 +2660,7 @@ fn render_batch_summary(
                     if let BatchResult::Error { error, .. } = result {
                         text.push_str(&format!("Pair error: {}\n", error));
                     }
-                    let detail = report.generate_summary_text(false);
+                    let detail = report.generate_summary_text_with_width(false, width);
                     text.push_str(&destyle_text(detail, ascii, plain));
                     text.push_str("========================================\n\n");
                 }
@@ -2619,7 +2780,13 @@ fn run_single(
         let remote_config = remote_fetch_config(args);
         let oci_config = oci_fetch_config(args);
 
-        let new = load_wasm_input(new_wasm_path, &remote_config, &oci_config, progress)?;
+        let new = load_wasm_input(
+            new_wasm_path,
+            &remote_config,
+            &oci_config,
+            args.no_symlinks,
+            progress,
+        )?;
 
         let mut store_opt = if let Some(ref path) = args.lineage_store {
             let mut store = if path.exists() {
@@ -2663,6 +2830,7 @@ fn run_single(
                     lineage_store: store_opt.as_ref(),
                 },
             )?
+            .with_symlinks(None, new.symlink.clone())
         } else {
             let old = if let Some(contract_id) = old_source {
                 let rpc_url = args.rpc_url.as_ref().unwrap();
@@ -2672,7 +2840,13 @@ fn run_single(
                         .with_id_mismatch_allowed(args.rpc_allow_id_mismatch),
                 )?
             } else {
-                load_wasm_input(&args.wasm_paths[0], &remote_config, &oci_config, progress)?
+                load_wasm_input(
+                    &args.wasm_paths[0],
+                    &remote_config,
+                    &oci_config,
+                    args.no_symlinks,
+                    progress,
+                )?
             };
             compare_contracts(
                 &ContractComparison {
@@ -2694,6 +2868,7 @@ fn run_single(
                 },
                 progress,
             )?
+            .with_symlinks(old.symlink.clone(), new.symlink.clone())
         };
 
         if let (Some(ref mut store), Some(ref version_id), Some(ref path)) =
@@ -2734,6 +2909,7 @@ fn run_single(
             args.explain,
             args.ascii,
             args.plain,
+            resolve_text_width(args.width, std::io::stdout().is_terminal()),
             None,
             progress,
         )?;
@@ -2833,11 +3009,12 @@ fn render_to_outputs(
     explain: bool,
     ascii: bool,
     plain: bool,
+    width: Option<usize>,
     contract_name: Option<&str>,
     progress: &dyn Fn(String),
 ) -> Result<()> {
     for output in outputs {
-        let content = render_single(report, output.format, explain, ascii, plain)?;
+        let content = render_single(report, output.format, explain, ascii, plain, width)?;
         emit_output(output, &content)?;
 
         if let Some(ref path) = output.path {
@@ -2861,6 +3038,52 @@ fn format_labels(labels: &[String], empty: &str) -> String {
     }
 }
 
+/// Render a path into batch JSON with display normalization applied (see
+/// [`loader::normalize_path_display`]), rather than `PathBuf`'s own
+/// `Serialize` (which would embed the OS-native separator the run happened
+/// to use).
+fn json_path(path: &Path) -> serde_json::Value {
+    serde_json::Value::String(loader::normalize_path_display(&path.display().to_string()))
+}
+
+fn json_path_opt(path: Option<&Path>) -> serde_json::Value {
+    match path {
+        Some(path) => json_path(path),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Resolve the wrap width for text-format finding messages.
+///
+/// `explicit` (`--width`) always wins, clamped up to
+/// [`render::MIN_TEXT_WIDTH`]: a mistakenly tiny value is widened to a still
+/// narrow but readable floor rather than rejected outright, since clamping a
+/// display width is a much smaller intervention than failing the whole run.
+///
+/// Otherwise: there is nothing meaningful to detect for piped or redirected
+/// output, so wrapping is off (`None`) unless `stdout_is_terminal`. When it
+/// is a terminal, the `COLUMNS` environment variable is used if set to a
+/// valid positive number — the same signal most shells export and the
+/// conventional first thing a CLI checks — falling back to
+/// [`render::DEFAULT_TEXT_WIDTH`] when `COLUMNS` is unset or not a number.
+/// This is deliberately not a raw terminal-size ioctl query: `COLUMNS` needs
+/// no new dependency and works the same way on every platform, and a fixed,
+/// documented fallback for when it's absent is exactly what "detection with
+/// a documented fallback" asks for.
+fn resolve_text_width(explicit: Option<usize>, stdout_is_terminal: bool) -> Option<usize> {
+    if let Some(width) = explicit {
+        return Some(width.max(render::MIN_TEXT_WIDTH));
+    }
+    if !stdout_is_terminal {
+        return None;
+    }
+    let detected = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&w| w > 0);
+    Some(detected.unwrap_or(render::DEFAULT_TEXT_WIDTH))
+}
+
 /// Apply `--ascii`/`--plain` marker and separator substitution to rendered
 /// text/Markdown. `plain` implies (and supersedes) `ascii`.
 fn destyle_text(text: String, ascii: bool, plain: bool) -> String {
@@ -2879,10 +3102,14 @@ fn render_single(
     explain: bool,
     ascii: bool,
     plain: bool,
+    width: Option<usize>,
 ) -> Result<String> {
     // JSON carries the severity as a field rather than as a marker glyph, and
     // the GitHub Actions workflow-command syntax is already plain ASCII, so
-    // `--ascii`/`--plain` only affect the human-readable formats.
+    // `--ascii`/`--plain` only affect the human-readable formats. `width` is
+    // narrower still: it only ever reaches `generate_summary_text_with_width`
+    // below, so JSON and Markdown output are structurally incapable of being
+    // affected by it.
     match format {
         OutputFormat::Json => Ok(serde_json::to_string_pretty(&report.to_json())?),
         OutputFormat::Markdown => {
@@ -2890,7 +3117,7 @@ fn render_single(
             Ok(destyle_text(markdown, ascii, plain))
         }
         OutputFormat::Text => {
-            let text = report.generate_summary_text(explain);
+            let text = report.generate_summary_text_with_width(explain, width);
             Ok(destyle_text(text, ascii, plain))
         }
         OutputFormat::GithubActions => Ok(render_github_actions(report)),
@@ -3158,6 +3385,7 @@ fn load_wasm_input(
     path: &Path,
     remote_config: &RemoteFetchConfig,
     oci_config: &OciFetchConfig,
+    reject_symlinks: bool,
     progress: &dyn Fn(String),
 ) -> Result<loader::WasmModule> {
     if is_stdin_wasm_path(path) {
@@ -3201,7 +3429,14 @@ fn load_wasm_input(
         ));
         return Ok(module);
     }
-    Ok(loader::load_wasm(path)?)
+    let module = loader::load_wasm_with_policy(path, reject_symlinks)?;
+    if let Some(symlink) = &module.symlink {
+        progress(format!(
+            "🔗 Symlink input: {} -> {}",
+            symlink.requested, symlink.resolved
+        ));
+    }
+    Ok(module)
 }
 
 /// One pair the batch loop is about to run, with the settings it runs under.
@@ -3552,23 +3787,31 @@ fn validate_suppression_config(path: &Path) -> Result<()> {
 /// The implicit `.safeguard.toml` lookup is passed as `default_config` rather
 /// than resolved here, so it lands at the built-in level of the chain and any
 /// manifest naming a config outranks it.
-fn cli_settings(args: &Args) -> manifest::CliSettings {
+fn cli_settings(args: &Args) -> Result<manifest::CliSettings> {
     let env_config = std::env::var_os(CONFIG_PATH_ENV_VAR).map(PathBuf::from);
     let default_config = (!args.no_config && args.config.is_none() && env_config.is_none())
         .then(|| PathBuf::from(DEFAULT_CONFIG_FILE))
         .filter(|path| path.exists());
+    // Only searched once nothing more specific already resolved a path —
+    // same reasoning as `default_config`, one tier further out.
+    let ancestor_config = if default_config.is_none() {
+        resolve_ancestor_config(!args.no_config && args.search_parent_config)?
+    } else {
+        None
+    };
 
-    manifest::CliSettings {
+    Ok(manifest::CliSettings {
         config: args.config.clone(),
         env_config,
         default_config,
+        ancestor_config,
         no_config: args.no_config,
         strict: args.strict,
         explain: args.explain,
         ascii: args.ascii,
         no_timestamp: args.no_timestamp,
         max_pairs: args.max_pairs,
-    }
+    })
 }
 
 /// Load the suppression config a pair runs under, caching by resolved path so
@@ -3725,6 +3968,123 @@ fn sanitize_report_filename(contract_name: &str, format: OutputFormat) -> PathBu
 }
 
 #[cfg(test)]
+mod ancestor_config_tests {
+    use super::*;
+
+    /// A fresh scratch directory for one test, under the OS temp dir rather
+    /// than `CARGO_TARGET_TMPDIR` — these tests build their own directory
+    /// trees from scratch and never touch the process's real current
+    /// directory (only `resolve_ancestor_config` does that, and only the
+    /// `enabled: false` short-circuit, which never reaches it, is exercised
+    /// here — everything else goes through `find_ancestor_configs`, which
+    /// takes its starting point as a plain argument).
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "safeguard-ancestor-config-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("failed to create scratch dir");
+        path
+    }
+
+    #[test]
+    fn is_workspace_boundary_detects_a_git_directory() {
+        let dir = scratch("git-dir");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        assert!(is_workspace_boundary(&dir));
+    }
+
+    #[test]
+    fn is_workspace_boundary_detects_a_git_worktree_file() {
+        // Worktrees and submodules use a `.git` *file* (a pointer to the
+        // real git dir elsewhere), not a directory.
+        let dir = scratch("git-file");
+        std::fs::write(dir.join(".git"), "gitdir: /elsewhere/.git/worktrees/x\n").unwrap();
+        assert!(is_workspace_boundary(&dir));
+    }
+
+    #[test]
+    fn is_workspace_boundary_is_false_without_a_git_entry() {
+        let dir = scratch("no-git");
+        assert!(!is_workspace_boundary(&dir));
+    }
+
+    #[test]
+    fn find_ancestor_configs_finds_nothing_below_an_empty_workspace() {
+        let root = scratch("empty-workspace");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let nested = root.join("services").join("api").join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert!(find_ancestor_configs(&nested).is_empty());
+    }
+
+    #[test]
+    fn find_ancestor_configs_finds_a_nested_ancestor_match() {
+        let root = scratch("nested-match");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(DEFAULT_CONFIG_FILE), "").unwrap();
+        let nested = root.join("services").join("api").join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            find_ancestor_configs(&nested),
+            vec![root.join(DEFAULT_CONFIG_FILE)]
+        );
+    }
+
+    #[test]
+    fn find_ancestor_configs_does_not_check_the_starting_directory_itself() {
+        // `start` is covered by the separate, higher-priority
+        // current-directory-default tier — the ancestor search must not
+        // re-report it as if it were a distinct candidate.
+        let root = scratch("skip-start");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(DEFAULT_CONFIG_FILE), "").unwrap();
+
+        assert!(find_ancestor_configs(&root).is_empty());
+    }
+
+    #[test]
+    fn find_ancestor_configs_stops_at_the_git_boundary() {
+        // A .safeguard.toml ABOVE the workspace boundary must never surface.
+        let outer = scratch("stops-at-boundary");
+        let root = outer.join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(outer.join(DEFAULT_CONFIG_FILE), "").unwrap();
+        let nested = root.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert!(find_ancestor_configs(&nested).is_empty());
+    }
+
+    #[test]
+    fn find_ancestor_configs_returns_every_candidate_nearest_first() {
+        let root = scratch("multiple-candidates");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(DEFAULT_CONFIG_FILE), "").unwrap();
+        let mid = root.join("services");
+        std::fs::create_dir_all(&mid).unwrap();
+        std::fs::write(mid.join(DEFAULT_CONFIG_FILE), "").unwrap();
+        let nested = mid.join("api").join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            find_ancestor_configs(&nested),
+            vec![mid.join(DEFAULT_CONFIG_FILE), root.join(DEFAULT_CONFIG_FILE)]
+        );
+    }
+
+    #[test]
+    fn resolve_ancestor_config_is_a_noop_when_disabled() {
+        // Short-circuits before ever reading the real current directory, so
+        // this is safe to run alongside every other test in this binary.
+        assert_eq!(resolve_ancestor_config(false).unwrap(), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3851,5 +4211,84 @@ mod tests {
         assert!(parse_watch_debounce_ms("fast").is_err());
         assert!(parse_watch_debounce_ms("").is_err());
         assert!(parse_watch_debounce_ms("-5").is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // resolve_text_width
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_text_width_is_none_when_not_a_terminal_and_no_explicit_width() {
+        // Piped/redirected output: nothing meaningful to detect, and no
+        // override given, so wrapping stays off.
+        assert_eq!(resolve_text_width(None, false), None);
+    }
+
+    #[test]
+    fn resolve_text_width_explicit_wins_even_when_not_a_terminal() {
+        assert_eq!(resolve_text_width(Some(100), false), Some(100));
+    }
+
+    #[test]
+    fn resolve_text_width_explicit_is_clamped_up_to_the_minimum() {
+        assert_eq!(
+            resolve_text_width(Some(1), false),
+            Some(render::MIN_TEXT_WIDTH)
+        );
+        assert_eq!(
+            resolve_text_width(Some(0), true),
+            Some(render::MIN_TEXT_WIDTH)
+        );
+        // A value already at or above the floor passes through unchanged.
+        assert_eq!(
+            resolve_text_width(Some(render::MIN_TEXT_WIDTH), false),
+            Some(render::MIN_TEXT_WIDTH)
+        );
+    }
+
+    #[test]
+    fn resolve_text_width_falls_back_to_the_default_on_a_terminal_without_columns() {
+        // SAFETY: main.rs's tests run single-threaded-safe with respect to
+        // this var (no other test in this binary reads or writes COLUMNS),
+        // matching the existing precedent for env-var-scoped tests here.
+        let prev = std::env::var("COLUMNS").ok();
+        std::env::remove_var("COLUMNS");
+        assert_eq!(
+            resolve_text_width(None, true),
+            Some(render::DEFAULT_TEXT_WIDTH)
+        );
+        if let Some(prev) = prev {
+            std::env::set_var("COLUMNS", prev);
+        }
+    }
+
+    #[test]
+    fn resolve_text_width_uses_columns_when_set_on_a_terminal() {
+        let prev = std::env::var("COLUMNS").ok();
+        std::env::set_var("COLUMNS", "132");
+        assert_eq!(resolve_text_width(None, true), Some(132));
+        match prev {
+            Some(prev) => std::env::set_var("COLUMNS", prev),
+            None => std::env::remove_var("COLUMNS"),
+        }
+    }
+
+    #[test]
+    fn resolve_text_width_ignores_an_invalid_columns_value() {
+        let prev = std::env::var("COLUMNS").ok();
+        std::env::set_var("COLUMNS", "not-a-number");
+        assert_eq!(
+            resolve_text_width(None, true),
+            Some(render::DEFAULT_TEXT_WIDTH)
+        );
+        std::env::set_var("COLUMNS", "0");
+        assert_eq!(
+            resolve_text_width(None, true),
+            Some(render::DEFAULT_TEXT_WIDTH)
+        );
+        match prev {
+            Some(prev) => std::env::set_var("COLUMNS", prev),
+            None => std::env::remove_var("COLUMNS"),
+        }
     }
 }
