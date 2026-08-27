@@ -180,6 +180,26 @@ pub struct SafetyReport {
     pub(crate) scope: AnalysisScope,
 
     #[cfg(feature = "unstable")]
+    pub rpc_provenance: Option<crate::rpc::RpcProvenance>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) rpc_provenance: Option<crate::rpc::RpcProvenance>,
+
+    /// Symlink resolution for the old build, if its input path was one. See
+    /// [`crate::loader::SymlinkResolution`].
+    #[cfg(feature = "unstable")]
+    pub old_symlink: Option<crate::loader::SymlinkResolution>,
+    /// Symlink resolution for the old build, if its input path was one.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) old_symlink: Option<crate::loader::SymlinkResolution>,
+
+    /// Symlink resolution for the new build, if its input path was one.
+    #[cfg(feature = "unstable")]
+    pub new_symlink: Option<crate::loader::SymlinkResolution>,
+    /// Symlink resolution for the new build, if its input path was one.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) new_symlink: Option<crate::loader::SymlinkResolution>,
+
+    #[cfg(feature = "unstable")]
     pub metrics: Option<BuildMetrics>,
     #[cfg(not(feature = "unstable"))]
     pub(crate) metrics: Option<BuildMetrics>,
@@ -322,6 +342,73 @@ impl SafetyReport {
                         }),
                     });
             }
+        }
+    }
+
+    pub fn apply_lineage_report(
+        &mut self,
+        lineage_report: &crate::lineage::LineageValidationReport,
+        suppressions: &SuppressionConfig,
+        explain: bool,
+        strict: bool,
+    ) {
+        if !lineage_report.is_safe {
+            self.is_safe = false;
+        }
+
+        for hist in &lineage_report.historical_findings {
+            let category = format!("Historical Lineage Break ({})", hist.historical_version_id);
+            let finding = hist.finding.clone();
+            let rule = suppressions.matching_rule(&finding);
+            let suppressed = rule.is_some();
+
+            match finding.severity {
+                crate::diff::Severity::Critical => {
+                    self.critical_count += 1;
+                    if suppressed {
+                        self.suppressed_critical_count += 1;
+                    }
+                }
+                crate::diff::Severity::Warning => {
+                    self.warning_count += 1;
+                    if suppressed {
+                        self.suppressed_warning_count += 1;
+                    }
+                }
+                crate::diff::Severity::Info => {
+                    self.info_count += 1;
+                    if suppressed {
+                        self.suppressed_info_count += 1;
+                    }
+                }
+            }
+
+            self.total_findings += 1;
+            if suppressed {
+                self.suppressed_count += 1;
+            } else {
+                for axis in &finding.axes {
+                    if self.gated_axes.contains(axis) || strict {
+                        self.is_safe = false;
+                        self.axis_verdicts.insert(*axis, AxisStatus::Failed);
+                    }
+                }
+            }
+
+            self.findings_by_category
+                .entry(category)
+                .or_default()
+                .push(ReportedFinding {
+                    rule_id: "historical_lineage_break".to_string(),
+                    axes: finding.axes.clone(),
+                    finding,
+                    suppressed,
+                    suppression_reason: rule.and_then(|r| r.reason.clone()),
+                    remediation: explain.then(|| {
+                        "Update candidate build to maintain backward compatibility with this historical version."
+                            .to_string()
+                    }),
+                });
         }
     }
 
@@ -579,6 +666,15 @@ pub fn asciify_markers(text: &str) -> String {
         .replace('⚠', "[WARNING]")
 }
 
+/// Strip the decorative Unicode `asciify_markers` intentionally leaves alone
+/// (the `↳` guidance/reason arrow, and the `─` box-drawing separator around
+/// the provenance block), for output that must be fully plain: no color, no
+/// Unicode markers, no decorative separators. Callers combine this with
+/// disabling color (see `--plain`); it does not touch color itself.
+pub fn plainify(text: &str) -> String {
+    asciify_markers(text).replace('↳', "->").replace('─', "-")
+}
+
 impl SafetyReport {
     pub fn new(diff: &DiffReport) -> Self {
         Self::with_suppressions(
@@ -670,6 +766,9 @@ impl SafetyReport {
             empirical: false,
             empirical_findings: Vec::new(),
             budget_violations: Vec::new(),
+            rpc_provenance: None,
+            old_symlink: None,
+            new_symlink: None,
             settings: ReportSettings::default(),
         }
     }
@@ -966,6 +1065,9 @@ impl SafetyReport {
             empirical: false,
             empirical_findings: Vec::new(),
             budget_violations,
+            rpc_provenance: None,
+            old_symlink: None,
+            new_symlink: None,
             settings: ReportSettings {
                 strict,
                 explain,
@@ -977,6 +1079,19 @@ impl SafetyReport {
     pub fn with_interface_hashes(mut self, old: InterfaceHash, new: InterfaceHash) -> Self {
         self.old_interface_hash = Some(old);
         self.new_interface_hash = Some(new);
+        self
+    }
+
+    /// Attach symlink resolution recorded while loading the old/new inputs.
+    /// Either or both may be `None` when that input was a direct file (or a
+    /// non-local source).
+    pub fn with_symlinks(
+        mut self,
+        old: Option<crate::loader::SymlinkResolution>,
+        new: Option<crate::loader::SymlinkResolution>,
+    ) -> Self {
+        self.old_symlink = old;
+        self.new_symlink = new;
         self
     }
 
@@ -1065,6 +1180,18 @@ impl SafetyReport {
                     .flatten()
                     .map(|hash| hash.to_hex())
                     .collect(),
+                ledger_sequence: self.rpc_provenance.as_ref().map(|p| p.ledger_sequence),
+                network: self.rpc_provenance.as_ref().map(|p| p.network.clone()),
+                rpc_endpoint: self.rpc_provenance.as_ref().map(|p| p.rpc_endpoint.clone()),
+                code_hash: self.rpc_provenance.as_ref().map(|p| p.code_hash.clone()),
+                live_until_ledger_seq: self
+                    .rpc_provenance
+                    .as_ref()
+                    .and_then(|p| p.live_until_ledger_seq),
+                symlinks: [self.old_symlink.clone(), self.new_symlink.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
             },
             is_safe: self.is_safe,
             strict: self.strict,
@@ -1096,6 +1223,7 @@ impl SafetyReport {
             empirical: self.empirical,
             empirical_findings: self.empirical_findings.clone(),
             budget_violations: self.budget_violations.clone(),
+            migration: None,
         }
     }
 
@@ -1105,6 +1233,13 @@ impl SafetyReport {
 
     pub fn generate_summary_text(&self, explain: bool) -> String {
         self.to_renderable().to_text(explain)
+    }
+
+    /// Like [`Self::generate_summary_text`], with finding messages
+    /// word-wrapped to `width` columns when given. See
+    /// [`crate::render::RenderableReport::to_text_with_width`].
+    pub fn generate_summary_text_with_width(&self, explain: bool, width: Option<usize>) -> String {
+        self.to_renderable().to_text_with_width(explain, width)
     }
 
     pub fn generate_summary_markdown(&self) -> String {
@@ -1237,6 +1372,9 @@ mod tests {
             no_timestamp: false,
             old_spec_summary: None,
             new_spec_summary: None,
+            rpc_provenance: None,
+            old_symlink: None,
+            new_symlink: None,
             scope: AnalysisScope::default(),
             metrics: None,
             axis_verdicts: HashMap::new(),

@@ -60,6 +60,11 @@ pub fn record_wasm_from_rpc(
     contract_id: &str,
     rpc_url: &str,
 ) -> Result<(WasmModule, ReplayBundle), Error> {
+    // Normalize up front so the bundle's `sanitized_url` (its identity for
+    // matching/replay) is consistent regardless of trailing-slash or
+    // default-port variations in how the URL was originally supplied.
+    let rpc_url = crate::rpc::normalize_url(rpc_url)?;
+    let rpc_url = rpc_url.as_str();
     let recorder = Recorder::new(rpc_url, contract_id);
     let module = fetch_wasm_recording(contract_id, rpc_url, &recorder)?;
     let mut bundle = recorder.into_bundle();
@@ -267,6 +272,7 @@ fn fetch_wasm_recording(
         path: format!("stellar://{}", contract_id),
         sha256: sha256_hex(&wasm_bytes),
         bytes: wasm_bytes,
+        rpc_provenance: None,
     })
 }
 
@@ -425,6 +431,7 @@ pub fn replay_wasm_from_bundle_struct(bundle: &ReplayBundle) -> Result<WasmModul
         path: format!("replay://bundle/{}", bundle.contract_id),
         sha256: sha,
         bytes: wasm_bytes,
+        rpc_provenance: None,
     })
 }
 

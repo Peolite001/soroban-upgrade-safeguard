@@ -1139,6 +1139,7 @@ dependencies = [
  "clap",
  "colored",
  "hex",
+ "libc",
  "notify",
  "proptest",
  "public-api",

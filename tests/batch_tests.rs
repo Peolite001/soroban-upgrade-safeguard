@@ -379,6 +379,41 @@ fn batch_directory_scanning_fails_on_breaking_contract() {
 }
 
 #[test]
+fn batch_directory_scanning_accepts_uppercase_wasm_extension() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dir_upper_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
+
+    // Copy fixtures with uppercase .WASM extensions:
+    // a.WASM: clean (v1 -> v1)
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("a.WASM")).expect("copy");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("a.WASM")).expect("copy");
+
+    // b.WASM: breaking (v1 -> v2)
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("b.WASM")).expect("copy");
+    std::fs::copy(wasm("v2.wasm"), new_dir.join("b.WASM")).expect("copy");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 1);
+    assert!(stdout.contains("Overall Status: ❌ FAILED"));
+    assert!(stdout.contains("a: ✅ PASSED"));
+    assert!(stdout.contains("b: ❌ FAILED"));
+}
+
+#[test]
 fn batch_conflicting_options_exit_with_error() {
     // 1. Both manifest and old-dir/new-dir
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
@@ -470,4 +505,118 @@ fn batch_manifest_writes_per_contract_reports_to_output_dir() {
         breaking_contents.contains("SOROBAN UPGRADE SAFETY REPORT"),
         "breaking report missing header"
     );
+}
+
+#[test]
+fn batch_manifest_writes_per_contract_custom_template() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("per_contract_custom_template");
+    let output_dir = tmp_dir.join("reports");
+    std::fs::create_dir_all(&tmp_dir).expect("failed to create tmp dir");
+
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_contract"
+        id = "my-clean-id"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_custom_template.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--per-contract-output-dir")
+        .arg(&output_dir)
+        .arg("--per-contract-output-name-template")
+        .arg("{id}_custom.{ext}")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("failed to run binary");
+
+    let code = output.status.code().expect("process terminated by signal");
+    assert_eq!(code, 0, "batch run must exit 0");
+
+    let clean_path = output_dir.join("my-clean-id_custom.json");
+    assert!(clean_path.exists(), "expected custom-named report file to exist");
+}
+
+#[test]
+fn batch_manifest_invalid_template_placeholder_fails() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("invalid_template");
+    let output_dir = tmp_dir.join("reports");
+
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_contract"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_invalid_template.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--per-contract-output-dir")
+        .arg(&output_dir)
+        .arg("--per-contract-output-name-template")
+        .arg("{invalid_placeholder}.{ext}")
+        .output()
+        .expect("failed to run binary");
+
+    let code = output.status.code().expect("process terminated by signal");
+    assert_eq!(code, 1, "batch run with invalid template must fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Unknown placeholder") || stderr.contains("invalid_placeholder"), "should report placeholder error");
+}
+
+#[test]
+fn batch_manifest_template_collision_fails() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("template_collision");
+    let output_dir = tmp_dir.join("reports");
+
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_1"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_2"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_collision.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--per-contract-output-dir")
+        .arg(&output_dir)
+        .arg("--per-contract-output-name-template")
+        .arg("static_name.{ext}")
+        .output()
+        .expect("failed to run binary");
+
+    let code = output.status.code().expect("process terminated by signal");
+    assert_eq!(code, 1, "batch run with template collision must fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("collision"), "should report collision error");
 }

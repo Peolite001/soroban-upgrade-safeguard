@@ -15,6 +15,7 @@ A powerful CLI tool to analyze and validate Soroban smart contract upgrades on t
 - **Suppression Config**: Acknowledge known, intentional breaking changes (e.g. a planned migration) in a `.safeguard.toml` so they no longer fail the run — while still listing them in the report.
 - **Interface Hash**: A stable, order-independent SHA-256 over the normalised spec. Two builds with the same hash expose the same interface, which makes it a cheap cache key and a direct answer to "did this change the interface?".
 - **Spec Extraction**: `extract` dumps a single build's decoded interface as JSON, so you can inspect a WASM or archive its interface without separate Stellar tooling.
+- **Interface Lockfiles**: Commit a reviewable interface snapshot and make CI fail when a candidate build drifts from it.
 - **Re-renderable Reports**: `render` turns a saved JSON report back into text or Markdown, so a stored verdict can be presented any number of ways without the original WASM files.
 - **Multi-Format Output**: Emit the same report as JSON, Markdown, and text simultaneously — each to its own file or stdout — in a single run.
 - **Watch Mode**: Continuously monitor input WASM files for changes and automatically re-run the comparison on every build.
@@ -42,6 +43,31 @@ soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>
 soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 ```
 
+### Comparing against a deployed contract (RPC baseline)
+
+Fetch the baseline directly from an on-chain contract instead of a local file
+— `<CONTRACT_ID>` is fetched over RPC, `<NEW_WASM>` is read from disk:
+
+```bash
+soroban-upgrade-safeguard \
+  --contract-id <CONTRACT_ID> \
+  --rpc-url <RPC_URL> \
+  <NEW_WASM>
+```
+
+For example:
+
+```bash
+soroban-upgrade-safeguard \
+  --contract-id CABCD1234... \
+  --rpc-url https://soroban-testnet.stellar.org \
+  ./wasm/v2.wasm
+```
+
+See [Zero-Trust RPC Baseline Retrieval](docs/documentation.md#zero-trust-rpc-baseline-retrieval)
+for the hash-verification pipeline, transport security rules, and
+authenticated-endpoint guidance to use before pointing this at production.
+
 ### Inspecting a single build
 
 ```bash
@@ -52,11 +78,54 @@ soroban-upgrade-safeguard extract ./wasm/v1.wasm
 soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only
 ```
 
-### Re-rendering a saved report
+### Pinning an interface with a lockfile
+
+Generate a lockfile from the build whose public interface you intend to protect:
 
 ```bash
+soroban-upgrade-safeguard lockfile ./wasm/v1.wasm \
+  --output ./wasm/contract.interface.lock.json
+```
+
+Commit the resulting JSON file. It contains the interface hash and the structured
+functions and user-defined types, with stable ordering and without build-specific
+paths. When an interface change is intentional, regenerate it with `--force` and
+review the lockfile diff as part of the same change:
+
+```bash
+soroban-upgrade-safeguard lockfile ./wasm/v2.wasm \
+  --output ./wasm/contract.interface.lock.json --force
+```
+
+Use the committed lockfile as a CI gate for a candidate build:
+
+```bash
+soroban-upgrade-safeguard ./wasm/candidate.wasm \
+  --interface-lockfile ./wasm/contract.interface.lock.json \
+  --format json
+```
+
+The command exits successfully when the exported interface matches. A drift exits
+non-zero and reports the same categorized findings as a normal two-build comparison.
+Lockfile checks cover the exported interface only; use the regular comparison mode
+for environment metadata, host imports, runtime surface, storage schemas, or
+empirical validation.
+
+### Re-rendering a saved report
+
+`render` accepts either a saved JSON report path or `-` to read the JSON from
+stdin, and prints it as `text` (the default) or `markdown` — `json` is not a
+render target, since re-rendering a saved JSON document as JSON would just be
+a copy.
+
+```bash
+# From a saved file
 soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format json > report.json
 soroban-upgrade-safeguard render report.json --format markdown
+
+# From stdin, piped straight from a comparison run
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format json \
+  | soroban-upgrade-safeguard render - --format text
 ```
 
 ### Signing and verifying reports
@@ -105,6 +174,49 @@ The tool auto-loads `.safeguard.toml` from the current directory, or use
 and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
 
+#### Ignoring configuration entirely
+
+Config is discovered automatically, from several places in turn: `--config`,
+then the `SOROBAN_SAFEGUARD_CONFIG` environment variable, then a
+`.safeguard.toml` in the current directory, then — with `--search-parent-config`
+— an ancestor directory. In batch mode a manifest may name one too.
+
+`--no-config` turns all of that off and runs with no suppressions at all. It is
+an escape hatch, not another layer in the chain: it outranks every source above,
+the manifest included, so nothing in the environment or the working tree can
+quietly re-enable a suppression.
+
+```bash
+# Judge the upgrade on the tool's own rules, ignoring any ambient .safeguard.toml
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --no-config
+```
+
+That makes it the flag to reach for when a run has to be reproducible or
+self-contained — verifying what a report would look like with nothing
+acknowledged, reproducing a CI result on a developer machine that has its own
+`.safeguard.toml`, or auditing whether a gate passes on its merits rather than
+on its suppressions.
+
+`--no-config` and `--config <PATH>` are **mutually exclusive**: passing both is
+rejected as a command-line error rather than resolved by precedence, since one
+asks for a specific config and the other for none, and guessing which was meant
+is exactly the wrong behavior for a safety gate. `--search-parent-config` is
+rejected alongside `--no-config` for the same reason. To run against a known
+config instead of the ambient one, pass `--config <PATH>` on its own.
+### Output format
+
+By default, and whenever `--format` is omitted, the report prints as
+colored, human-readable **text**. Select another format explicitly with
+`--format`:
+
+```bash
+# JSON, for scripting and CI
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format json
+
+# Markdown, for PR descriptions and comments
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format markdown
+```
+
 ### Multiple output formats
 
 Emit the same report in several formats and destinations in a single run:
@@ -123,6 +235,32 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
   --format text \
   --output json:ci-report.json
 ```
+
+### Quiet output
+
+`--quiet` suppresses everything the tool narrates *about* the run: the banner and
+separator lines, the per-file loading and spec-summary lines, config-discovery
+notes, batch pair headers, and the `report written to <path>` confirmations.
+
+It does not remove anything from the report. Every format you selected is still
+produced in full, with the same findings, to the same destination. The verdict
+and the exit code are also unchanged — `--quiet` only decides what gets narrated,
+never what gets analyzed, reported, or gated on.
+
+```bash
+# CI: only the JSON report reaches the log, with no surrounding progress text
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --format json --quiet
+
+# Still exits non-zero on breaking changes, so this remains a working gate
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --quiet --output json:report.json || echo "upgrade rejected"
+```
+
+Note that progress output already avoids stdout whenever stdout carries a
+machine-readable report — with `--format json` it is written to stderr instead.
+`--quiet` goes further and silences it on both streams, which is what you want
+when a CI log should contain the report and nothing else.
 
 ### Watch mode
 
@@ -174,6 +312,38 @@ To see exactly where each value came from without running any comparison:
 ```bash
 soroban-upgrade-safeguard --manifest release.toml --explain-manifest
 ```
+
+#### Naming each pair
+
+`name` gives a pair a stable identity in the results. It is optional — when
+omitted, a pair is identified by the file name of its `new` build, so
+`token_v2.wasm` reports as `token_v2.wasm`:
+
+```toml
+[[pairs]]
+old  = "token_v1.wasm"
+new  = "token_v2.wasm"
+name = "token"
+```
+
+That name is what every batch output keys off:
+
+- the summary line and the `=== Contract: token ===` detail heading in text output;
+- the summary table row and the `## Details: token` heading in Markdown;
+- the `results[].name` field in JSON;
+- the `::group::token` log group in GitHub Actions output;
+- the file name written under `--per-contract-output-dir`.
+
+It also identifies a pair that *fails*: a pair whose comparison errors is
+reported under its name rather than a path, so the failing entry is
+recognisable at a glance. Because identity has to be unambiguous, two pairs
+resolving to the same name is a hard error, raised before any comparison runs
+and naming both manifests involved — which is the usual reason to set `name`
+explicitly, since two teams' `v2.wasm` files would otherwise collide.
+
+For a stable identifier meant for tooling rather than people — one that survives
+a name being reworded — use the separate [`id`](docs/batch_manifests.md#pair-ids)
+field.
 
 See [Batch Manifests](docs/batch_manifests.md) for the full schema, includes,
 schema coverage rules, path rules, and JSON provenance.

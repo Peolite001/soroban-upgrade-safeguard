@@ -43,8 +43,11 @@
 
 use serde::{Deserialize, Serialize};
 use stellar_xdr::curr::{
-    ScSpecFunctionInputV0, ScSpecTypeDef, ScSpecUdtEnumCaseV0, ScSpecUdtErrorEnumCaseV0,
-    ScSpecUdtStructFieldV0, ScSpecUdtUnionCaseV0,
+    ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSpecTypeMap, ScSpecTypeOption,
+    ScSpecTypeResult, ScSpecTypeTuple, ScSpecTypeUdt, ScSpecTypeVec, ScSpecUdtEnumCaseV0,
+    ScSpecUdtEnumV0, ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0, ScSpecUdtStructFieldV0,
+    ScSpecUdtStructV0, ScSpecUdtUnionCaseTupleV0, ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0,
+    ScSpecUdtUnionV0, StringM, VecM,
 };
 
 use crate::interface_hash::InterfaceHash;
@@ -56,6 +59,13 @@ use crate::spec::ContractSpec;
 /// Bumped when a change would break a consumer that reads the current shape.
 /// Adding a field is not such a change.
 pub const SPEC_SCHEMA_VERSION: u32 = 1;
+
+/// Version of the committed interface lockfile format.
+///
+/// This is separate from [`SPEC_SCHEMA_VERSION`] because extracted build
+/// artifacts may evolve independently from the smaller, source-controlled
+/// contract used by CI.
+pub const INTERFACE_LOCKFILE_SCHEMA_VERSION: u32 = 1;
 
 /// A contract's decoded interface, ready to serialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +163,457 @@ impl ExtractedSpec {
             error_enums,
         }
     }
+}
+
+impl ExtractedSpec {
+    /// Convert an [`ExtractedSpec`] back into a [`ContractSpec`] for diffing.
+    pub fn to_contract_spec(&self) -> Result<ContractSpec, anyhow::Error> {
+        let mut spec = ContractSpec::default();
+
+        for s in &self.structs {
+            let fields: Result<Vec<_>, anyhow::Error> = s
+                .fields
+                .iter()
+                .map(|f| {
+                    Ok(stellar_xdr::curr::ScSpecUdtStructFieldV0 {
+                        doc: f
+                            .doc
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("doc error"))?,
+                        name: f
+                            .name
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("name error"))?,
+                        type_: (&f.type_).try_into()?,
+                    })
+                })
+                .collect();
+            let xdr_struct = stellar_xdr::curr::ScSpecUdtStructV0 {
+                doc: s
+                    .doc
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                lib: s
+                    .lib
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("lib error"))?,
+                name: s
+                    .name
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                fields: fields?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many fields"))?,
+            };
+            spec.structs.insert(s.name.clone(), xdr_struct);
+        }
+
+        for e in &self.enums {
+            let cases: Result<Vec<_>, anyhow::Error> = e
+                .cases
+                .iter()
+                .map(|c| {
+                    Ok(stellar_xdr::curr::ScSpecUdtEnumCaseV0 {
+                        doc: c
+                            .doc
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("doc error"))?,
+                        name: c
+                            .name
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("name error"))?,
+                        value: c.value,
+                    })
+                })
+                .collect();
+            let xdr_enum = stellar_xdr::curr::ScSpecUdtEnumV0 {
+                doc: e
+                    .doc
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                lib: e
+                    .lib
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("lib error"))?,
+                name: e
+                    .name
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                cases: cases?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many cases"))?,
+            };
+            spec.enums.insert(e.name.clone(), xdr_enum);
+        }
+
+        for u in &self.unions {
+            let cases: Result<Vec<_>, anyhow::Error> = u
+                .cases
+                .iter()
+                .map(|c| match c {
+                    UnionCaseJson::Void { name, doc } => {
+                        Ok(stellar_xdr::curr::ScSpecUdtUnionCaseV0::VoidV0(
+                            stellar_xdr::curr::ScSpecUdtUnionCaseVoidV0 {
+                                doc: doc
+                                    .as_str()
+                                    .try_into()
+                                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                                name: name
+                                    .as_str()
+                                    .try_into()
+                                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                            },
+                        ))
+                    }
+                    UnionCaseJson::Tuple { name, doc, types } => {
+                        let parsed_types: Result<Vec<_>, anyhow::Error> =
+                            types.iter().map(|t| t.try_into()).collect();
+                        Ok(stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(
+                            stellar_xdr::curr::ScSpecUdtUnionCaseTupleV0 {
+                                doc: doc
+                                    .as_str()
+                                    .try_into()
+                                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                                name: name
+                                    .as_str()
+                                    .try_into()
+                                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                                type_: parsed_types?
+                                    .try_into()
+                                    .map_err(|_| anyhow::anyhow!("Too many types"))?,
+                            },
+                        ))
+                    }
+                })
+                .collect();
+            let xdr_union = stellar_xdr::curr::ScSpecUdtUnionV0 {
+                doc: u
+                    .doc
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                lib: u
+                    .lib
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("lib error"))?,
+                name: u
+                    .name
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                cases: cases?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many cases"))?,
+            };
+            spec.unions.insert(u.name.clone(), xdr_union);
+        }
+
+        for err in &self.error_enums {
+            let cases: Result<Vec<_>, anyhow::Error> = err
+                .cases
+                .iter()
+                .map(|c| {
+                    Ok(stellar_xdr::curr::ScSpecUdtErrorEnumCaseV0 {
+                        doc: c
+                            .doc
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("doc error"))?,
+                        name: c
+                            .name
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("name error"))?,
+                        value: c.value,
+                    })
+                })
+                .collect();
+            let xdr_error = stellar_xdr::curr::ScSpecUdtErrorEnumV0 {
+                doc: err
+                    .doc
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                lib: err
+                    .lib
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("lib error"))?,
+                name: err
+                    .name
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                cases: cases?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many cases"))?,
+            };
+            spec.error_enums.insert(err.name.clone(), xdr_error);
+        }
+
+        for func in &self.functions {
+            let inputs: Result<Vec<_>, anyhow::Error> = func
+                .inputs
+                .iter()
+                .map(|i| {
+                    Ok(stellar_xdr::curr::ScSpecFunctionInputV0 {
+                        doc: i
+                            .doc
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("doc error"))?,
+                        name: i
+                            .name
+                            .as_str()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("name error"))?,
+                        type_: (&i.type_).try_into()?,
+                    })
+                })
+                .collect();
+            let outputs: Result<Vec<_>, anyhow::Error> =
+                func.outputs.iter().map(|o| o.try_into()).collect();
+            let xdr_func = stellar_xdr::curr::ScSpecFunctionV0 {
+                doc: func
+                    .doc
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("doc error"))?,
+                name: func
+                    .name
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("name error"))?,
+                inputs: inputs?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many inputs"))?,
+                outputs: outputs?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Too many outputs"))?,
+            };
+            spec.functions.insert(func.name.clone(), xdr_func);
+        }
+
+        Ok(spec)
+    }
+}
+
+/// A deterministic, reviewable snapshot of a contract's exported interface.
+///
+/// Build-specific provenance is intentionally omitted: changing a source path
+/// or tool version should not change the lockfile diff. The interface hash is
+/// retained as a compact integrity check for the structured payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceLockfile {
+    pub lockfile_schema_version: u32,
+    pub interface_hash: String,
+    pub functions: Vec<FunctionJson>,
+    pub structs: Vec<StructJson>,
+    pub enums: Vec<EnumJson>,
+    pub unions: Vec<UnionJson>,
+    pub error_enums: Vec<ErrorEnumJson>,
+}
+
+impl InterfaceLockfile {
+    /// Create a lockfile from an extracted interface, omitting build provenance.
+    pub fn from_extracted(extracted: &ExtractedSpec) -> Self {
+        Self {
+            lockfile_schema_version: INTERFACE_LOCKFILE_SCHEMA_VERSION,
+            interface_hash: extracted.interface_hash.clone(),
+            functions: extracted.functions.clone(),
+            structs: extracted.structs.clone(),
+            enums: extracted.enums.clone(),
+            unions: extracted.unions.clone(),
+            error_enums: extracted.error_enums.clone(),
+        }
+    }
+
+    /// Decode the lockfile's structured interface into the diff engine model.
+    pub fn to_contract_spec(&self) -> Result<ContractSpec, String> {
+        if self.lockfile_schema_version != INTERFACE_LOCKFILE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported interface lockfile schema version {}; expected {}",
+                self.lockfile_schema_version, INTERFACE_LOCKFILE_SCHEMA_VERSION
+            ));
+        }
+
+        let mut spec = ContractSpec::default();
+        for function in &self.functions {
+            let name = function.name.clone();
+            if spec.functions.contains_key(&name) {
+                return Err(format!("duplicate function '{name}' in interface lockfile"));
+            }
+            let inputs: Vec<ScSpecFunctionInputV0> = function
+                .inputs
+                .iter()
+                .map(|input| {
+                    Ok(ScSpecFunctionInputV0 {
+                        doc: string_m(&input.doc, "function input documentation")?,
+                        name: string_m(&input.name, "function input name")?,
+                        type_: input.type_.to_xdr()?,
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            let outputs: Vec<ScSpecTypeDef> = function
+                .outputs
+                .iter()
+                .map(SpecType::to_xdr)
+                .collect::<Result<_, String>>()?;
+            spec.functions.insert(
+                name,
+                ScSpecFunctionV0 {
+                    doc: string_m(&function.doc, "function documentation")?,
+                    name: stellar_xdr::curr::ScSymbol(string_m(&function.name, "function name")?),
+                    inputs: vec_m(inputs, "function inputs")?,
+                    outputs: vec_m(outputs, "function outputs")?,
+                },
+            );
+        }
+
+        for structure in &self.structs {
+            let name = structure.name.clone();
+            if spec.structs.contains_key(&name) {
+                return Err(format!("duplicate struct '{name}' in interface lockfile"));
+            }
+            let fields: Vec<ScSpecUdtStructFieldV0> = structure
+                .fields
+                .iter()
+                .map(|field| {
+                    Ok(ScSpecUdtStructFieldV0 {
+                        doc: string_m(&field.doc, "struct field documentation")?,
+                        name: string_m(&field.name, "struct field name")?,
+                        type_: field.type_.to_xdr()?,
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            spec.structs.insert(
+                name,
+                ScSpecUdtStructV0 {
+                    doc: string_m(&structure.doc, "struct documentation")?,
+                    lib: string_m(&structure.lib, "struct library")?,
+                    name: string_m(&structure.name, "struct name")?,
+                    fields: vec_m(fields, "struct fields")?,
+                },
+            );
+        }
+
+        for enumeration in &self.enums {
+            let name = enumeration.name.clone();
+            if spec.enums.contains_key(&name) {
+                return Err(format!("duplicate enum '{name}' in interface lockfile"));
+            }
+            let cases = enumeration
+                .cases
+                .iter()
+                .map(|case| {
+                    Ok(ScSpecUdtEnumCaseV0 {
+                        doc: string_m(&case.doc, "enum case documentation")?,
+                        name: string_m(&case.name, "enum case name")?,
+                        value: case.value,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            spec.enums.insert(
+                name,
+                ScSpecUdtEnumV0 {
+                    doc: string_m(&enumeration.doc, "enum documentation")?,
+                    lib: string_m(&enumeration.lib, "enum library")?,
+                    name: string_m(&enumeration.name, "enum name")?,
+                    cases: vec_m(cases, "enum cases")?,
+                },
+            );
+        }
+
+        for union in &self.unions {
+            let name = union.name.clone();
+            if spec.unions.contains_key(&name) {
+                return Err(format!("duplicate union '{name}' in interface lockfile"));
+            }
+            let cases = union
+                .cases
+                .iter()
+                .map(UnionCaseJson::to_xdr)
+                .collect::<Result<Vec<_>, String>>()?;
+            spec.unions.insert(
+                name,
+                ScSpecUdtUnionV0 {
+                    doc: string_m(&union.doc, "union documentation")?,
+                    lib: string_m(&union.lib, "union library")?,
+                    name: string_m(&union.name, "union name")?,
+                    cases: vec_m(cases, "union cases")?,
+                },
+            );
+        }
+
+        for enumeration in &self.error_enums {
+            let name = enumeration.name.clone();
+            if spec.error_enums.contains_key(&name) {
+                return Err(format!(
+                    "duplicate error enum '{name}' in interface lockfile"
+                ));
+            }
+            let cases = enumeration
+                .cases
+                .iter()
+                .map(|case| {
+                    Ok(ScSpecUdtErrorEnumCaseV0 {
+                        doc: string_m(&case.doc, "error enum case documentation")?,
+                        name: string_m(&case.name, "error enum case name")?,
+                        value: case.value,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            spec.error_enums.insert(
+                name,
+                ScSpecUdtErrorEnumV0 {
+                    doc: string_m(&enumeration.doc, "error enum documentation")?,
+                    lib: string_m(&enumeration.lib, "error enum library")?,
+                    name: string_m(&enumeration.name, "error enum name")?,
+                    cases: vec_m(cases, "error enum cases")?,
+                },
+            );
+        }
+
+        let actual_hash = spec.interface_hash().to_hex();
+        if actual_hash != self.interface_hash {
+            return Err(format!(
+                "interface lockfile hash mismatch: declared {}, calculated {}",
+                self.interface_hash, actual_hash
+            ));
+        }
+        Ok(spec)
+    }
+
+    /// Parse and validate a JSON lockfile.
+    pub fn from_json_str(contents: &str) -> Result<Self, String> {
+        let lockfile: Self = serde_json::from_str(contents)
+            .map_err(|error| format!("invalid interface lockfile JSON: {error}"))?;
+        lockfile.to_contract_spec()?;
+        Ok(lockfile)
+    }
+}
+
+fn string_m<const N: u32>(value: &str, label: &str) -> Result<StringM<N>, String> {
+    value
+        .try_into()
+        .map_err(|_| format!("{label} exceeds the Soroban string limit"))
+}
+
+fn vec_m<T, const N: u32>(values: Vec<T>, label: &str) -> Result<VecM<T, N>, String> {
+    values
+        .try_into()
+        .map_err(|_| format!("{label} exceeds the Soroban collection limit"))
 }
 
 /// Decoded `contractenvmetav0`.
@@ -382,6 +843,84 @@ pub enum SpecType {
     },
 }
 
+impl SpecType {
+    fn to_xdr(&self) -> Result<ScSpecTypeDef, String> {
+        Ok(match self {
+            Self::Val => ScSpecTypeDef::Val,
+            Self::Bool => ScSpecTypeDef::Bool,
+            Self::Void => ScSpecTypeDef::Void,
+            Self::Error => ScSpecTypeDef::Error,
+            Self::U32 => ScSpecTypeDef::U32,
+            Self::I32 => ScSpecTypeDef::I32,
+            Self::U64 => ScSpecTypeDef::U64,
+            Self::I64 => ScSpecTypeDef::I64,
+            Self::Timepoint => ScSpecTypeDef::Timepoint,
+            Self::Duration => ScSpecTypeDef::Duration,
+            Self::U128 => ScSpecTypeDef::U128,
+            Self::I128 => ScSpecTypeDef::I128,
+            Self::U256 => ScSpecTypeDef::U256,
+            Self::I256 => ScSpecTypeDef::I256,
+            Self::Bytes => ScSpecTypeDef::Bytes,
+            Self::String => ScSpecTypeDef::String,
+            Self::Symbol => ScSpecTypeDef::Symbol,
+            Self::Address => ScSpecTypeDef::Address,
+            Self::Option { value } => ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+                value_type: Box::new(value.to_xdr()?),
+            })),
+            Self::Result { ok, error } => ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+                ok_type: Box::new(ok.to_xdr()?),
+                error_type: Box::new(error.to_xdr()?),
+            })),
+            Self::Vec { element } => ScSpecTypeDef::Vec(Box::new(ScSpecTypeVec {
+                element_type: Box::new(element.to_xdr()?),
+            })),
+            Self::Map { key, value } => ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
+                key_type: Box::new(key.to_xdr()?),
+                value_type: Box::new(value.to_xdr()?),
+            })),
+            Self::Tuple { values } => ScSpecTypeDef::Tuple(Box::new(ScSpecTypeTuple {
+                value_types: vec_m(
+                    values
+                        .iter()
+                        .map(SpecType::to_xdr)
+                        .collect::<Result<Vec<_>, String>>()?,
+                    "tuple values",
+                )?,
+            })),
+            Self::BytesN { n } => {
+                ScSpecTypeDef::BytesN(stellar_xdr::curr::ScSpecTypeBytesN { n: *n })
+            }
+            Self::Udt { name } => ScSpecTypeDef::Udt(ScSpecTypeUdt {
+                name: string_m(name, "user-defined type name")?,
+            }),
+        })
+    }
+}
+
+impl UnionCaseJson {
+    fn to_xdr(&self) -> Result<ScSpecUdtUnionCaseV0, String> {
+        Ok(match self {
+            Self::Void { name, doc } => ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                name: string_m(name, "union case name")?,
+                doc: string_m(doc, "union case documentation")?,
+            }),
+            Self::Tuple { name, doc, types } => {
+                ScSpecUdtUnionCaseV0::TupleV0(ScSpecUdtUnionCaseTupleV0 {
+                    name: string_m(name, "union case name")?,
+                    doc: string_m(doc, "union case documentation")?,
+                    type_: vec_m(
+                        types
+                            .iter()
+                            .map(SpecType::to_xdr)
+                            .collect::<Result<Vec<_>, String>>()?,
+                        "union case types",
+                    )?,
+                })
+            }
+        })
+    }
+}
+
 impl From<&ScSpecTypeDef> for SpecType {
     fn from(type_def: &ScSpecTypeDef) -> Self {
         match type_def {
@@ -424,6 +963,74 @@ impl From<&ScSpecTypeDef> for SpecType {
             ScSpecTypeDef::Udt(inner) => SpecType::Udt {
                 name: inner.name.to_string(),
             },
+        }
+    }
+}
+
+impl TryFrom<&SpecType> for ScSpecTypeDef {
+    type Error = anyhow::Error;
+
+    fn try_from(type_def: &SpecType) -> Result<Self, anyhow::Error> {
+        match type_def {
+            SpecType::Val => Ok(ScSpecTypeDef::Val),
+            SpecType::Bool => Ok(ScSpecTypeDef::Bool),
+            SpecType::Void => Ok(ScSpecTypeDef::Void),
+            SpecType::Error => Ok(ScSpecTypeDef::Error),
+            SpecType::U32 => Ok(ScSpecTypeDef::U32),
+            SpecType::I32 => Ok(ScSpecTypeDef::I32),
+            SpecType::U64 => Ok(ScSpecTypeDef::U64),
+            SpecType::I64 => Ok(ScSpecTypeDef::I64),
+            SpecType::Timepoint => Ok(ScSpecTypeDef::Timepoint),
+            SpecType::Duration => Ok(ScSpecTypeDef::Duration),
+            SpecType::U128 => Ok(ScSpecTypeDef::U128),
+            SpecType::I128 => Ok(ScSpecTypeDef::I128),
+            SpecType::U256 => Ok(ScSpecTypeDef::U256),
+            SpecType::I256 => Ok(ScSpecTypeDef::I256),
+            SpecType::Bytes => Ok(ScSpecTypeDef::Bytes),
+            SpecType::String => Ok(ScSpecTypeDef::String),
+            SpecType::Symbol => Ok(ScSpecTypeDef::Symbol),
+            SpecType::Address => Ok(ScSpecTypeDef::Address),
+            SpecType::Option { value } => Ok(ScSpecTypeDef::Option(Box::new(
+                stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: Box::new(ScSpecTypeDef::try_from(value.as_ref())?),
+                },
+            ))),
+            SpecType::Result { ok, error } => Ok(ScSpecTypeDef::Result(Box::new(
+                stellar_xdr::curr::ScSpecTypeResult {
+                    ok_type: Box::new(ScSpecTypeDef::try_from(ok.as_ref())?),
+                    error_type: Box::new(ScSpecTypeDef::try_from(error.as_ref())?),
+                },
+            ))),
+            SpecType::Vec { element } => Ok(ScSpecTypeDef::Vec(Box::new(
+                stellar_xdr::curr::ScSpecTypeVec {
+                    element_type: Box::new(ScSpecTypeDef::try_from(element.as_ref())?),
+                },
+            ))),
+            SpecType::Map { key, value } => Ok(ScSpecTypeDef::Map(Box::new(
+                stellar_xdr::curr::ScSpecTypeMap {
+                    key_type: Box::new(ScSpecTypeDef::try_from(key.as_ref())?),
+                    value_type: Box::new(ScSpecTypeDef::try_from(value.as_ref())?),
+                },
+            ))),
+            SpecType::Tuple { values } => {
+                let parsed_types: Result<Vec<_>, _> =
+                    values.iter().map(ScSpecTypeDef::try_from).collect();
+                Ok(ScSpecTypeDef::Tuple(Box::new(
+                    stellar_xdr::curr::ScSpecTypeTuple {
+                        value_types: parsed_types?
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("Tuple too large"))?,
+                    },
+                )))
+            }
+            SpecType::BytesN { n } => {
+                Ok(ScSpecTypeDef::BytesN(stellar_xdr::curr::ScSpecTypeBytesN {
+                    n: *n,
+                }))
+            }
+            SpecType::Udt { name } => Ok(ScSpecTypeDef::Udt(stellar_xdr::curr::ScSpecTypeUdt {
+                name: name.as_str().try_into()?,
+            })),
         }
     }
 }
@@ -522,6 +1129,60 @@ mod tests {
         assert_eq!(serde_json::to_string(&restored).unwrap(), json);
         assert_eq!(restored.structs[0].name, "Data");
         assert_eq!(restored.structs[0].doc, "A record.");
+    }
+
+    #[test]
+    fn lockfile_round_trips_into_contract_spec() {
+        let entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+            doc: "Call it.".try_into().unwrap(),
+            name: "call".try_into().unwrap(),
+            inputs: vec![ScSpecFunctionInputV0 {
+                doc: "Value.".try_into().unwrap(),
+                name: "value".try_into().unwrap(),
+                type_: ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+                    value_type: Box::new(ScSpecTypeDef::U32),
+                })),
+            }]
+            .try_into()
+            .unwrap(),
+            outputs: vec![ScSpecTypeDef::Bool].try_into().unwrap(),
+        });
+        let original = ContractSpec::from_entries(&[entry]);
+        let extracted = ExtractedSpec::new("test", &metadata(), &original);
+        let lockfile = InterfaceLockfile::from_extracted(&extracted);
+
+        let restored = lockfile.to_contract_spec().unwrap();
+        assert_eq!(restored.interface_hash(), original.interface_hash());
+        assert_eq!(restored.functions().len(), 1);
+        assert_eq!(restored.functions()["call"].inputs.len(), 1);
+    }
+
+    #[test]
+    fn lockfile_rejects_a_mismatched_hash() {
+        let spec = ContractSpec::from_entries(&[]);
+        let extracted = ExtractedSpec::new("test", &metadata(), &spec);
+        let mut lockfile = InterfaceLockfile::from_extracted(&extracted);
+        lockfile.interface_hash = "0".repeat(64);
+
+        let error = lockfile.to_contract_spec().unwrap_err();
+        assert!(error.contains("hash mismatch"));
+    }
+
+    #[test]
+    fn lockfile_rejects_an_unsupported_schema_version() {
+        let spec = ContractSpec::from_entries(&[]);
+        let extracted = ExtractedSpec::new("test", &metadata(), &spec);
+        let mut lockfile = InterfaceLockfile::from_extracted(&extracted);
+        lockfile.lockfile_schema_version += 1;
+
+        let error = lockfile.to_contract_spec().unwrap_err();
+        assert!(error.contains("unsupported interface lockfile schema version"));
+    }
+
+    #[test]
+    fn lockfile_rejects_malformed_json() {
+        let error = InterfaceLockfile::from_json_str("{not json").unwrap_err();
+        assert!(error.contains("invalid interface lockfile JSON"));
     }
 
     #[test]

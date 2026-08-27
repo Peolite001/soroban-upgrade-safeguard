@@ -4,6 +4,7 @@
 //! how a developer inspecting a build or a pipeline archiving one would use it.
 
 use serde_json::Value;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -16,6 +17,13 @@ fn wasm(name: &str) -> PathBuf {
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+}
+
+fn temp_lockfile(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "soroban-upgrade-safeguard-{name}-{}.json",
+        std::process::id()
+    ))
 }
 
 /// Run `extract` on a fixture, returning (stdout, exit code).
@@ -147,6 +155,148 @@ fn different_interfaces_hash_differently() {
         v1, v2,
         "the fixtures differ in their interface, so the hashes must differ"
     );
+}
+
+#[test]
+fn lockfile_generates_deterministic_reviewable_json() {
+    let path = temp_lockfile("generate");
+    let _ = fs::remove_file(&path);
+
+    let first = bin()
+        .arg("lockfile")
+        .arg(wasm("v1.wasm"))
+        .arg("--output")
+        .arg(&path)
+        .output()
+        .expect("failed to generate lockfile");
+    assert_eq!(first.status.code(), Some(0));
+    let first_contents = fs::read_to_string(&path).expect("lockfile should be written");
+    let json: Value = serde_json::from_str(&first_contents).expect("lockfile should be JSON");
+    assert_eq!(json["lockfile_schema_version"], 1);
+    assert_eq!(json["interface_hash"].as_str().unwrap().len(), 64);
+
+    let second = bin()
+        .arg("lockfile")
+        .arg(wasm("v1.wasm"))
+        .arg("--output")
+        .arg(&path)
+        .arg("--force")
+        .output()
+        .expect("failed to update lockfile");
+    assert_eq!(second.status.code(), Some(0));
+    assert_eq!(first_contents, fs::read_to_string(&path).unwrap());
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn lockfile_refuses_overwrite_without_force() {
+    let path = temp_lockfile("overwrite");
+    let _ = fs::remove_file(&path);
+    let generated = bin()
+        .arg("lockfile")
+        .arg(wasm("v1.wasm"))
+        .arg("--output")
+        .arg(&path)
+        .output()
+        .expect("failed to generate lockfile");
+    assert_eq!(generated.status.code(), Some(0));
+
+    let rejected = bin()
+        .arg("lockfile")
+        .arg(wasm("v2.wasm"))
+        .arg("--output")
+        .arg(&path)
+        .output()
+        .expect("failed to run overwrite check");
+    assert_ne!(rejected.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("Use --force"));
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn lockfile_check_passes_for_matching_build_and_fails_for_drift() {
+    let path = temp_lockfile("check");
+    let _ = fs::remove_file(&path);
+    let generated = bin()
+        .arg("lockfile")
+        .arg(wasm("v1.wasm"))
+        .arg("--output")
+        .arg(&path)
+        .output()
+        .expect("failed to generate lockfile");
+    assert_eq!(generated.status.code(), Some(0));
+
+    let matching = bin()
+        .arg(wasm("v1.wasm"))
+        .arg("--interface-lockfile")
+        .arg(&path)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("failed to check matching build");
+    assert_eq!(matching.status.code(), Some(0));
+    let matching_json: Value =
+        serde_json::from_slice(&matching.stdout).expect("matching lockfile check should emit JSON");
+    assert_eq!(matching_json["is_safe"], Value::Bool(true));
+
+    let drifting = bin()
+        .arg(wasm("v2.wasm"))
+        .arg("--interface-lockfile")
+        .arg(&path)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("failed to check drifting build");
+    assert_eq!(drifting.status.code(), Some(1));
+    let drifting_json: Value =
+        serde_json::from_slice(&drifting.stdout).expect("drifting lockfile check should emit JSON");
+    assert_eq!(drifting_json["is_safe"], Value::Bool(false));
+    assert!(drifting_json["counts"]["critical"].as_u64().unwrap() >= 1);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn malformed_lockfile_fails_with_a_clear_error() {
+    let path = temp_lockfile("malformed");
+    fs::write(&path, "{not json").unwrap();
+
+    let output = bin()
+        .arg(wasm("v1.wasm"))
+        .arg("--interface-lockfile")
+        .arg(&path)
+        .output()
+        .expect("failed to run malformed lockfile check");
+    assert_ne!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid interface lockfile"));
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn lockfile_check_renders_normal_markdown_findings() {
+    let path = temp_lockfile("markdown");
+    let _ = fs::remove_file(&path);
+    let generated = bin()
+        .arg("lockfile")
+        .arg(wasm("v1.wasm"))
+        .arg("--output")
+        .arg(&path)
+        .output()
+        .expect("failed to generate lockfile");
+    assert_eq!(generated.status.code(), Some(0));
+
+    let output = bin()
+        .arg(wasm("v2.wasm"))
+        .arg("--interface-lockfile")
+        .arg(&path)
+        .arg("--format")
+        .arg("markdown")
+        .output()
+        .expect("failed to render markdown lockfile check");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout.contains("# Soroban Upgrade Safety Report"));
+    assert!(stdout.contains("### Function Signature Changed"));
+    fs::remove_file(path).unwrap();
 }
 
 #[test]

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::capability;
 use crate::category::FindingCategory;
 use crate::mapper::LayoutMapper;
@@ -254,22 +256,24 @@ pub fn compare_call_abi(
     crate::call_abi::compare(old, new)
 }
 
-/// Recursively check if type_def references target_name directly or transitively in spec.
-fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractSpec) -> bool {
+fn references_type_inner(
+    type_def: &ScSpecTypeDef,
+    target_name: &str,
+    spec: &ContractSpec,
+    visited: &mut HashSet<String>,
+) -> bool {
     match type_def {
         ScSpecTypeDef::Udt(udt) => {
             let udt_name = udt.name.to_string();
             if udt_name == target_name {
                 return true;
             }
+            if !visited.insert(udt_name.clone()) {
+                return false;
+            }
             if let Some(st) = spec.structs.get(&udt_name) {
                 for field in st.fields.iter() {
-                    if let ScSpecTypeDef::Udt(ref f_udt) = field.type_ {
-                        if f_udt.name.to_string() == udt_name {
-                            continue;
-                        }
-                    }
-                    if references_type(&field.type_, target_name, spec) {
+                    if references_type_inner(&field.type_, target_name, spec, visited) {
                         return true;
                     }
                 }
@@ -278,12 +282,7 @@ fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractS
                 for case in un.cases.iter() {
                     if let stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) = case {
                         for ty in t.type_.iter() {
-                            if let ScSpecTypeDef::Udt(ref f_udt) = ty {
-                                if f_udt.name.to_string() == udt_name {
-                                    continue;
-                                }
-                            }
-                            if references_type(ty, target_name, spec) {
+                            if references_type_inner(ty, target_name, spec, visited) {
                                 return true;
                             }
                         }
@@ -292,22 +291,27 @@ fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractS
             }
             false
         }
-        ScSpecTypeDef::Option(opt) => references_type(&opt.value_type, target_name, spec),
+        ScSpecTypeDef::Option(opt) => references_type_inner(&opt.value_type, target_name, spec, visited),
         ScSpecTypeDef::Result(res) => {
-            references_type(&res.ok_type, target_name, spec)
-                || references_type(&res.error_type, target_name, spec)
+            references_type_inner(&res.ok_type, target_name, spec, visited)
+                || references_type_inner(&res.error_type, target_name, spec, visited)
         }
-        ScSpecTypeDef::Vec(v) => references_type(&v.element_type, target_name, spec),
+        ScSpecTypeDef::Vec(v) => references_type_inner(&v.element_type, target_name, spec, visited),
         ScSpecTypeDef::Map(m) => {
-            references_type(&m.key_type, target_name, spec)
-                || references_type(&m.value_type, target_name, spec)
+            references_type_inner(&m.key_type, target_name, spec, visited)
+                || references_type_inner(&m.value_type, target_name, spec, visited)
         }
         ScSpecTypeDef::Tuple(t) => t
             .value_types
             .iter()
-            .any(|ty| references_type(ty, target_name, spec)),
+            .any(|ty| references_type_inner(ty, target_name, spec, visited)),
         _ => false,
     }
+}
+
+fn references_type(type_def: &ScSpecTypeDef, target_name: &str, spec: &ContractSpec) -> bool {
+    let mut visited = HashSet::new();
+    references_type_inner(type_def, target_name, spec, &mut visited)
 }
 
 /// Helper to check if type_name is used in any function signatures.
@@ -498,67 +502,97 @@ pub fn compare_env_metadata(
         (None, None) => {}
         (Some(old_meta), Some(new_meta)) if old_meta == new_meta => {}
         (old_meta, new_meta) => {
-            let severity = env_metadata_change_severity(old_meta, new_meta);
+            let (severity, target, message) = analyze_env_metadata_change(old_meta, new_meta);
             report.findings.push(Finding {
                 axes: Vec::new(),
                 severity,
                 category: FindingCategory::Environment.as_str().to_string(),
-                message: format_env_metadata_change(old_meta, new_meta),
+                message,
                 type_name: None,
-                target: None,
+                target: Some(target),
                 root_target: None,
             });
         }
     }
 }
 
-fn env_metadata_change_severity(
+fn analyze_env_metadata_change(
     old: Option<&ContractEnvMeta>,
     new: Option<&ContractEnvMeta>,
-) -> Severity {
-    let old_protocol = old.and_then(ContractEnvMeta::protocol_version);
-    let new_protocol = new.and_then(ContractEnvMeta::protocol_version);
-
-    if old_protocol.is_some() && new_protocol.is_some() && old_protocol != new_protocol {
-        Severity::Warning
-    } else {
-        Severity::Info
-    }
-}
-
-fn format_env_metadata_change(
-    old: Option<&ContractEnvMeta>,
-    new: Option<&ContractEnvMeta>,
-) -> String {
+) -> (Severity, String, String) {
     match (old, new) {
-        (None, Some(new_meta)) => format!(
-            "Contract environment metadata appeared ({}).",
-            new_meta.summary()
+        (None, Some(new_meta)) => (
+            Severity::Info,
+            "env_metadata".to_string(),
+            format!(
+                "Contract environment metadata appeared ({}).",
+                new_meta.summary()
+            ),
         ),
-        (Some(old_meta), None) => format!(
-            "Contract environment metadata was removed (was: {}).",
-            old_meta.summary()
+        (Some(old_meta), None) => (
+            Severity::Warning,
+            "env_metadata".to_string(),
+            format!(
+                "Contract environment metadata was removed (was: {}).",
+                old_meta.summary()
+            ),
         ),
         (Some(old_meta), Some(new_meta)) => {
-            if let (Some(old_proto), Some(new_proto)) =
-                (old_meta.protocol_version(), new_meta.protocol_version())
-            {
-                if old_proto != new_proto {
-                    return format!(
-                        "Soroban protocol interface version changed from {} to {} \
-                         (pre-release {} → {}).",
-                        old_proto,
-                        new_proto,
-                        old_meta.pre_release_version().unwrap_or(0),
-                        new_meta.pre_release_version().unwrap_or(0),
+            let old_proto = old_meta.protocol_version();
+            let new_proto = new_meta.protocol_version();
+            let old_pre = old_meta.pre_release_version().unwrap_or(0);
+            let new_pre = new_meta.pre_release_version().unwrap_or(0);
+
+            if let (Some(old_p), Some(new_p)) = (old_proto, new_proto) {
+                if old_p > new_p {
+                    return (
+                        Severity::Critical,
+                        "protocol_version".to_string(),
+                        format!(
+                            "Soroban protocol version downgraded from {} to {} (pre-release {} → {}).",
+                            old_p, new_p, old_pre, new_pre
+                        ),
                     );
+                } else if old_p < new_p {
+                    return (
+                        Severity::Warning,
+                        "protocol_version".to_string(),
+                        format!(
+                            "Soroban protocol version upgraded from {} to {} (pre-release {} → {}).",
+                            old_p, new_p, old_pre, new_pre
+                        ),
+                    );
+                } else if old_pre != new_pre {
+                    if old_pre > new_pre {
+                        return (
+                            Severity::Warning,
+                            "pre_release_version".to_string(),
+                            format!(
+                                "Soroban protocol pre-release version downgraded from {} to {} (protocol version {} unchanged).",
+                                old_pre, new_pre, old_p
+                            ),
+                        );
+                    } else {
+                        return (
+                            Severity::Info,
+                            "pre_release_version".to_string(),
+                            format!(
+                                "Soroban protocol pre-release version upgraded from {} to {} (protocol version {} unchanged).",
+                                old_pre, new_pre, old_p
+                            ),
+                        );
+                    }
                 }
             }
 
-            format!(
-                "Contract environment metadata changed from {} to {}.",
-                old_meta.summary(),
-                new_meta.summary()
+            (
+                Severity::Info,
+                "env_metadata".to_string(),
+                format!(
+                    "Contract environment metadata changed from {} to {}.",
+                    old_meta.summary(),
+                    new_meta.summary()
+                ),
             )
         }
         (None, None) => unreachable!("compare_env_metadata filters identical/absent pairs"),
@@ -2397,6 +2431,38 @@ mod tests {
     }
 
     #[test]
+    fn empty_env_metadata_matching_on_both_sides_produces_no_finding() {
+        // A `contractenvmetav0` section that decoded successfully but carries
+        // zero entries is a valid legacy artifact, not malformed metadata.
+        // Two matching empty sections must not be flagged as changed.
+        let empty = ContractEnvMeta { entries: vec![] };
+        let mut report = DiffReport::default();
+        compare_env_metadata(Some(&empty), Some(&empty), &mut report);
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn env_metadata_empty_section_appearing_is_reported_distinctly_from_missing() {
+        // A present-but-empty section is a different fact from "no section
+        // at all": going from None to Some(empty) must still surface an
+        // appearance finding, and its summary must say "empty" rather than
+        // describing a protocol version that was never declared.
+        let empty = ContractEnvMeta { entries: vec![] };
+        let mut report = DiffReport::default();
+        compare_env_metadata(None, Some(&empty), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let finding = &report.findings[0];
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.category, FindingCategory::Environment.as_str());
+        assert!(
+            finding.message.contains("empty"),
+            "message should describe the section as empty, got: {}",
+            finding.message
+        );
+    }
+
+    #[test]
     fn env_metadata_protocol_change_is_warning() {
         let old = env_meta(21, 0);
         let new = env_meta(22, 0);
@@ -2407,9 +2473,7 @@ mod tests {
         let finding = &report.findings[0];
         assert_eq!(finding.severity, Severity::Warning);
         assert_eq!(finding.category, FindingCategory::Environment.as_str());
-        assert!(finding
-            .message
-            .contains("protocol interface version changed"));
+        assert!(finding.message.contains("upgraded from 21 to 22"));
     }
 
     #[test]
@@ -3436,5 +3500,106 @@ mod tests {
             "Message was: {}",
             fc.message
         );
+    }
+
+    #[test]
+    fn protocol_version_upgrade_emits_warning_with_target() {
+        let old_meta = make_env_meta(20, 0);
+        let new_meta = make_env_meta(21, 0);
+        let mut report = DiffReport::default();
+
+        compare_env_metadata(Some(&old_meta), Some(&new_meta), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.category, "Environment");
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.target.as_deref(), Some("protocol_version"));
+        assert!(f.message.contains("upgraded from 20 to 21"));
+    }
+
+    #[test]
+    fn protocol_version_downgrade_emits_critical_with_target() {
+        let old_meta = make_env_meta(21, 0);
+        let new_meta = make_env_meta(20, 0);
+        let mut report = DiffReport::default();
+
+        compare_env_metadata(Some(&old_meta), Some(&new_meta), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.category, "Environment");
+        assert_eq!(f.severity, Severity::Critical);
+        assert_eq!(f.target.as_deref(), Some("protocol_version"));
+        assert!(f.message.contains("downgraded from 21 to 20"));
+    }
+
+    #[test]
+    fn prerelease_downgrade_emits_warning_with_target() {
+        let old_meta = make_env_meta(21, 2);
+        let new_meta = make_env_meta(21, 1);
+        let mut report = DiffReport::default();
+
+        compare_env_metadata(Some(&old_meta), Some(&new_meta), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.category, "Environment");
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.target.as_deref(), Some("pre_release_version"));
+        assert!(f
+            .message
+            .contains("pre-release version downgraded from 2 to 1"));
+    }
+
+    #[test]
+    fn prerelease_upgrade_emits_info_with_target() {
+        let old_meta = make_env_meta(21, 1);
+        let new_meta = make_env_meta(21, 2);
+        let mut report = DiffReport::default();
+
+        compare_env_metadata(Some(&old_meta), Some(&new_meta), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.category, "Environment");
+        assert_eq!(f.severity, Severity::Info);
+        assert_eq!(f.target.as_deref(), Some("pre_release_version"));
+        assert!(f
+            .message
+            .contains("pre-release version upgraded from 1 to 2"));
+    }
+
+    #[test]
+    fn env_metadata_appearance_and_removal() {
+        let meta = make_env_meta(20, 0);
+
+        let mut report_app = DiffReport::default();
+        compare_env_metadata(None, Some(&meta), &mut report_app);
+        assert_eq!(report_app.findings.len(), 1);
+        assert_eq!(report_app.findings[0].severity, Severity::Info);
+        assert_eq!(
+            report_app.findings[0].target.as_deref(),
+            Some("env_metadata")
+        );
+        assert!(report_app.findings[0].message.contains("appeared"));
+
+        let mut report_rem = DiffReport::default();
+        compare_env_metadata(Some(&meta), None, &mut report_rem);
+        assert_eq!(report_rem.findings.len(), 1);
+        assert_eq!(report_rem.findings[0].severity, Severity::Warning);
+        assert_eq!(
+            report_rem.findings[0].target.as_deref(),
+            Some("env_metadata")
+        );
+        assert!(report_rem.findings[0].message.contains("removed"));
+    }
+
+    fn make_env_meta(protocol: u32, pre_release: u32) -> ContractEnvMeta {
+        use stellar_xdr::curr::ScEnvMetaEntry;
+        let version = ((protocol as u64) << 32) | (pre_release as u64);
+        ContractEnvMeta {
+            entries: vec![ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(version)],
+        }
     }
 }

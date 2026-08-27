@@ -46,13 +46,16 @@
 //! **Valued settings** — `config`, `policy.*`, `limits.*` — last writer wins:
 //!
 //! ```text
-//! built-in default  <  CLI flag  <  included defaults  <  root [defaults]  <  pair field
+//! built-in default  <  SOROBAN_SAFEGUARD_CONFIG  <  CLI flag  <  included defaults  <  root [defaults]  <  pair field
 //! ```
 //!
-//! The CLI sits *below* the manifest deliberately: `--config` is the run-level
-//! fallback, and a manifest naming a config is the more specific statement.
-//! `--no-config` is the one exception — an explicit escape hatch that wins over
-//! everything.
+//! `config` is the one valued setting with an environment-variable layer:
+//! `SOROBAN_SAFEGUARD_CONFIG` lets a CI system set a config path once instead
+//! of repeating `--config` on every invocation, but sits below `--config`
+//! itself so an explicit flag always wins. The CLI (env var included) sits
+//! *below* the manifest deliberately: it is the run-level fallback, and a
+//! manifest naming a config is the more specific statement. `--no-config` is
+//! the one exception — an explicit escape hatch that wins over everything.
 //!
 //! **Escalation booleans** — `strict`, `explain`, `ascii`, `no_timestamp` —
 //! OR-chain: any layer may enable, none may disable. This mirrors
@@ -91,6 +94,20 @@ use crate::suppression::{PolicyConfig, SuppressionConfig};
 /// for any layout a human would write by hand (org → team → service → local).
 pub const MAX_INCLUDE_DEPTH: usize = 8;
 
+/// Default ceiling on the total number of pairs a composed manifest may
+/// contain, overridable with `--max-pairs`.
+///
+/// A malformed or accidentally generated manifest (a bad template loop, a
+/// script gone wrong) can list thousands of pairs; without a cap the tool
+/// would start loading and comparing WASM for every one of them before
+/// anyone notices. 500 comfortably covers any manifest a human would compose
+/// by hand, including a large monorepo, while still catching a runaway file.
+///
+/// Deliberately **not** overridable from within a manifest itself (no
+/// `[defaults].max_pairs`): the whole point is a ceiling the manifest cannot
+/// raise on its own, so the CLI is the only place it can be set.
+pub const DEFAULT_MAX_PAIRS: usize = 500;
+
 // ── Raw (on-disk) schema ─────────────────────────────────────────────────────
 
 /// One manifest file exactly as written on disk, before composition.
@@ -99,9 +116,26 @@ pub const MAX_INCLUDE_DEPTH: usize = 8;
 /// hard error rather than a silently ignored setting — composition multiplies
 /// files, and a silently dropped `strict = true` in a fragment is precisely the
 /// failure mode this feature must not introduce.
-#[derive(Debug, Clone, Default, Deserialize)]
+fn default_manifest_version() -> u32 {
+    1
+}
+
+/// One manifest file exactly as written on disk, before composition.
+///
+/// Every struct in this schema uses `deny_unknown_fields` so a typo'd key is a
+/// hard error rather than a silently ignored setting — composition multiplies
+/// files, and a silently dropped `strict = true` in a fragment is precisely the
+/// failure mode this feature must not introduce.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawManifest {
+    /// The version of the manifest format.
+    ///
+    /// Defaults to `1` (the initial version) when omitted, preserving legacy
+    /// behavior for manifests written before format versioning was introduced.
+    /// Only version 1 is currently supported.
+    #[serde(default = "default_manifest_version")]
+    pub version: u32,
     /// Other manifest files to compose in, depth-first, in order.
     #[serde(default)]
     pub include: Vec<PathBuf>,
@@ -118,6 +152,18 @@ pub struct RawManifest {
     /// up; see `docs/batch_manifests.md`.
     #[serde(default)]
     pub dependencies: Vec<ContractDependency>,
+}
+
+impl Default for RawManifest {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            include: Vec::new(),
+            defaults: RawDefaults::default(),
+            pairs: Vec::new(),
+            dependencies: Vec::new(),
+        }
+    }
 }
 
 /// The `[defaults]` table: settings that apply to every pair.
@@ -163,6 +209,21 @@ pub struct RawPair {
     /// Report name. Defaults to the file name of `new`.
     #[serde(default)]
     pub name: Option<String>,
+    /// Stable identifier for CI annotations and reruns, independent of
+    /// `name`. Defaults to the pair's resolved `name` when omitted. Must be
+    /// non-empty and contain only ASCII letters, digits, `-`, `_`, and `.`
+    /// when given explicitly; must be unique across the whole composition.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Free-form grouping tags (service, deployment stage, ownership, ...),
+    /// for filtering and review — never consulted for identity or the safety
+    /// verdict. Each must be non-empty and contain only ASCII letters,
+    /// digits, `-`, `_`, `.`, and `:` (for `key:value` tags like
+    /// `stage:prod`); duplicates within one pair are folded down to their
+    /// first occurrence. Unlike `id`, the same label is expected to repeat
+    /// across many pairs — that repetition is the point.
+    #[serde(default)]
+    pub labels: Vec<String>,
     /// Base directory for this pair's relative `old`/`new`.
     #[serde(default)]
     pub base_dir: Option<PathBuf>,
@@ -242,6 +303,9 @@ pub enum Origin {
     BuiltIn,
     /// A command-line flag.
     Cli,
+    /// An environment variable (e.g. `SOROBAN_SAFEGUARD_CONFIG`), read
+    /// because no more specific layer set the value.
+    Env,
     /// A manifest file, by path.
     File(PathBuf),
 }
@@ -251,7 +315,10 @@ impl std::fmt::Display for Origin {
         match self {
             Origin::BuiltIn => write!(f, "built-in"),
             Origin::Cli => write!(f, "cli"),
-            Origin::File(path) => write!(f, "{}", path.display()),
+            Origin::Env => write!(f, "env"),
+            Origin::File(path) => {
+                write!(f, "{}", crate::loader::normalize_path_display(&path.display().to_string()))
+            }
         }
     }
 }
@@ -349,6 +416,12 @@ impl ResolvedSettings {
 pub struct ResolvedPair {
     /// Report identity: the explicit `name`, else the file name of `new`.
     pub name: String,
+    /// Stable identifier for CI annotations and reruns: the explicit `id`,
+    /// else this pair's resolved `name`. Unique across the whole composition.
+    pub id: String,
+    /// Free-form grouping tags, deduplicated and in declaration order. Empty
+    /// when the pair declared none. See [`RawPair::labels`].
+    pub labels: Vec<String>,
     pub old: PathBuf,
     pub new: PathBuf,
     /// Optional schema paths, resolved against the manifest that declared the pair.
@@ -381,26 +454,66 @@ pub struct ResolvedManifest {
 }
 
 /// The command-line half of the precedence chain.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CliSettings {
     /// `--config`.
     pub config: Option<PathBuf>,
-    /// The implicitly discovered `.safeguard.toml`, when one exists and no
-    /// `--config` was given.
+    /// The `SOROBAN_SAFEGUARD_CONFIG` environment variable, read only when
+    /// `--config` was not given. Sits above [`Self::default_config`] and
+    /// below `--config` and every manifest layer: CI systems can set it once
+    /// instead of repeating `--config` on every invocation, but an explicit
+    /// flag or a manifest naming its own `config` still wins.
+    pub env_config: Option<PathBuf>,
+    /// The implicitly discovered `.safeguard.toml`, when one exists and
+    /// neither `--config` nor the environment variable named one.
     ///
-    /// This sits at the [`Origin::BuiltIn`] level — below `--config` and below
-    /// every manifest layer — because it is exactly that: the compiled-in
-    /// fallback the tool has always applied when nothing named a config. Keeping
-    /// it in the chain rather than as a post-hoc `unwrap_or` means a manifest
-    /// that names its own `config` overrides it, which is what a reader of the
-    /// precedence table would expect.
+    /// This sits at the [`Origin::BuiltIn`] level — below `--config`, below
+    /// the environment variable, and below every manifest layer — because it
+    /// is exactly that: the compiled-in fallback the tool has always applied
+    /// when nothing named a config. Keeping it in the chain rather than as a
+    /// post-hoc `unwrap_or` means a manifest that names its own `config`
+    /// overrides it, which is what a reader of the precedence table would
+    /// expect.
     pub default_config: Option<PathBuf>,
+    /// A `.safeguard.toml` found by `--search-parent-config` in an ancestor
+    /// of the current directory, when nothing more specific (`--config`, the
+    /// environment variable, or [`Self::default_config`]) named one.
+    ///
+    /// Sits at the same [`Origin::BuiltIn`] level as `default_config` — it is
+    /// the same kind of thing, a compiled-in fallback, just with a wider
+    /// search radius the caller opted into. Populating this field is where
+    /// `--search-parent-config` is entirely gated: when the flag is off, the
+    /// caller never computes a value for it, and this field is always `None`.
+    pub ancestor_config: Option<PathBuf>,
     /// `--no-config`: wins over every layer and yields no suppression config.
     pub no_config: bool,
     pub strict: bool,
     pub explain: bool,
     pub ascii: bool,
     pub no_timestamp: bool,
+    /// `--max-pairs`. Not part of the manifest schema — see
+    /// [`DEFAULT_MAX_PAIRS`] for why it must stay CLI-only.
+    pub max_pairs: usize,
+}
+
+impl Default for CliSettings {
+    // Not `#[derive(Default)]`: `max_pairs` must default to
+    // `DEFAULT_MAX_PAIRS`, not `usize`'s own zero default, or every existing
+    // manifest would fail with `CliSettings::default()`.
+    fn default() -> Self {
+        Self {
+            config: None,
+            env_config: None,
+            default_config: None,
+            ancestor_config: None,
+            no_config: false,
+            strict: false,
+            explain: false,
+            ascii: false,
+            no_timestamp: false,
+            max_pairs: DEFAULT_MAX_PAIRS,
+        }
+    }
 }
 
 // ── Walking ──────────────────────────────────────────────────────────────────
@@ -439,6 +552,7 @@ struct Walk {
 /// Resolve `root` and everything it includes into a ready-to-run composition.
 ///
 /// Fails on include cycles, an include chain deeper than [`MAX_INCLUDE_DEPTH`],
+/// more pairs than [`CliSettings::max_pairs`] (default [`DEFAULT_MAX_PAIRS`]),
 /// duplicate pair identities, unknown fields, unreadable includes, and files
 /// that parse as neither TOML nor JSON.
 pub fn resolve(root: &Path, cli: &CliSettings) -> Result<ResolvedManifest> {
@@ -446,6 +560,46 @@ pub fn resolve(root: &Path, cli: &CliSettings) -> Result<ResolvedManifest> {
     let mut walk = Walk::default();
     let mut stack: Vec<PathBuf> = Vec::new();
     visit(&root, &mut walk, &mut stack, 0)?;
+
+    if walk.pairs.is_empty() {
+        bail!(
+            "Manifest composition contains no comparison pairs. A manifest must declare at least one comparison pair.\n\
+             Minimal valid shape:\n\
+             \n\
+             # TOML\n\
+             [[pairs]]\n\
+             name = \"my-contract\"\n\
+             old = \"old.wasm\"\n\
+             new = \"new.wasm\"\n\
+             \n\
+             # JSON\n\
+             {{\n\
+               \"pairs\": [\n\
+                 {{\n\
+                   \"name\": \"my-contract\",\n\
+                   \"old\": \"old.wasm\",\n\
+                   \"new\": \"new.wasm\"\n\
+                 }}\n\
+               ]\n\
+             }}"
+        );
+    }
+
+    // Checked ahead of the (more expensive) precedence fold, and long before
+    // the batch loop would start loading WASM for each pair: a malformed or
+    // accidentally generated manifest with thousands of pairs is rejected as
+    // a configuration error, not run until something else gives out.
+    if walk.pairs.len() > cli.max_pairs {
+        bail!(
+            "Manifest composition contains {} pairs, exceeding the maximum of {} (--max-pairs).\n  \
+             root: {}\n\
+             Raise --max-pairs if this many pairs is intentional, or check for a manifest \
+             generation mistake.",
+            walk.pairs.len(),
+            cli.max_pairs,
+            root.display()
+        );
+    }
 
     let pairs = fold_pairs(&walk, cli)?;
 
@@ -491,6 +645,14 @@ fn visit(path: &Path, walk: &mut Walk, stack: &mut Vec<PathBuf>, depth: usize) -
             )
         }
     })?;
+
+    if raw.version != 1 {
+        bail!(
+            "Unsupported manifest version. Supported version: 1, encountered: {} in '{}'",
+            raw.version,
+            path.display()
+        );
+    }
 
     let dir = parent_dir(path);
     stack.push(path.to_path_buf());
@@ -551,13 +713,35 @@ fn visit(path: &Path, walk: &mut Walk, stack: &mut Vec<PathBuf>, depth: usize) -
     Ok(())
 }
 
-/// Apply the precedence chain to every walked pair and check identities.
+/// Non-empty, and restricted to characters safe in CI annotations, file
+/// names, and shell arguments — ASCII letters, digits, `-`, `_`, and `.`. (An
+/// empty string vacuously passes the character check alone, hence the
+/// explicit `is_empty` guard.)
+fn is_valid_token(value: &str, extra: &[char]) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || extra.contains(&c))
+}
+
+fn is_valid_pair_id(id: &str) -> bool {
+    is_valid_token(id, &[])
+}
+
+/// Same base charset as [`is_valid_pair_id`], plus `:` — labels are meant for
+/// `key:value`-style tags (`service:token`, `stage:prod`), which `id` has no
+/// need for.
+fn is_valid_label(label: &str) -> bool {
+    is_valid_token(label, &[':'])
+}
+
 fn fold_pairs(walk: &Walk, cli: &CliSettings) -> Result<Vec<ResolvedPair>> {
     let mut resolved = Vec::with_capacity(walk.pairs.len());
     // Duplicate detection runs before any comparison, so a collision fails the
     // run with nothing written — the old code bailed mid-loop, after earlier
     // pairs had already produced report files.
     let mut names: HashMap<String, PathBuf> = HashMap::new();
+    let mut ids: HashMap<String, PathBuf> = HashMap::new();
 
     for walked in &walk.pairs {
         let pair_layer = Layer {
@@ -601,8 +785,64 @@ fn fold_pairs(walk: &Walk, cli: &CliSettings) -> Result<Vec<ResolvedPair>> {
         }
         names.insert(name.clone(), walked.defined_in.clone());
 
+        // Pair ID: explicit `id`, validated, else the resolved `name`. The
+        // fallback is not itself re-validated against the ID charset — it
+        // reuses `name` verbatim, exactly as `name` has always behaved, so an
+        // existing manifest that never sets `id` cannot start failing here.
+        let id = match &walked.raw.id {
+            Some(explicit) => {
+                if !is_valid_pair_id(explicit) {
+                    bail!(
+                        "Invalid pair id '{}' for '{}' in {}.\n  \
+                         IDs must be non-empty and contain only ASCII letters, digits, \
+                         '-', '_', and '.'.",
+                        explicit,
+                        name,
+                        walked.defined_in.display()
+                    );
+                }
+                explicit.clone()
+            }
+            None => name.clone(),
+        };
+
+        if let Some(previous) = ids.get(&id) {
+            bail!(
+                "Duplicate pair id '{}' in the manifest composition.\n  \
+                 first defined in: {}\n  also defined in:  {}\n\
+                 Give one of them an explicit `id` so reruns and CI annotations stay unambiguous.",
+                id,
+                previous.display(),
+                walked.defined_in.display()
+            );
+        }
+        ids.insert(id.clone(), walked.defined_in.clone());
+
+        // Labels: validated like `id`, but never checked for uniqueness —
+        // the same label repeating across many pairs is the whole point.
+        // Duplicates *within* one pair's own list are folded to their first
+        // occurrence rather than rejected, since they carry no information.
+        let mut labels: Vec<String> = Vec::with_capacity(walked.raw.labels.len());
+        for label in &walked.raw.labels {
+            if !is_valid_label(label) {
+                bail!(
+                    "Invalid label '{}' for '{}' in {}.\n  \
+                     Labels must be non-empty and contain only ASCII letters, digits, \
+                     '-', '_', '.', and ':'.",
+                    label,
+                    name,
+                    walked.defined_in.display()
+                );
+            }
+            if !labels.contains(label) {
+                labels.push(label.clone());
+            }
+        }
+
         resolved.push(ResolvedPair {
             name,
+            id,
+            labels,
             old,
             new,
             old_storage_schema: walked
@@ -654,13 +894,23 @@ fn fold_settings(layers: &[Layer], pair: &Layer, cli: &CliSettings) -> ResolvedS
             origin: Origin::Cli,
         }
     } else {
-        let mut current = match (&cli.config, &cli.default_config) {
-            (Some(path), _) => Sourced {
+        let mut current = match (
+            &cli.config,
+            &cli.env_config,
+            &cli.default_config,
+            &cli.ancestor_config,
+        ) {
+            (Some(path), _, _, _) => Sourced {
                 value: Some(path.clone()),
                 origin: Origin::Cli,
             },
-            (None, Some(path)) => Sourced::built_in(Some(path.clone())),
-            (None, None) => Sourced::built_in(None),
+            (None, Some(path), _, _) => Sourced {
+                value: Some(path.clone()),
+                origin: Origin::Env,
+            },
+            (None, None, Some(path), _) => Sourced::built_in(Some(path.clone())),
+            (None, None, None, Some(path)) => Sourced::built_in(Some(path.clone())),
+            (None, None, None, None) => Sourced::built_in(None),
         };
         for layer in chain() {
             if let Some(path) = &layer.config {
@@ -758,8 +1008,38 @@ pub fn cli_only_settings(cli: &CliSettings) -> ResolvedSettings {
 /// only "as either TOML or JSON", which is undebuggable once includes multiply
 /// the number of candidate files.
 fn parse_file(path: &Path) -> Result<RawManifest> {
-    let content = std::fs::read_to_string(path)
+    let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
+    // Windows tooling commonly saves UTF-8 files with a leading BOM, which
+    // neither TOML nor JSON has syntax for; strip it before parsing (and
+    // before the format sniff below, which would otherwise see the BOM
+    // instead of the manifest's real first character).
+    let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+
+    if content.trim().is_empty() {
+        bail!(
+            "Manifest file '{}' is empty. A manifest must declare at least one comparison pair.\n\
+             Minimal valid shape:\n\
+             \n\
+             # TOML\n\
+             [[pairs]]\n\
+             name = \"my-contract\"\n\
+             old = \"old.wasm\"\n\
+             new = \"new.wasm\"\n\
+             \n\
+             # JSON\n\
+             {{\n\
+               \"pairs\": [\n\
+                 {{\n\
+                   \"name\": \"my-contract\",\n\
+                   \"old\": \"old.wasm\",\n\
+                   \"new\": \"new.wasm\"\n\
+                 }}\n\
+               ]\n\
+             }}",
+            path.display()
+        );
+    }
 
     let json_first = path
         .extension()
@@ -767,11 +1047,11 @@ fn parse_file(path: &Path) -> Result<RawManifest> {
         .is_some_and(|e| e.eq_ignore_ascii_case("json"))
         || content.trim_start().starts_with(['{', '[']);
 
-    let toml_error = match toml::from_str::<RawManifest>(&content) {
+    let toml_error = match toml::from_str::<RawManifest>(content) {
         Ok(manifest) => return Ok(manifest),
         Err(e) => e.to_string(),
     };
-    let json_error = match serde_json::from_str::<RawManifest>(&content) {
+    let json_error = match serde_json::from_str::<RawManifest>(content) {
         Ok(manifest) => return Ok(manifest),
         Err(e) => format!("{e}"),
     };
@@ -817,6 +1097,16 @@ fn canonical_identity(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Render `path` for report-facing output (JSON, `--explain-manifest`) with
+/// display normalization applied (see
+/// [`crate::loader::normalize_path_display`]). Deliberately **not** used for
+/// diagnostic-only messages like the include-cycle chain below, which show
+/// the path exactly as the filesystem gave it to help track down the actual
+/// file.
+fn display_path(path: &Path) -> String {
+    crate::loader::normalize_path_display(&path.display().to_string())
+}
+
 fn chain_display(stack: &[PathBuf], next: &Path) -> String {
     stack
         .iter()
@@ -833,11 +1123,11 @@ impl ResolvedManifest {
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
-            "root": self.root.display().to_string(),
+            "root": display_path(&self.root),
             "sources": self
                 .sources
                 .iter()
-                .map(|p| p.display().to_string())
+                .map(display_path)
                 .collect::<Vec<_>>(),
             "pairs": self.pairs.iter().map(ResolvedPair::to_json).collect::<Vec<_>>(),
             "dependencies": self.dependencies,
@@ -849,26 +1139,30 @@ impl ResolvedManifest {
         let mut out = String::new();
         out.push_str("Manifest resolution\n");
         out.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-        out.push_str(&format!("root:    {}\n", self.root.display()));
+        out.push_str(&format!("root:    {}\n", display_path(&self.root)));
         out.push_str("sources:\n");
         for source in &self.sources {
-            out.push_str(&format!("  - {}\n", source.display()));
+            out.push_str(&format!("  - {}\n", display_path(source)));
         }
 
         out.push_str(&format!("\npairs ({}):\n", self.pairs.len()));
         for (index, pair) in self.pairs.iter().enumerate() {
             out.push_str(&format!("\n  [{}] {}\n", index + 1, pair.name));
+            out.push_str(&format!("      id:         {}\n", pair.id));
+            if !pair.labels.is_empty() {
+                out.push_str(&format!("      labels:     {}\n", pair.labels.join(", ")));
+            }
             out.push_str(&format!(
                 "      defined in: {}\n",
-                pair.defined_in.display()
+                display_path(&pair.defined_in)
             ));
-            out.push_str(&format!("      old:        {}\n", pair.old.display()));
-            out.push_str(&format!("      new:        {}\n", pair.new.display()));
+            out.push_str(&format!("      old:        {}\n", display_path(&pair.old)));
+            out.push_str(&format!("      new:        {}\n", display_path(&pair.new)));
             if let Some(path) = &pair.old_storage_schema {
-                out.push_str(&format!("      old schema:  {}\n", path.display()));
+                out.push_str(&format!("      old schema:  {}\n", display_path(path)));
             }
             if let Some(path) = &pair.new_storage_schema {
-                out.push_str(&format!("      new schema:  {}\n", path.display()));
+                out.push_str(&format!("      new schema:  {}\n", display_path(path)));
             }
             for (key, value, origin) in pair.settings.rows() {
                 // Width covers the longest key (`policy.gate_runtime_surface`)
@@ -898,7 +1192,7 @@ impl ResolvedManifest {
                     dep.dependency.caller,
                     dep.dependency.callee,
                     functions,
-                    dep.defined_in.display()
+                    display_path(&dep.defined_in)
                 ));
             }
         }
@@ -911,17 +1205,13 @@ impl ResolvedPair {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "name": self.name,
-            "defined_in": self.defined_in.display().to_string(),
-            "old": self.old.display().to_string(),
-            "new": self.new.display().to_string(),
-            "old_storage_schema": self
-                .old_storage_schema
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            "new_storage_schema": self
-                .new_storage_schema
-                .as_ref()
-                .map(|path| path.display().to_string()),
+            "id": self.id,
+            "labels": self.labels,
+            "defined_in": display_path(&self.defined_in),
+            "old": display_path(&self.old),
+            "new": display_path(&self.new),
+            "old_storage_schema": self.old_storage_schema.as_deref().map(display_path),
+            "new_storage_schema": self.new_storage_schema.as_deref().map(display_path),
             "settings": self.settings.to_json(),
         })
     }
@@ -931,7 +1221,7 @@ impl ResolvedSettings {
     /// `(key, rendered value, origin)` for every setting, in a stable order.
     fn rows(&self) -> Vec<(&'static str, String, String)> {
         let render_path = |s: &Sourced<Option<PathBuf>>| match &s.value {
-            Some(path) => path.display().to_string(),
+            Some(path) => display_path(path),
             None => "(none)".to_string(),
         };
         vec![
@@ -1013,7 +1303,7 @@ impl ResolvedSettings {
         map.insert(
             "config".to_string(),
             serde_json::json!({
-                "value": self.config.value.as_ref().map(|p| p.display().to_string()),
+                "value": self.config.value.as_deref().map(display_path),
                 "origin": self.config.origin,
             }),
         );
@@ -1336,6 +1626,250 @@ mod tests {
     }
 
     #[test]
+    fn env_config_is_used_when_cli_config_and_manifest_layers_are_absent() {
+        let dir = temp_dir("env-config-fallback");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            env_config: Some(PathBuf::from("/env/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/env/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Env);
+    }
+
+    #[test]
+    fn cli_config_outranks_env_config() {
+        let dir = temp_dir("cli-outranks-env-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            config: Some(PathBuf::from("/cli/.safeguard.toml")),
+            env_config: Some(PathBuf::from("/env/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/cli/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Cli);
+    }
+
+    #[test]
+    fn env_config_outranks_discovered_default_config() {
+        let dir = temp_dir("env-outranks-default-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            env_config: Some(PathBuf::from("/env/.safeguard.toml")),
+            default_config: Some(PathBuf::from(".safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/env/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Env);
+    }
+
+    #[test]
+    fn no_config_outranks_env_config() {
+        let dir = temp_dir("no-config-outranks-env-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            env_config: Some(PathBuf::from("/env/.safeguard.toml")),
+            no_config: true,
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(resolved.pairs[0].settings.config.value, None);
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Cli);
+    }
+
+    // ── ancestor_config (--search-parent-config) ────────────────────────────
+
+    #[test]
+    fn ancestor_config_is_used_when_nothing_more_specific_resolves() {
+        let dir = temp_dir("ancestor-config-fallback");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/repo/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::BuiltIn);
+    }
+
+    #[test]
+    fn default_config_outranks_ancestor_config() {
+        let dir = temp_dir("default-outranks-ancestor-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            default_config: Some(PathBuf::from(".safeguard.toml")),
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from(".safeguard.toml")),
+            "the current-directory default must win over an ancestor match"
+        );
+    }
+
+    #[test]
+    fn env_config_outranks_ancestor_config() {
+        let dir = temp_dir("env-outranks-ancestor-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            env_config: Some(PathBuf::from("/env/.safeguard.toml")),
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/env/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Env);
+    }
+
+    #[test]
+    fn cli_config_outranks_ancestor_config() {
+        let dir = temp_dir("cli-outranks-ancestor-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            config: Some(PathBuf::from("/cli/.safeguard.toml")),
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/cli/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Cli);
+    }
+
+    #[test]
+    fn no_config_outranks_ancestor_config() {
+        let dir = temp_dir("no-config-outranks-ancestor-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            no_config: true,
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(resolved.pairs[0].settings.config.value, None);
+    }
+
+    #[test]
+    fn a_manifest_naming_its_own_config_outranks_ancestor_config() {
+        let dir = temp_dir("manifest-outranks-ancestor-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            config = "team.safeguard.toml"
+            "#,
+        );
+        let cli = CliSettings {
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(dir.join("team.safeguard.toml")),
+            "a pair naming its own config is more specific than any CLI-level fallback"
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::File(root));
+    }
+
+    #[test]
     fn includes_compose_depth_first_in_order() {
         let dir = temp_dir("depth-first");
         write(
@@ -1513,6 +2047,126 @@ mod tests {
         assert_eq!(resolved.pairs.len(), 1);
     }
 
+    // ── max pairs ────────────────────────────────────────────────────────────
+
+    /// A manifest body with `n` distinct pairs, none of which need to exist on
+    /// disk — `resolve()` only resolves path strings, it never touches WASM.
+    fn pairs_toml(n: usize) -> String {
+        let mut out = String::new();
+        for i in 0..n {
+            out.push_str(&format!(
+                "[[pairs]]\nold = \"a{i}_v1.wasm\"\nnew = \"a{i}_v2.wasm\"\n\n"
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn default_max_pairs_allows_an_ordinary_manifest() {
+        let dir = temp_dir("max-pairs-default-ok");
+        let root = write(&dir, "root.toml", &pairs_toml(3));
+        let resolved = resolve(&root, &CliSettings::default())
+            .expect("a manifest far under the default ceiling must resolve");
+        assert_eq!(resolved.pairs.len(), 3);
+    }
+
+    #[test]
+    fn default_max_pairs_rejects_a_manifest_over_the_default_ceiling() {
+        let dir = temp_dir("max-pairs-default-over");
+        let root = write(&dir, "root.toml", &pairs_toml(DEFAULT_MAX_PAIRS + 1));
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(
+            error.contains(&format!("{} pairs", DEFAULT_MAX_PAIRS + 1)),
+            "got: {error}"
+        );
+        assert!(
+            error.contains(&format!("maximum of {DEFAULT_MAX_PAIRS}")),
+            "got: {error}"
+        );
+        assert!(error.contains("--max-pairs"), "got: {error}");
+    }
+
+    #[test]
+    fn custom_max_pairs_rejects_a_manifest_over_the_custom_limit() {
+        let dir = temp_dir("max-pairs-custom-over");
+        let root = write(&dir, "root.toml", &pairs_toml(3));
+        let cli = CliSettings {
+            max_pairs: 2,
+            ..CliSettings::default()
+        };
+        let error = format!("{:#}", resolve(&root, &cli).unwrap_err());
+        assert!(error.contains("3 pairs"), "got: {error}");
+        assert!(error.contains("maximum of 2"), "got: {error}");
+    }
+
+    #[test]
+    fn max_pairs_exactly_at_the_custom_limit_succeeds() {
+        let dir = temp_dir("max-pairs-custom-boundary-ok");
+        let root = write(&dir, "root.toml", &pairs_toml(3));
+        let cli = CliSettings {
+            max_pairs: 3,
+            ..CliSettings::default()
+        };
+        let resolved =
+            resolve(&root, &cli).expect("a manifest exactly at the limit must still resolve");
+        assert_eq!(resolved.pairs.len(), 3);
+    }
+
+    #[test]
+    fn max_pairs_one_over_the_custom_limit_is_rejected() {
+        let dir = temp_dir("max-pairs-custom-boundary-over");
+        let root = write(&dir, "root.toml", &pairs_toml(4));
+        let cli = CliSettings {
+            max_pairs: 3,
+            ..CliSettings::default()
+        };
+        let error = format!("{:#}", resolve(&root, &cli).unwrap_err());
+        assert!(error.contains("4 pairs"), "got: {error}");
+        assert!(error.contains("maximum of 3"), "got: {error}");
+    }
+
+    #[test]
+    fn max_pairs_check_counts_pairs_composed_across_includes() {
+        // The cap applies to the whole composition, not per-file.
+        let dir = temp_dir("max-pairs-across-includes");
+        write(&dir, "frag.toml", &pairs_toml(2));
+        let root = write(
+            &dir,
+            "root.toml",
+            &format!("include = [\"frag.toml\"]\n\n{}", pairs_toml(2)),
+        );
+        let cli = CliSettings {
+            max_pairs: 3,
+            ..CliSettings::default()
+        };
+        let error = format!("{:#}", resolve(&root, &cli).unwrap_err());
+        assert!(
+            error.contains("4 pairs"),
+            "included and root pairs must both count toward the cap, got: {error}"
+        );
+    }
+
+    #[test]
+    fn max_pairs_rejection_runs_before_the_precedence_fold() {
+        // A manifest that would ALSO be rejected for a duplicate name must
+        // report the pair-count violation instead: the cap is checked first,
+        // ahead of the (more expensive) duplicate-detection fold.
+        let dir = temp_dir("max-pairs-before-fold");
+        let mut body = pairs_toml(3);
+        body.push_str("[[pairs]]\nold = \"dup_v1.wasm\"\nnew = \"dup_v2.wasm\"\nname = \"same\"\n\n");
+        body.push_str("[[pairs]]\nold = \"dup_v1.wasm\"\nnew = \"dup_v2.wasm\"\nname = \"same\"\n");
+        let root = write(&dir, "root.toml", &body);
+        let cli = CliSettings {
+            max_pairs: 3,
+            ..CliSettings::default()
+        };
+        let error = format!("{:#}", resolve(&root, &cli).unwrap_err());
+        assert!(
+            error.contains("maximum of 3"),
+            "the pair-count cap must be reported ahead of the duplicate-name error, got: {error}"
+        );
+    }
+
     #[test]
     fn duplicate_names_name_both_files() {
         let dir = temp_dir("dupe");
@@ -1546,6 +2200,543 @@ mod tests {
         );
         assert!(error.contains("frag.toml"), "first file missing: {error}");
         assert!(error.contains("root.toml"), "second file missing: {error}");
+    }
+
+    // ── pair IDs ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn id_defaults_to_the_resolved_name_when_omitted() {
+        let dir = temp_dir("id-default");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old  = "a_v1.wasm"
+            new  = "a_v2.wasm"
+            name = "token"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].name, "token");
+        assert_eq!(resolved.pairs[0].id, "token");
+    }
+
+    #[test]
+    fn id_defaults_to_the_new_file_name_when_neither_name_nor_id_is_set() {
+        let dir = temp_dir("id-default-filename");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].name, "a_v2.wasm");
+        assert_eq!(resolved.pairs[0].id, "a_v2.wasm");
+    }
+
+    #[test]
+    fn explicit_id_is_independent_of_name() {
+        let dir = temp_dir("id-explicit");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old  = "a_v1.wasm"
+            new  = "a_v2.wasm"
+            name = "Token (v1 -> v2)"
+            id   = "token-v1-v2"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].name, "Token (v1 -> v2)");
+        assert_eq!(resolved.pairs[0].id, "token-v1-v2");
+    }
+
+    #[test]
+    fn duplicate_explicit_ids_name_both_files() {
+        let dir = temp_dir("id-dupe");
+        write(
+            &dir,
+            "frag.toml",
+            r#"
+            [[pairs]]
+            old  = "a_v1.wasm"
+            new  = "a_v2.wasm"
+            name = "token-a"
+            id   = "shared-id"
+            "#,
+        );
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            include = ["frag.toml"]
+
+            [[pairs]]
+            old  = "b_v1.wasm"
+            new  = "b_v2.wasm"
+            name = "token-b"
+            id   = "shared-id"
+            "#,
+        );
+
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(
+            error.contains("Duplicate pair id 'shared-id'"),
+            "got: {error}"
+        );
+        assert!(error.contains("frag.toml"), "first file missing: {error}");
+        assert!(error.contains("root.toml"), "second file missing: {error}");
+    }
+
+    #[test]
+    fn an_explicit_id_colliding_with_another_pairs_fallback_id_is_rejected() {
+        // Pair 1 has no explicit id, so its id falls back to its name "dup".
+        // Pair 2 explicitly claims "dup" too -> must still be caught.
+        let dir = temp_dir("id-dupe-fallback");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old  = "a_v1.wasm"
+            new  = "a_v2.wasm"
+            name = "dup"
+
+            [[pairs]]
+            old  = "b_v1.wasm"
+            new  = "b_v2.wasm"
+            name = "token-b"
+            id   = "dup"
+            "#,
+        );
+
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Duplicate pair id 'dup'"), "got: {error}");
+    }
+
+    #[test]
+    fn empty_id_is_rejected() {
+        let dir = temp_dir("id-empty");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            id  = ""
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Invalid pair id"), "got: {error}");
+    }
+
+    #[test]
+    fn id_with_whitespace_is_rejected() {
+        let dir = temp_dir("id-whitespace");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            id  = "has space"
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(
+            error.contains("Invalid pair id 'has space'"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn id_with_disallowed_characters_is_rejected() {
+        let dir = temp_dir("id-bad-chars");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            id  = "token/v1"
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Invalid pair id 'token/v1'"), "got: {error}");
+    }
+
+    #[test]
+    fn id_allows_letters_digits_dash_underscore_dot() {
+        let dir = temp_dir("id-valid-charset");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            id  = "Token-v1.2_beta"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].id, "Token-v1.2_beta");
+    }
+
+    #[test]
+    fn a_name_with_characters_invalid_for_id_still_works_as_a_fallback() {
+        // `name` has no charset restriction; a fallback id derived from it
+        // must not be re-validated against the id charset, or an existing
+        // manifest that never set `id` could start failing.
+        let dir = temp_dir("id-fallback-not-revalidated");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old  = "a_v1.wasm"
+            new  = "a_v2.wasm"
+            name = "token (legacy name with spaces)"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default())
+            .expect("a fallback id derived from an unrestricted name must not be rejected");
+        assert_eq!(resolved.pairs[0].id, "token (legacy name with spaces)");
+    }
+
+    #[test]
+    fn ids_are_unique_across_a_json_manifest_too() {
+        let dir = temp_dir("id-json-dupe");
+        let root = write(
+            &dir,
+            "root.json",
+            r#"{"pairs":[
+                {"old":"a_v1.wasm","new":"a_v2.wasm","name":"a","id":"same"},
+                {"old":"b_v1.wasm","new":"b_v2.wasm","name":"b","id":"same"}
+            ]}"#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Duplicate pair id 'same'"), "got: {error}");
+    }
+
+    #[test]
+    fn ids_accepted_in_a_json_manifest() {
+        let dir = temp_dir("id-json-ok");
+        let root = write(
+            &dir,
+            "root.json",
+            r#"{"pairs":[{"old":"a_v1.wasm","new":"a_v2.wasm","name":"a","id":"a-1"}]}"#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].id, "a-1");
+    }
+
+    #[test]
+    fn resolved_pair_json_includes_id() {
+        let dir = temp_dir("id-json-output");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            id  = "a-1"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        let json = resolved.to_json();
+        assert_eq!(json["pairs"][0]["id"], "a-1");
+    }
+
+    // ── labels ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn unlabeled_pair_has_an_empty_labels_list() {
+        let dir = temp_dir("labels-none");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert!(resolved.pairs[0].labels.is_empty());
+    }
+
+    #[test]
+    fn explicit_labels_are_accepted_and_ordered() {
+        let dir = temp_dir("labels-explicit");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            labels = ["payments", "prod", "team-platform"]
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(
+            resolved.pairs[0].labels,
+            vec!["payments", "prod", "team-platform"]
+        );
+    }
+
+    #[test]
+    fn key_value_style_labels_with_a_colon_are_accepted() {
+        // `:` is valid in labels (unlike in `id`) specifically for
+        // `key:value` tags such as `service:token` / `stage:prod`.
+        let dir = temp_dir("labels-colon");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            labels = ["service:token", "stage:prod"]
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default())
+            .expect("key:value labels must be accepted");
+        assert_eq!(resolved.pairs[0].labels, vec!["service:token", "stage:prod"]);
+    }
+
+    #[test]
+    fn a_colon_is_rejected_in_a_pair_id_even_though_labels_allow_it() {
+        // Confirms the two validators genuinely diverge: `id` did not
+        // silently inherit the wider label charset.
+        let dir = temp_dir("id-rejects-colon");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            id  = "stage:prod"
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Invalid pair id 'stage:prod'"), "got: {error}");
+    }
+
+    #[test]
+    fn the_same_label_is_allowed_to_repeat_across_many_pairs() {
+        // Labels group pairs together; the whole point is that many pairs
+        // share one label. This must never be treated as a collision, unlike
+        // `id`.
+        let dir = temp_dir("labels-repeat-across-pairs");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            name   = "a"
+            labels = ["prod"]
+
+            [[pairs]]
+            old    = "b_v1.wasm"
+            new    = "b_v2.wasm"
+            name   = "b"
+            labels = ["prod"]
+
+            [[pairs]]
+            old    = "c_v1.wasm"
+            new    = "c_v2.wasm"
+            name   = "c"
+            labels = ["prod"]
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default())
+            .expect("repeated labels across pairs must not be rejected");
+        assert_eq!(resolved.pairs.len(), 3);
+        for pair in &resolved.pairs {
+            assert_eq!(pair.labels, vec!["prod"]);
+        }
+    }
+
+    #[test]
+    fn duplicate_labels_within_one_pair_are_folded_to_first_occurrence() {
+        let dir = temp_dir("labels-dedup-within-pair");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            labels = ["prod", "payments", "prod"]
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].labels, vec!["prod", "payments"]);
+    }
+
+    #[test]
+    fn empty_label_is_rejected() {
+        let dir = temp_dir("labels-empty");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            labels = [""]
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Invalid label"), "got: {error}");
+    }
+
+    #[test]
+    fn whitespace_label_is_rejected() {
+        let dir = temp_dir("labels-whitespace");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            labels = ["has space"]
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Invalid label 'has space'"), "got: {error}");
+    }
+
+    #[test]
+    fn label_with_disallowed_characters_is_rejected() {
+        let dir = temp_dir("labels-bad-chars");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            name   = "svc"
+            labels = ["team/payments"]
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(
+            error.contains("Invalid label 'team/payments'"),
+            "got: {error}"
+        );
+        assert!(error.contains("svc"), "error should name the pair: {error}");
+    }
+
+    #[test]
+    fn one_invalid_label_among_valid_ones_still_rejects_the_pair() {
+        let dir = temp_dir("labels-mixed-validity");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            labels = ["prod", "bad label", "payments"]
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(error.contains("Invalid label 'bad label'"), "got: {error}");
+    }
+
+    #[test]
+    fn resolved_pair_json_includes_labels() {
+        let dir = temp_dir("labels-json-output");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            labels = ["prod", "payments"]
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        let json = resolved.to_json();
+        assert_eq!(json["pairs"][0]["labels"], serde_json::json!(["prod", "payments"]));
+    }
+
+    #[test]
+    fn resolved_pair_json_has_an_empty_labels_array_when_unlabeled() {
+        let dir = temp_dir("labels-json-empty");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        let json = resolved.to_json();
+        assert_eq!(json["pairs"][0]["labels"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn labels_are_accepted_in_a_json_manifest() {
+        let dir = temp_dir("labels-json-manifest");
+        let root = write(
+            &dir,
+            "root.json",
+            r#"{"pairs":[{"old":"a_v1.wasm","new":"a_v2.wasm","labels":["prod","payments"]}]}"#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).unwrap();
+        assert_eq!(resolved.pairs[0].labels, vec!["prod", "payments"]);
+    }
+
+    #[test]
+    fn labels_never_affect_pair_identity_or_duplicate_detection() {
+        // Two pairs with the same label but different names/ids must resolve
+        // fine; two pairs with the same name but different labels must still
+        // collide on the name, unaffected by labels either way.
+        let dir = temp_dir("labels-identity-independence");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            name   = "token"
+            labels = ["prod"]
+
+            [[pairs]]
+            old    = "b_v1.wasm"
+            new    = "b_v2.wasm"
+            name   = "token"
+            labels = ["staging"]
+            "#,
+        );
+        let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
+        assert!(
+            error.contains("Duplicate contract name 'token'"),
+            "differing labels must not mask a real name collision: {error}"
+        );
     }
 
     #[test]
@@ -1811,5 +3002,129 @@ mod tests {
         assert!(text.contains("root.toml"));
         assert!(text.contains("[1] a"));
         assert!(text.contains("strict"));
+    }
+
+    #[test]
+    fn manifest_version_defaults_to_one() {
+        let dir = temp_dir("version-default");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).expect("resolve failed");
+        assert_eq!(resolved.pairs.len(), 1);
+    }
+
+    #[test]
+    fn manifest_version_supported_one_toml() {
+        let dir = temp_dir("version-supported-toml");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            version = 1
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).expect("resolve failed");
+        assert_eq!(resolved.pairs.len(), 1);
+    }
+
+    #[test]
+    fn manifest_version_supported_one_json() {
+        let dir = temp_dir("version-supported-json");
+        let root = write(
+            &dir,
+            "root.json",
+            r#"{"version": 1, "pairs": [{"old": "a_v1.wasm", "new": "a_v2.wasm"}]}"#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).expect("resolve failed");
+        assert_eq!(resolved.pairs.len(), 1);
+    }
+
+    #[test]
+    fn manifest_version_mismatch_toml_rejected() {
+        let dir = temp_dir("version-mismatch-toml");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            version = 2
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
+        assert!(error.contains("Unsupported manifest version"), "got: {error}");
+        assert!(error.contains("Supported version: 1"), "got: {error}");
+        assert!(error.contains("encountered: 2"), "got: {error}");
+    }
+
+    #[test]
+    fn manifest_version_mismatch_json_rejected() {
+        let dir = temp_dir("version-mismatch-json");
+        let root = write(
+            &dir,
+            "root.json",
+            r#"{"version": 2, "pairs": [{"old": "a_v1.wasm", "new": "a_v2.wasm"}]}"#,
+        );
+        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
+        assert!(error.contains("Unsupported manifest version"), "got: {error}");
+        assert!(error.contains("Supported version: 1"), "got: {error}");
+        assert!(error.contains("encountered: 2"), "got: {error}");
+    }
+
+    #[test]
+    fn manifest_version_mismatch_in_include_rejected() {
+        let dir = temp_dir("version-mismatch-include");
+        write(
+            &dir,
+            "frag.toml",
+            r#"
+            version = 2
+            "#,
+        );
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            include = ["frag.toml"]
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
+        assert!(error.contains("Unsupported manifest version"), "got: {error}");
+        assert!(error.contains("Supported version: 1"), "got: {error}");
+        assert!(error.contains("encountered: 2"), "got: {error}");
+    }
+
+    #[test]
+    fn manifest_whitespace_only_rejected() {
+        let dir = temp_dir("manifest-whitespace");
+        let root = write(&dir, "root.toml", "   \n\t  \n");
+        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
+        assert!(error.contains("is empty"), "got: {error}");
+        assert!(error.contains("[[pairs]]"), "got: {error}");
+        assert!(error.contains("\"pairs\":"), "got: {error}");
+    }
+
+    #[test]
+    fn manifest_no_pairs_rejected() {
+        let dir = temp_dir("manifest-no-pairs");
+        let root = write(&dir, "root.toml", "version = 1");
+        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
+        assert!(error.contains("contains no comparison pairs"), "got: {error}");
+        assert!(error.contains("[[pairs]]"), "got: {error}");
+        assert!(error.contains("\"pairs\":"), "got: {error}");
     }
 }

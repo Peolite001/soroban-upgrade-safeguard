@@ -151,3 +151,260 @@ impl<'a> LayoutMapper<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::ContractSpec;
+    use stellar_xdr::curr::{
+        ScSpecTypeDef, ScSpecTypeMap, ScSpecTypeOption, ScSpecTypeResult, ScSpecTypeTuple,
+        ScSpecTypeUdt, ScSpecTypeVec, ScSpecUdtStructFieldV0, ScSpecUdtStructV0,
+        ScSpecUdtUnionCaseTupleV0, ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0,
+        ScSpecUdtUnionV0, StringM, VecM,
+    };
+
+    fn udt(name: &str) -> ScSpecTypeDef {
+        ScSpecTypeDef::Udt(ScSpecTypeUdt {
+            name: name.try_into().unwrap(),
+        })
+    }
+
+    fn insert_struct(spec: &mut ContractSpec, name: &str, fields: Vec<(&str, ScSpecTypeDef)>) {
+        let xdr_fields: Vec<ScSpecUdtStructFieldV0> = fields
+            .into_iter()
+            .map(|(n, t)| ScSpecUdtStructFieldV0 {
+                doc: StringM::default(),
+                name: n.try_into().unwrap(),
+                type_: t,
+            })
+            .collect();
+        spec.structs.insert(
+            name.to_string(),
+            ScSpecUdtStructV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                fields: VecM::try_from(xdr_fields).unwrap(),
+            },
+        );
+    }
+
+    fn insert_union(
+        spec: &mut ContractSpec,
+        name: &str,
+        cases: Vec<(&str, Vec<ScSpecTypeDef>)>,
+    ) {
+        let mut xdr_cases: Vec<ScSpecUdtUnionCaseV0> = Vec::new();
+        for (case_name, payloads) in cases {
+            if payloads.is_empty() {
+                xdr_cases.push(ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                    doc: StringM::default(),
+                    name: case_name.try_into().unwrap(),
+                }));
+            } else {
+                xdr_cases.push(ScSpecUdtUnionCaseV0::TupleV0(ScSpecUdtUnionCaseTupleV0 {
+                    doc: StringM::default(),
+                    name: case_name.try_into().unwrap(),
+                    type_: VecM::try_from(payloads).unwrap(),
+                }));
+            }
+        }
+        spec.unions.insert(
+            name.to_string(),
+            ScSpecUdtUnionV0 {
+                doc: StringM::default(),
+                lib: StringM::default(),
+                name: name.try_into().unwrap(),
+                cases: VecM::try_from(xdr_cases).unwrap(),
+            },
+        );
+    }
+
+    fn build_graph_spec() -> ContractSpec {
+        let mut spec = ContractSpec::default();
+
+        insert_struct(&mut spec, "Leaf", vec![("v", ScSpecTypeDef::U32)]);
+
+        insert_struct(
+            &mut spec,
+            "Mid",
+            vec![
+                ("direct", udt("Leaf")),
+                ("wrapped_opt", ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+                    value_type: Box::new(udt("Leaf")),
+                }))),
+                ("wrapped_vec", ScSpecTypeDef::Vec(Box::new(ScSpecTypeVec {
+                    element_type: Box::new(udt("Leaf")),
+                }))),
+            ],
+        );
+
+        insert_struct(
+            &mut spec,
+            "Root",
+            vec![
+                ("mid", udt("Mid")),
+                ("map_of_leaf_to_mid", ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
+                    key_type: Box::new(udt("Leaf")),
+                    value_type: Box::new(udt("Mid")),
+                }))),
+                ("result_leaf_mid", ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+                    ok_type: Box::new(udt("Leaf")),
+                    error_type: Box::new(udt("Mid")),
+                }))),
+                ("tuple_mid_leaf", ScSpecTypeDef::Tuple(Box::new(ScSpecTypeTuple {
+                    value_types: VecM::try_from(vec![udt("Mid"), udt("Leaf")]).unwrap(),
+                }))),
+            ],
+        );
+
+        insert_struct(&mut spec, "CycleA", vec![("b", udt("CycleB"))]);
+        insert_struct(&mut spec, "CycleB", vec![("a", udt("CycleA"))]);
+
+        insert_union(
+            &mut spec,
+            "U",
+            vec![
+                ("Empty", vec![]),
+                ("HasMid", vec![udt("Mid")]),
+                ("Pair", vec![udt("CycleA"), udt("Root")]),
+            ],
+        );
+
+        spec
+    }
+
+    fn sorted<'a, I: IntoIterator<Item = &'a String>>(iter: I) -> Vec<String> {
+        let mut v: Vec<String> = iter.into_iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn dependency_graph_direct_and_transitive_closure() {
+        let spec = build_graph_spec();
+        let mapper = LayoutMapper::new(&spec);
+
+        let leaf_deps = mapper.get_udt_dependencies(&udt("Leaf"));
+        assert!(
+            leaf_deps.is_empty(),
+            "Leaf only contains u32, must have no UDT deps, got {:?}",
+            leaf_deps
+        );
+
+        let mid_deps = mapper.get_udt_dependencies(&udt("Mid"));
+        assert_eq!(sorted(&mid_deps), vec!["Leaf".to_string()]);
+
+        let root_deps = mapper.get_udt_dependencies(&udt("Root"));
+        assert_eq!(
+            sorted(&root_deps),
+            vec!["Leaf".to_string(), "Mid".to_string()],
+            "Root transitively depends on both Mid and Leaf via every container variant"
+        );
+    }
+
+    #[test]
+    fn dependency_graph_cycle_terminates_and_returns_both_nodes() {
+        let spec = build_graph_spec();
+        let mapper = LayoutMapper::new(&spec);
+
+        let a_deps = mapper.get_udt_dependencies(&udt("CycleA"));
+        assert_eq!(
+            sorted(&a_deps),
+            vec!["CycleA".to_string(), "CycleB".to_string()],
+            "Cycle walk must include both nodes of the 2-cycle and terminate"
+        );
+
+        let b_deps = mapper.get_udt_dependencies(&udt("CycleB"));
+        assert_eq!(
+            sorted(&b_deps),
+            vec!["CycleA".to_string(), "CycleB".to_string()],
+            "Entering from either side of the cycle yields the same closure"
+        );
+
+        let u_deps = mapper.get_udt_dependencies(&udt("U"));
+        let mut u_sorted = sorted(&u_deps);
+        u_sorted.sort();
+        assert_eq!(
+            u_sorted,
+            vec![
+                "CycleA".to_string(),
+                "CycleB".to_string(),
+                "Leaf".to_string(),
+                "Mid".to_string(),
+                "Root".to_string(),
+            ],
+            "Union walk must cover void case (skipped), tuple case, and transitive closure"
+        );
+    }
+
+    #[test]
+    fn dependency_graph_reverse_dependencies_nodes_and_edges_with_stable_ordering() {
+        let spec = build_graph_spec();
+        let mapper = LayoutMapper::new(&spec);
+        let reverse = mapper.build_reverse_dependencies();
+
+        let reverse_keys = sorted(reverse.keys());
+        assert_eq!(
+            reverse_keys,
+            vec![
+                "CycleA".to_string(),
+                "CycleB".to_string(),
+                "Leaf".to_string(),
+                "Mid".to_string(),
+                "Root".to_string(),
+            ],
+            "Every UDT used as a field type anywhere must appear as a reverse key"
+        );
+
+        assert_eq!(reverse["CycleA"], vec!["CycleB".to_string()]);
+        assert_eq!(reverse["CycleB"], vec!["CycleA".to_string()]);
+
+        assert_eq!(
+            reverse["Mid"],
+            vec!["Root".to_string(), "U".to_string()],
+            "Mid is referenced from Root (direct + containers) and union case HasMid; deduped and sorted"
+        );
+
+        assert_eq!(
+            reverse["Leaf"],
+            vec!["Mid".to_string(), "Root".to_string()],
+            "Leaf is referenced from Mid directly and via containers; then Root transitively maps/results/tuples carry Leaf payloads; deduped sorted"
+        );
+
+        assert_eq!(reverse["Root"], vec!["U".to_string()]);
+
+        for (key, value) in &reverse {
+            let mut expected = value.clone();
+            expected.sort();
+            expected.dedup();
+            assert_eq!(
+                value, &expected,
+                "reverse edge list for '{key}' must be sorted and deduped for stable output"
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_graph_structured_metadata_is_required() {
+        // Negative control: a spec with actual dependencies must produce a
+        // non-trivial graph. If someone naively refactors get_udt_dependencies
+        // to always return HashSet::new(), this test fails alongside the
+        // others, catching an accidental graph-stripping regression.
+        let spec = build_graph_spec();
+        let mapper = LayoutMapper::new(&spec);
+
+        assert!(
+            !mapper.get_udt_dependencies(&udt("Root")).is_empty(),
+            "get_udt_dependencies(Root) must be non-empty — structured metadata is required"
+        );
+        assert!(
+            !mapper.get_udt_dependencies(&udt("U")).is_empty(),
+            "get_udt_dependencies(U) must be non-empty — union case payloads must contribute edges"
+        );
+        assert!(
+            !mapper.build_reverse_dependencies().is_empty(),
+            "build_reverse_dependencies() must produce entries — structured metadata is required"
+        );
+    }
+}

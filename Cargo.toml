@@ -35,10 +35,13 @@ ureq = { version = "2.9", features = ["json"] }
 
 # Watch mode
 notify = { version = "7.0", optional = true }
+# Unix SIGTERM handling for watch mode's clean shutdown path.
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
-# Property-based/fuzz testing for the decode + type-walk paths (see
-# tests/fuzz_walk.rs). Dev-only: it does not affect the shipped binary.
+# Property-based testing for the decode + type-walk paths (see
+# tests/diff_properties.rs and tests/fuzz_walk.rs). Dev-only: it does not
+# affect the shipped binary.
 proptest = "1"
 public-api = "0.52.1"
 rustdoc-json = "0.9.10"
@@ -46,5 +49,5 @@ rustup-toolchain = "0.1.10"
 
 [features]
 default = ["unstable"]
-watch = ["notify"]
+watch = ["notify", "libc"]
 unstable = []
