@@ -210,6 +210,13 @@ fn fetch_wasm_from_rpc_inner(
     rpc_url: &str,
     auth: Option<&RpcClientConfig>,
 ) -> Result<WasmModule, Error> {
+    // `config.url` (when `auth` is set) is already normalized by
+    // `RpcClientConfig::new`; normalizing again here is a no-op for it and
+    // ensures the bare (no-config) call path gets the same treatment, so
+    // provenance and request construction always see the same canonical URL.
+    let rpc_url = crate::rpc::normalize_url(rpc_url)?;
+    let rpc_url = rpc_url.as_str();
+
     let max_retries = auth
         .map(|c| c.max_snapshot_retries)
         .unwrap_or(crate::rpc::DEFAULT_MAX_SNAPSHOT_RETRIES);
@@ -546,6 +553,11 @@ fn fetch_instance_storage_from_rpc_with_provenance_inner(
     rpc_url: &str,
     auth: Option<&RpcClientConfig>,
 ) -> Result<(Vec<ContractDataEntry>, crate::rpc::RpcProvenance), Error> {
+    // See the matching comment in `fetch_wasm_from_rpc_inner`: this keeps the
+    // bare and `RpcClientConfig`-backed call paths consistent.
+    let rpc_url = crate::rpc::normalize_url(rpc_url)?;
+    let rpc_url = rpc_url.as_str();
+
     let strkey =
         stellar_strkey::Strkey::from_string(contract_id).map_err(|e| Error::InvalidInput {
             details: format!("Invalid contract ID '{}': {}", contract_id, e),
