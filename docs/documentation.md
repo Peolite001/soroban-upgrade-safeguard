@@ -307,9 +307,10 @@ suppresses these lines entirely, on either stream.
 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>
 ```
 
-Every file in `<OLD_DIR>` whose extension case-insensitively matches `.wasm`
-is looked up by its exact filename in `<NEW_DIR>`, producing three kinds of
-outcome:
+Files are matched by exact filename, with the `.wasm` extension compared
+case-insensitively. Both directories are enumerated, so an artifact on either
+side without a counterpart on the other is accounted for, producing three kinds
+of outcome:
 
 - **Matched** (same filename present in both directories): the pair is
   compared exactly like a two-build comparison and folded into the batch
@@ -320,12 +321,20 @@ outcome:
   This is not merely a warning: it unconditionally sets the batch's overall
   verdict to unsafe (non-zero exit), the same as any other Critical finding,
   regardless of `--strict`.
-- **New-only** (present in `<NEW_DIR>` only): directory scan only enumerates
-  `<OLD_DIR>` to find contracts to pair, so a file that exists solely in
-  `<NEW_DIR>` is not currently detected — it produces no pair, no finding,
-  and no warning, and is silently excluded from the batch. If you need every
-  newly added artifact accounted for explicitly, list pairs in a
-  [manifest](batch_manifests.md) instead.
+- **New-only** (present in `<NEW_DIR>` only): reported as a warning naming each
+  unmatched file, but never treated as a comparison pair. There is no old build
+  to judge it against, so it produces no findings, takes no slot in the batch
+  counter, and cannot move the verdict or the exit code. The warning exists
+  because the tool cannot tell an intentionally added contract from a rename
+  applied to only one side, and the second case would otherwise ship a contract
+  nobody checked. It is written to stderr as a diagnostic rather than as
+  progress output, so `--quiet` does not suppress it. If you want every added
+  artifact accounted for as an explicit, verifiable pair instead, list pairs in
+  a [manifest](batch_manifests.md).
+
+  When `<OLD_DIR>` holds no `.wasm` files at all but `<NEW_DIR>` does, the run
+  fails with an error that says so and points at reversed `--old-dir`/`--new-dir`
+  arguments, which is overwhelmingly the cause.
 
 ### Local file inputs
 

@@ -174,6 +174,35 @@ The tool auto-loads `.safeguard.toml` from the current directory, or use
 and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
 
+#### Ignoring configuration entirely
+
+Config is discovered automatically, from several places in turn: `--config`,
+then the `SOROBAN_SAFEGUARD_CONFIG` environment variable, then a
+`.safeguard.toml` in the current directory, then — with `--search-parent-config`
+— an ancestor directory. In batch mode a manifest may name one too.
+
+`--no-config` turns all of that off and runs with no suppressions at all. It is
+an escape hatch, not another layer in the chain: it outranks every source above,
+the manifest included, so nothing in the environment or the working tree can
+quietly re-enable a suppression.
+
+```bash
+# Judge the upgrade on the tool's own rules, ignoring any ambient .safeguard.toml
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --no-config
+```
+
+That makes it the flag to reach for when a run has to be reproducible or
+self-contained — verifying what a report would look like with nothing
+acknowledged, reproducing a CI result on a developer machine that has its own
+`.safeguard.toml`, or auditing whether a gate passes on its merits rather than
+on its suppressions.
+
+`--no-config` and `--config <PATH>` are **mutually exclusive**: passing both is
+rejected as a command-line error rather than resolved by precedence, since one
+asks for a specific config and the other for none, and guessing which was meant
+is exactly the wrong behavior for a safety gate. `--search-parent-config` is
+rejected alongside `--no-config` for the same reason. To run against a known
+config instead of the ambient one, pass `--config <PATH>` on its own.
 ### Output format
 
 By default, and whenever `--format` is omitted, the report prints as
@@ -206,6 +235,32 @@ soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
   --format text \
   --output json:ci-report.json
 ```
+
+### Quiet output
+
+`--quiet` suppresses everything the tool narrates *about* the run: the banner and
+separator lines, the per-file loading and spec-summary lines, config-discovery
+notes, batch pair headers, and the `report written to <path>` confirmations.
+
+It does not remove anything from the report. Every format you selected is still
+produced in full, with the same findings, to the same destination. The verdict
+and the exit code are also unchanged — `--quiet` only decides what gets narrated,
+never what gets analyzed, reported, or gated on.
+
+```bash
+# CI: only the JSON report reaches the log, with no surrounding progress text
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --format json --quiet
+
+# Still exits non-zero on breaking changes, so this remains a working gate
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --quiet --output json:report.json || echo "upgrade rejected"
+```
+
+Note that progress output already avoids stdout whenever stdout carries a
+machine-readable report — with `--format json` it is written to stderr instead.
+`--quiet` goes further and silences it on both streams, which is what you want
+when a CI log should contain the report and nothing else.
 
 ### Watch mode
 
@@ -257,6 +312,38 @@ To see exactly where each value came from without running any comparison:
 ```bash
 soroban-upgrade-safeguard --manifest release.toml --explain-manifest
 ```
+
+#### Naming each pair
+
+`name` gives a pair a stable identity in the results. It is optional — when
+omitted, a pair is identified by the file name of its `new` build, so
+`token_v2.wasm` reports as `token_v2.wasm`:
+
+```toml
+[[pairs]]
+old  = "token_v1.wasm"
+new  = "token_v2.wasm"
+name = "token"
+```
+
+That name is what every batch output keys off:
+
+- the summary line and the `=== Contract: token ===` detail heading in text output;
+- the summary table row and the `## Details: token` heading in Markdown;
+- the `results[].name` field in JSON;
+- the `::group::token` log group in GitHub Actions output;
+- the file name written under `--per-contract-output-dir`.
+
+It also identifies a pair that *fails*: a pair whose comparison errors is
+reported under its name rather than a path, so the failing entry is
+recognisable at a glance. Because identity has to be unambiguous, two pairs
+resolving to the same name is a hard error, raised before any comparison runs
+and naming both manifests involved — which is the usual reason to set `name`
+explicitly, since two teams' `v2.wasm` files would otherwise collide.
+
+For a stable identifier meant for tooling rather than people — one that survives
+a name being reworded — use the separate [`id`](docs/batch_manifests.md#pair-ids)
+field.
 
 See [Batch Manifests](docs/batch_manifests.md) for the full schema, includes,
 schema coverage rules, path rules, and JSON provenance.
