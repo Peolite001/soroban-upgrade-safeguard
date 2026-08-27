@@ -262,6 +262,71 @@ match the CLI help output (`--help`) and the `override_usage` in `src/main.rs`.
 
 Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)), and `--no-symlinks` for local paths (see [Local file inputs](#local-file-inputs)).
 
+### Report output destinations
+
+By default a report is printed to stdout in the format chosen by `--format`
+(`text` if `--format` is omitted). `--output` adds an explicit destination and
+can be repeated to emit the same report as several formats/files in one run
+(see [Multiple output formats](../README.md#multiple-output-formats) for
+worked examples):
+
+```bash
+# stdout only, text (the default — no --output needed)
+soroban-upgrade-safeguard old.wasm new.wasm
+
+# format-only destination: still stdout, just a different format
+soroban-upgrade-safeguard old.wasm new.wasm --output json
+
+# FORMAT:PATH: write that format to a file instead of stdout
+soroban-upgrade-safeguard old.wasm new.wasm --output json:report.json
+
+# repeat --output for multiple destinations in one run
+soroban-upgrade-safeguard old.wasm new.wasm \
+  --output json:report.json \
+  --output markdown:report.md
+```
+
+A bare path passed to `--output` (no `FORMAT:` prefix, e.g. `--output
+report.txt`) is a file destination whose format comes from `--format`,
+falling back to `text` if `--format` is also omitted. Any parent directories
+in an `--output` file path that don't already exist are created
+automatically.
+
+Decorative and progress lines (headers, per-file "report written to ..."
+notices, suppression-config diagnostics) are ordinarily printed to stdout
+alongside a `text` report. But whenever stdout would otherwise carry a clean,
+parseable document — because the stdout format is `json`, `markdown`, or
+`github-actions`, or because any `--output` targets a file in addition to
+stdout — progress lines are written to stderr instead, so stdout stays safe
+to pipe or redirect into a file without decorative noise mixed in. `--quiet`
+suppresses these lines entirely, on either stream.
+
+### Directory scan
+
+```bash
+soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>
+```
+
+Every file in `<OLD_DIR>` whose extension case-insensitively matches `.wasm`
+is looked up by its exact filename in `<NEW_DIR>`, producing three kinds of
+outcome:
+
+- **Matched** (same filename present in both directories): the pair is
+  compared exactly like a two-build comparison and folded into the batch
+  results.
+- **Old-only** (present in `<OLD_DIR>`, missing from `<NEW_DIR>`): recorded as
+  a Critical `contract-missing-from-new` finding — removing a deployed
+  contract from the new build would break every client that depends on it.
+  This is not merely a warning: it unconditionally sets the batch's overall
+  verdict to unsafe (non-zero exit), the same as any other Critical finding,
+  regardless of `--strict`.
+- **New-only** (present in `<NEW_DIR>` only): directory scan only enumerates
+  `<OLD_DIR>` to find contracts to pair, so a file that exists solely in
+  `<NEW_DIR>` is not currently detected — it produces no pair, no finding,
+  and no warning, and is silently excluded from the batch. If you need every
+  newly added artifact accounted for explicitly, list pairs in a
+  [manifest](batch_manifests.md) instead.
+
 ### Local file inputs
 
 A local WASM path is followed transparently whether it is a direct file or a
@@ -329,6 +394,29 @@ report; a diagnostic message for a problem with the path itself (a missing
 file, an unreadable manifest, a broken symlink) still shows the path exactly
 as given, unmodified, since that is what the reader needs to locate the real
 file on their own filesystem.
+
+### Hash-only extraction
+
+```bash
+soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only
+```
+
+`extract --hash-only` prints nothing but the interface hash — no surrounding
+JSON report document, just the bare hex digest on its own line. The digest is
+the same order-independent SHA-256 the tool uses everywhere else (lockfiles,
+`--interface-lockfile` checks): it covers the analyzed WASM's exported
+interface — its functions and user-defined types — not the raw WASM bytes,
+so two builds that differ only in compiler version, doc comments, or section
+ordering still hash identically. See [Interface Hash](../src/interface_hash.rs)
+for exactly what is and is not covered.
+
+Because the output is a single line with nothing else on stdout, it's suited
+to capturing directly in a script — for a cache key, or a cheap "did the
+interface change?" check without running a full comparison:
+
+```bash
+hash="$(soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only)"
+```
 
 ### Interface lockfiles
 
@@ -1156,6 +1244,28 @@ For the full field-level compatibility contract — which fields are stable,
 additive, conditional, or deprecated, how to handle unknown fields, and how to
 handle unsupported future versions — see the
 [Report Schema Compatibility Policy](report_schema_compatibility.md).
+
+### Rendering a saved report
+
+`render` turns a previously saved JSON report back into a human-readable
+document, without needing the original WASM files. It accepts a report in
+either of two forms — a path to a saved JSON file, or `-` to read the JSON
+from stdin:
+
+```bash
+# From a saved file
+soroban-upgrade-safeguard render report.json --format markdown
+
+# From stdin, piped straight from a comparison run
+soroban-upgrade-safeguard ./old.wasm ./new.wasm --format json \
+  | soroban-upgrade-safeguard render - --format text
+```
+
+Any argument other than `-` is read as a file path. The only supported
+target formats are `text` (the default, colored human-readable output) and
+`markdown` (suitable for PR descriptions and comments) — `json` is not a
+valid `--format` for `render`, since re-rendering a saved JSON document as
+JSON would just be a no-op copy.
 
 ### Upgrading an older saved report
 
