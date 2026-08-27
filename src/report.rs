@@ -1125,6 +1125,10 @@ impl SafetyReport {
                 network: self.rpc_provenance.as_ref().map(|p| p.network.clone()),
                 rpc_endpoint: self.rpc_provenance.as_ref().map(|p| p.rpc_endpoint.clone()),
                 code_hash: self.rpc_provenance.as_ref().map(|p| p.code_hash.clone()),
+                live_until_ledger_seq: self
+                    .rpc_provenance
+                    .as_ref()
+                    .and_then(|p| p.live_until_ledger_seq),
             },
             is_safe: self.is_safe,
             strict: self.strict,

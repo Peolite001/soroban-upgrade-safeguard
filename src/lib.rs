@@ -101,6 +101,11 @@ pub mod parser;
 mod parser;
 
 #[cfg(feature = "unstable")]
+pub mod preflight;
+#[cfg(not(feature = "unstable"))]
+mod preflight;
+
+#[cfg(feature = "unstable")]
 pub mod profile;
 #[cfg(not(feature = "unstable"))]
 mod profile;

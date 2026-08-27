@@ -61,6 +61,7 @@ Every field and enum value in the JSON output is classified as one of:
 | `provenance.network` | `string` | absent | Set only in RPC mode. |
 | `provenance.rpc_endpoint` | `string` | absent | Sanitized URL. Set only in RPC mode. |
 | `provenance.code_hash` | `string` | absent | SHA-256 hex of fetched WASM. Set only in RPC mode. |
+| `provenance.live_until_ledger_seq` | `integer` | absent | Ledger sequence until which the sampled ledger entry is live (`liveUntilLedgerSeq`). Set only in RPC mode, and only when the endpoint reported a TTL for the sampled entry. |
 | `scope` | `object` | `{}` | Analysis scope summary (what dimensions were checked). |
 | `storage_coverage` | `string` | `""` | Human-readable storage coverage description. |
 | `old_interface_hash` | `string` | absent | Hex interface hash of the old build. |

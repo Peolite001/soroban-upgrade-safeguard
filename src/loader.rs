@@ -192,6 +192,54 @@ pub fn extract_latest_ledger(response: &serde_json::Value) -> Option<u64> {
     }
 }
 
+/// Extract the `liveUntilLedgerSeq` expiration field from a single
+/// `getLedgerEntries` JSON-RPC entry, if present.
+///
+/// Entries with no TTL (e.g. entry types Stellar RPC never assigns
+/// expiration to) simply omit the field, and a value in an unexpected shape
+/// is treated the same as absent: expiration is supplementary durability
+/// context for the reader, not something that should turn otherwise valid
+/// ledger data into a hard failure.
+pub fn extract_entry_expiration(entry: &serde_json::Value) -> Option<u64> {
+    let val = entry.get("liveUntilLedgerSeq")?;
+    if let Some(n) = val.as_u64() {
+        Some(n)
+    } else if let Some(s) = val.as_str() {
+        s.parse::<u64>().ok()
+    } else {
+        None
+    }
+}
+
+/// Returns `true` if `content_type` (the raw `Content-Type` header value, or
+/// `None` if the header was absent) is compatible with a JSON-RPC response
+/// body.
+///
+/// A missing header is accepted leniently, since some RPC providers omit
+/// `Content-Type` entirely despite returning a valid JSON body. Standard
+/// (`application/json`) and vendor-specific (`application/vnd.api+json`,
+/// etc. — anything using the `+json` structured syntax suffix) JSON types
+/// are accepted case-insensitively and regardless of a trailing parameter
+/// such as `; charset=utf-8`. Anything else (HTML, XML, binary payloads,
+/// plain text, ...) is rejected so a misconfigured endpoint or proxy
+/// produces a clear error instead of an opaque JSON parse failure.
+fn is_json_content_type(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return true;
+    };
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    matches!(
+        media_type.as_str(),
+        "application/json" | "text/json" | "application/json-rpc" | "application/x-json"
+    ) || media_type.ends_with("+json")
+}
+
 /// Query the Stellar network passphrase from the RPC endpoint, returning a fallback if unavailable.
 fn query_network_passphrase(rpc_url: &str, auth: Option<&RpcClientConfig>) -> String {
     if let Ok(response) = query_rpc(rpc_url, auth, "getNetwork", serde_json::json!({})) {
@@ -277,6 +325,8 @@ fn fetch_wasm_from_rpc_inner(
                 message: format!("Contract '{}' not found on-chain", contract_id),
             });
         }
+
+        let instance_expiration = extract_entry_expiration(&entries[0]);
 
         let entry_xdr_b64 = entries[0]["xdr"]
             .as_str()
@@ -452,6 +502,7 @@ fn fetch_wasm_from_rpc_inner(
             network,
             rpc_endpoint: crate::rpc::redact_url(rpc_url),
             code_hash: hex::encode(wasm_hash.0),
+            live_until_ledger_seq: instance_expiration,
         };
 
         return Ok(WasmModule {
@@ -463,6 +514,37 @@ fn fetch_wasm_from_rpc_inner(
     }
 }
 
+/// Deterministic (never random) JSON-RPC request ID sent with every request,
+/// so the response can be verified to actually answer it.
+const JSON_RPC_REQUEST_ID: i64 = 1;
+
+/// Verify that a JSON-RPC response's `id` matches the `id` sent with the
+/// request. A proxy or misconfigured endpoint can return a valid-looking
+/// response that actually answers a different request; this is the only way
+/// to catch that.
+fn validate_response_id(
+    response: &serde_json::Value,
+    expected_id: i64,
+    rpc_url: &str,
+) -> Result<(), Error> {
+    match response.get("id") {
+        Some(val) if val.as_i64() == Some(expected_id) => Ok(()),
+        Some(val) => Err(Error::RpcIdMismatch {
+            rpc_url: crate::rpc::redact_url(rpc_url),
+            expected_id,
+            received_id: Some(match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            }),
+        }),
+        None => Err(Error::RpcIdMismatch {
+            rpc_url: crate::rpc::redact_url(rpc_url),
+            expected_id,
+            received_id: None,
+        }),
+    }
+}
+
 /// Helper to execute JSON-RPC request to Stellar RPC.
 fn query_rpc(
     rpc_url: &str,
@@ -470,9 +552,10 @@ fn query_rpc(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
+    let request_id = JSON_RPC_REQUEST_ID;
     let payload = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": 1,
+        "id": request_id,
         "method": method,
         "params": params
     });
@@ -488,19 +571,34 @@ fn query_rpc(
     for (name, value) in &headers.values {
         request = request.set(name, value);
     }
-    let response: serde_json::Value = request
-        .send_json(payload)
-        .map_err(|e| Error::RpcTransport {
+    let response = request.send_json(payload).map_err(|e| Error::RpcTransport {
+        rpc_url: crate::rpc::redact_url(rpc_url),
+        details: format!("RPC request failed ({:?})", e.kind()),
+        source: None,
+    })?;
+
+    let content_type = response.header("Content-Type").map(str::to_string);
+    if !is_json_content_type(content_type.as_deref()) {
+        return Err(Error::RpcTransport {
             rpc_url: crate::rpc::redact_url(rpc_url),
-            details: format!("RPC request failed ({:?})", e.kind()),
+            details: format!(
+                "endpoint returned unsupported Content-Type '{}'; expected a JSON content type",
+                content_type.as_deref().unwrap_or("<none>")
+            ),
             source: None,
-        })?
-        .into_json()
-        .map_err(|_e| Error::RpcTransport {
-            rpc_url: crate::rpc::redact_url(rpc_url),
-            details: "Failed to parse RPC response body".to_string(),
-            source: None,
-        })?;
+        });
+    }
+
+    let response: serde_json::Value = response.into_json().map_err(|_e| Error::RpcTransport {
+        rpc_url: crate::rpc::redact_url(rpc_url),
+        details: "Failed to parse RPC response body".to_string(),
+        source: None,
+    })?;
+
+    let allow_id_mismatch = auth.map(|c| c.allow_id_mismatch).unwrap_or(false);
+    if !allow_id_mismatch {
+        validate_response_id(&response, request_id, rpc_url)?;
+    }
 
     if let Some(err) = response.get("error") {
         let msg = err["message"].as_str().unwrap_or("Unknown RPC error");
@@ -612,6 +710,8 @@ fn fetch_instance_storage_from_rpc_with_provenance_inner(
         });
     }
 
+    let instance_expiration = extract_entry_expiration(&entries[0]);
+
     let entry_xdr_b64 = entries[0]["xdr"]
         .as_str()
         .ok_or_else(|| Error::RpcProtocol {
@@ -678,6 +778,96 @@ fn fetch_instance_storage_from_rpc_with_provenance_inner(
             network,
             rpc_endpoint: crate::rpc::redact_url(rpc_url),
             code_hash: String::new(),
+            live_until_ledger_seq: instance_expiration,
         },
     ))
+}
+
+#[cfg(test)]
+mod expiration_tests {
+    use super::extract_entry_expiration;
+
+    #[test]
+    fn extracts_numeric_expiration() {
+        let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": 555555 });
+        assert_eq!(extract_entry_expiration(&entry), Some(555555));
+    }
+
+    #[test]
+    fn extracts_string_encoded_expiration() {
+        let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": "400000" });
+        assert_eq!(extract_entry_expiration(&entry), Some(400000));
+    }
+
+    #[test]
+    fn missing_field_returns_none() {
+        let entry = serde_json::json!({ "xdr": "ignored" });
+        assert_eq!(extract_entry_expiration(&entry), None);
+    }
+
+    #[test]
+    fn malformed_field_returns_none_without_error() {
+        let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": { "nested": true } });
+        assert_eq!(extract_entry_expiration(&entry), None);
+
+        let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": "not-a-number" });
+        assert_eq!(extract_entry_expiration(&entry), None);
+
+        let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": null });
+        assert_eq!(extract_entry_expiration(&entry), None);
+    }
+}
+
+#[cfg(test)]
+mod content_type_tests {
+    use super::is_json_content_type;
+
+    #[test]
+    fn accepts_standard_json() {
+        assert!(is_json_content_type(Some("application/json")));
+    }
+
+    #[test]
+    fn accepts_standard_json_case_insensitively() {
+        assert!(is_json_content_type(Some("APPLICATION/JSON")));
+        assert!(is_json_content_type(Some("Application/Json")));
+    }
+
+    #[test]
+    fn accepts_json_with_charset_parameter() {
+        assert!(is_json_content_type(Some("application/json; charset=utf-8")));
+        assert!(is_json_content_type(Some(
+            "application/json;charset=UTF-8"
+        )));
+    }
+
+    #[test]
+    fn accepts_vendor_json_content_types() {
+        assert!(is_json_content_type(Some("application/vnd.api+json")));
+        assert!(is_json_content_type(Some("application/hal+json")));
+        assert!(is_json_content_type(Some(
+            "application/vnd.custom+json; charset=utf-8"
+        )));
+        assert!(is_json_content_type(Some("text/json")));
+        assert!(is_json_content_type(Some("application/json-rpc")));
+    }
+
+    #[test]
+    fn accepts_missing_content_type() {
+        assert!(is_json_content_type(None));
+    }
+
+    #[test]
+    fn rejects_html() {
+        assert!(!is_json_content_type(Some("text/html")));
+        assert!(!is_json_content_type(Some("text/html; charset=utf-8")));
+    }
+
+    #[test]
+    fn rejects_binary_and_other_incompatible_types() {
+        assert!(!is_json_content_type(Some("application/octet-stream")));
+        assert!(!is_json_content_type(Some("image/png")));
+        assert!(!is_json_content_type(Some("application/xml")));
+        assert!(!is_json_content_type(Some("text/plain")));
+    }
 }

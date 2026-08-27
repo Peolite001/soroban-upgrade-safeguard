@@ -16,7 +16,7 @@ use soroban_upgrade_safeguard::{
     color::{should_disable_color, ColorMode},
     diff, loader, manifest, migration,
     oci::{self, OciArtifactKind, OciFetchConfig, OciReference},
-    parser,
+    parser, preflight,
     remote::{self, RemoteFetchConfig, RemoteRef},
     render::RenderableReport,
     report,
@@ -227,7 +227,8 @@ enum RenderFormat {
                       soroban-upgrade-safeguard lockfile <WASM> --output <PATH> [OPTIONS]\n       \
                       soroban-upgrade-safeguard render <REPORT_JSON> [OPTIONS]\n       \
                       soroban-upgrade-safeguard init [OPTIONS]\n       \
-                      soroban-upgrade-safeguard stream [OPTIONS]",
+                      soroban-upgrade-safeguard stream [OPTIONS]\n       \
+                      soroban-upgrade-safeguard preflight --rpc-url <URL> [OPTIONS]",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
 )]
@@ -261,6 +262,12 @@ struct Args {
     /// RPC headers as NAME=ENV_VAR. The secret is read only from the environment.
     #[arg(long = "rpc-header", value_name = "NAME=ENV_VAR")]
     rpc_headers: Vec<String>,
+
+    /// Accept a JSON-RPC response whose `id` is missing or does not match
+    /// the request's `id`. Off by default; only use this for a provider
+    /// known not to echo request IDs correctly.
+    #[arg(long)]
+    rpc_allow_id_mismatch: bool,
 
     /// Path to a suppression config acknowledging known, intentional breaking
     /// changes. When omitted, falls back to the SOROBAN_SAFEGUARD_CONFIG
@@ -509,6 +516,8 @@ enum Command {
     VerifyAttestation(VerifyAttestationArgs),
     /// Streaming JSON Lines batch mode: one job per line on stdin, one result per line on stdout
     Stream(StreamArgs),
+    /// Validate RPC connectivity and JSON-RPC protocol shape without fetching contract code
+    Preflight(PreflightArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -682,6 +691,30 @@ struct InitArgs {
     rpc_headers: Vec<String>,
 }
 
+/// `preflight`: validate RPC connectivity and protocol shape only.
+#[derive(ClapArgs, Debug)]
+struct PreflightArgs {
+    /// Stellar RPC URL (e.g. https://soroban-testnet.stellar.org)
+    #[arg(long, value_name = "RPC_URL", required = true)]
+    rpc_url: String,
+
+    /// RPC headers as NAME=ENV_VAR. The secret is read only from the environment.
+    #[arg(long = "rpc-header", value_name = "NAME=ENV_VAR")]
+    rpc_headers: Vec<String>,
+
+    /// Timeout, in seconds, for the preflight request.
+    #[arg(long, value_name = "SECONDS", default_value_t = preflight::DEFAULT_PREFLIGHT_TIMEOUT.as_secs())]
+    timeout_secs: u64,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+
+    /// Do not color output
+    #[arg(long)]
+    no_color: bool,
+}
+
 fn rpc_config(url: &str, headers: &[String]) -> Result<RpcClientConfig> {
     let mut config = RpcClientConfig::new(url.to_string()).map_err(|e| anyhow::anyhow!(e))?;
     for spec in headers {
@@ -739,6 +772,97 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
     let extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
     println!("{}", serde_json::to_string_pretty(&extracted)?);
     Ok(())
+}
+
+/// Validate RPC connectivity and JSON-RPC protocol shape without fetching
+/// any contract code. See [`preflight::run_preflight_with_timeout`] for the
+/// exact checks performed.
+fn run_preflight(args: &PreflightArgs) -> Result<()> {
+    if should_disable_color(
+        args.no_color,
+        ColorMode::Auto,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    ) {
+        colored::control::set_override(false);
+    }
+
+    let config = rpc_config(&args.rpc_url, &args.rpc_headers)?;
+    let report =
+        preflight::run_preflight_with_timeout(&config, Duration::from_secs(args.timeout_secs));
+
+    if args.format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Preflight check: {}", report.rpc_endpoint);
+        println!();
+
+        let transport_detail = if report.transport.success {
+            Some(format!(
+                "HTTP {}",
+                report.transport.status_code.unwrap_or_default()
+            ))
+        } else {
+            report.transport.error.clone()
+        };
+        print_preflight_line("Transport", report.transport.success, transport_detail);
+
+        let protocol_detail = if report.protocol.success {
+            Some(format!(
+                "jsonrpc {}, id matches",
+                report.protocol.jsonrpc_version.as_deref().unwrap_or("?")
+            ))
+        } else {
+            report.protocol.error.clone()
+        };
+        print_preflight_line("Protocol", report.protocol.success, protocol_detail);
+
+        let capability_detail = if report.capability.success {
+            Some(match report.capability.latest_ledger {
+                Some(seq) => format!(
+                    "{} succeeded (latestLedger {seq})",
+                    report.capability.method
+                ),
+                None => format!("{} succeeded", report.capability.method),
+            })
+        } else {
+            report.capability.error.clone()
+        };
+        print_preflight_line("Capability", report.capability.success, capability_detail);
+
+        println!();
+        println!(
+            "Overall: {}",
+            if report.all_passed() {
+                "PASS".green().bold()
+            } else {
+                "FAIL".red().bold()
+            }
+        );
+        println!();
+        println!(
+            "Note: a passing preflight check confirms endpoint connectivity only. \
+             It does not verify that any specific contract or network is compatible."
+        );
+    }
+
+    std::io::stdout().flush().ok();
+    if !report.all_passed() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn print_preflight_line(label: &str, success: bool, detail: Option<String>) {
+    let status = if success {
+        "PASS".green()
+    } else {
+        "FAIL".red()
+    };
+    match detail {
+        Some(detail) => println!("{label:<12}{status}  {detail}"),
+        None => println!("{label:<12}{status}"),
+    }
 }
 
 /// Extract one build and write its exported interface as a lockfile.
@@ -1353,6 +1477,7 @@ fn main() -> Result<()> {
             return run_verify_attestation(verify_args)
         }
         Some(Command::Stream(stream_args)) => return run_stream(stream_args),
+        Some(Command::Preflight(preflight_args)) => return run_preflight(preflight_args),
         None => {}
     }
 
@@ -1738,6 +1863,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                                 contract_id: None,
                                 rpc_url: None,
                                 rpc_headers: &args.rpc_headers,
+                                rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
                                 lineage_store: None,
                             },
                             progress,
@@ -2542,7 +2668,8 @@ fn run_single(
                 let rpc_url = args.rpc_url.as_ref().unwrap();
                 loader::fetch_wasm_from_rpc_with_config(
                     contract_id,
-                    &rpc_config(rpc_url, &args.rpc_headers)?,
+                    &rpc_config(rpc_url, &args.rpc_headers)?
+                        .with_id_mismatch_allowed(args.rpc_allow_id_mismatch),
                 )?
             } else {
                 load_wasm_input(&args.wasm_paths[0], &remote_config, &oci_config, progress)?
@@ -2562,6 +2689,7 @@ fn run_single(
                     contract_id: old_source,
                     rpc_url: args.rpc_url.as_deref(),
                     rpc_headers: &args.rpc_headers,
+                    rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
                     lineage_store: store_opt.as_ref(),
                 },
                 progress,
@@ -3128,6 +3256,7 @@ struct ContractComparison<'a> {
     contract_id: Option<&'a str>,
     rpc_url: Option<&'a str>,
     rpc_headers: &'a [String],
+    rpc_allow_id_mismatch: bool,
     lineage_store: Option<&'a soroban_upgrade_safeguard::lineage::LineageStore>,
 }
 
@@ -3184,6 +3313,7 @@ fn compare_contracts(
         contract_id,
         rpc_url,
         rpc_headers,
+        rpc_allow_id_mismatch,
         lineage_store,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
@@ -3276,6 +3406,7 @@ fn compare_contracts(
         } else if let (Some(cid), Some(rpc)) = (contract_id, rpc_url) {
             progress("🌐 Fetching contract instance storage from RPC...".to_string());
             match rpc_config(rpc, rpc_headers).and_then(|config| {
+                let config = config.with_id_mismatch_allowed(*rpc_allow_id_mismatch);
                 loader::fetch_instance_storage_from_rpc_with_provenance(cid, &config)
                     .map_err(|e| anyhow::anyhow!(e))
             }) {
@@ -3296,6 +3427,19 @@ fn compare_contracts(
                         loaded.len()
                     ));
                     entries = loaded;
+                    // Surface the sampled entry's durability (expiration) in
+                    // the report even when contract/code provenance was
+                    // never separately captured, without clobbering a
+                    // code_hash the code-fetch path may have already set.
+                    match report.rpc_provenance.as_mut() {
+                        Some(existing) => {
+                            existing.live_until_ledger_seq =
+                                storage_provenance.live_until_ledger_seq;
+                        }
+                        None => {
+                            report.rpc_provenance = Some(storage_provenance);
+                        }
+                    }
                 }
                 Err(e) => {
                     progress(format!(

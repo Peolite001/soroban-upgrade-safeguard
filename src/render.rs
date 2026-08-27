@@ -52,6 +52,11 @@ pub struct Provenance {
     /// On-chain code hash (if fetched via RPC).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_hash: Option<String>,
+    /// Ledger sequence until which the sampled ledger entry is live
+    /// (`liveUntilLedgerSeq`), if the RPC reported one. Absent when the
+    /// entry has no TTL or the endpoint did not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_until_ledger_seq: Option<u64>,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -241,6 +246,9 @@ impl RenderableReport {
         if let Some(ref hash) = self.provenance.code_hash {
             block.push_str(&format!("CodeHash: {hash}\n").dimmed());
         }
+        if let Some(seq) = self.provenance.live_until_ledger_seq {
+            block.push_str(&format!("LiveUntil: ledger {seq}\n").dimmed());
+        }
         block.push_str(
             &"────────────────────────────────────────\n"
                 .dimmed()
@@ -280,6 +288,9 @@ impl RenderableReport {
         }
         if let Some(ref hash) = self.provenance.code_hash {
             block.push_str(&format!("- **Code Hash**: `{hash}`\n"));
+        }
+        if let Some(seq) = self.provenance.live_until_ledger_seq {
+            block.push_str(&format!("- **Live Until Ledger**: `{seq}`\n"));
         }
         block.push('\n');
         block

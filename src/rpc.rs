@@ -20,13 +20,20 @@ const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// or not. Centralized so timeout/redirect hardening can't silently regress
 /// on one call path while being applied to another.
 pub(crate) fn default_agent() -> Agent {
+    agent_with_timeout(RPC_REQUEST_TIMEOUT)
+}
+
+/// Build an RPC agent with an explicit request timeout, sharing the same
+/// redirect hardening as [`default_agent`]. Used by callers (like the
+/// preflight check) that need a shorter timeout than the production default.
+pub(crate) fn agent_with_timeout(timeout: Duration) -> Agent {
     AgentBuilder::new()
         // Reject redirects entirely. `ureq` only strips the standard
         // Authorization header; provider-specific API-key headers would
         // otherwise be forwarded to the redirected origin.
         .redirects(0)
         .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
-        .timeout(RPC_REQUEST_TIMEOUT)
+        .timeout(timeout)
         .build()
 }
 
@@ -59,6 +66,12 @@ pub struct RpcProvenance {
     pub rpc_endpoint: String,
     /// Lowercase hex SHA-256 hash of the contract's WASM code.
     pub code_hash: String,
+    /// Ledger sequence until which the sampled ledger entry is live
+    /// (`liveUntilLedgerSeq`), if the RPC reported one. `None` means either
+    /// the entry has no TTL or the endpoint did not report it; it is not an
+    /// error condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_until_ledger_seq: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -66,6 +79,12 @@ pub struct RpcClientConfig {
     pub url: String,
     pub headers: Vec<RpcHeader>,
     pub max_snapshot_retries: u32,
+    /// When `true`, a JSON-RPC response whose `id` is missing or does not
+    /// match the request's `id` is accepted instead of rejected. Off by
+    /// default; only turn this on for a provider that is known not to echo
+    /// request IDs correctly, since it weakens protection against a proxy
+    /// or misconfigured endpoint returning a response for the wrong request.
+    pub allow_id_mismatch: bool,
 }
 
 impl Default for RpcClientConfig {
@@ -74,6 +93,7 @@ impl Default for RpcClientConfig {
             url: String::new(),
             headers: Vec::new(),
             max_snapshot_retries: DEFAULT_MAX_SNAPSHOT_RETRIES,
+            allow_id_mismatch: false,
         }
     }
 }
@@ -84,6 +104,7 @@ impl fmt::Debug for RpcClientConfig {
             .field("url", &redact_url(&self.url))
             .field("headers", &self.headers)
             .field("max_snapshot_retries", &self.max_snapshot_retries)
+            .field("allow_id_mismatch", &self.allow_id_mismatch)
             .finish()
     }
 }
@@ -95,12 +116,21 @@ impl RpcClientConfig {
             url,
             headers: Vec::new(),
             max_snapshot_retries: DEFAULT_MAX_SNAPSHOT_RETRIES,
+            allow_id_mismatch: false,
         })
     }
 
     /// Configure maximum retries for snapshot consistency failures.
     pub fn with_max_retries(mut self, retries: u32) -> Self {
         self.max_snapshot_retries = retries;
+        self
+    }
+
+    /// Accept a JSON-RPC response whose `id` is missing or does not match
+    /// the request's `id`, for providers known not to echo it correctly.
+    /// Off by default; see [`RpcClientConfig::allow_id_mismatch`].
+    pub fn with_id_mismatch_allowed(mut self, allow: bool) -> Self {
+        self.allow_id_mismatch = allow;
         self
     }
 

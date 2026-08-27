@@ -24,6 +24,7 @@ pub enum ErrorKind {
     RemoteFetch,
     OciFetch,
     RpcSnapshotConsistency,
+    RpcIdMismatch,
 }
 
 /// The canonical error type for the soroban-upgrade-safeguard library.
@@ -50,6 +51,7 @@ pub enum ErrorKind {
 /// | [`LimitExceeded`](Error::LimitExceeded) | A resource limit (XDR depth, entry count, WASM size) was exceeded |
 /// | [`RemoteFetch`](Error::RemoteFetch) | Downloading a `https://` input artifact failed (transport, size, redirect, or transport-policy violation) |
 /// | [`OciFetch`](Error::OciFetch) | Resolving an `oci://` input artifact failed (manifest/blob transport, auth, or media-type selection) |
+/// | [`RpcIdMismatch`](Error::RpcIdMismatch) | A JSON-RPC response's `id` was missing or did not match the request's `id` |
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -133,6 +135,13 @@ pub enum Error {
         attempts: u32,
         observed_sequences: Vec<u64>,
     },
+    RpcIdMismatch {
+        rpc_url: String,
+        expected_id: i64,
+        /// Display form of the `id` actually received, or `None` if the
+        /// response omitted the field entirely.
+        received_id: Option<String>,
+    },
 }
 
 impl Error {
@@ -159,6 +168,7 @@ impl Error {
             Error::RemoteFetch { .. } => ErrorKind::RemoteFetch,
             Error::OciFetch { .. } => ErrorKind::OciFetch,
             Error::RpcSnapshotConsistency { .. } => ErrorKind::RpcSnapshotConsistency,
+            Error::RpcIdMismatch { .. } => ErrorKind::RpcIdMismatch,
         }
     }
 
@@ -320,6 +330,20 @@ impl fmt::Display for Error {
                     "RPC snapshot consistency failure for '{rpc_url}' after {attempts} attempts: {details}"
                 )
             }
+            Error::RpcIdMismatch {
+                rpc_url,
+                expected_id,
+                received_id,
+            } => match received_id {
+                Some(received) => write!(
+                    f,
+                    "RPC response ID mismatch from '{rpc_url}': expected '{expected_id}', received '{received}'"
+                ),
+                None => write!(
+                    f,
+                    "RPC response from '{rpc_url}' is missing its 'id' field (expected '{expected_id}')"
+                ),
+            },
         }
     }
 }
@@ -365,6 +389,7 @@ impl std::error::Error for Error {
                 .as_ref()
                 .map(|s| s.as_ref() as &dyn std::error::Error),
             Error::RpcSnapshotConsistency { .. } => None,
+            Error::RpcIdMismatch { .. } => None,
         }
     }
 }
