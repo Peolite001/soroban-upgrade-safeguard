@@ -149,6 +149,36 @@ The tool auto-loads `.safeguard.toml` from the current directory, or use
 and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
 
+#### Ignoring configuration entirely
+
+Config is discovered automatically, from several places in turn: `--config`,
+then the `SOROBAN_SAFEGUARD_CONFIG` environment variable, then a
+`.safeguard.toml` in the current directory, then — with `--search-parent-config`
+— an ancestor directory. In batch mode a manifest may name one too.
+
+`--no-config` turns all of that off and runs with no suppressions at all. It is
+an escape hatch, not another layer in the chain: it outranks every source above,
+the manifest included, so nothing in the environment or the working tree can
+quietly re-enable a suppression.
+
+```bash
+# Judge the upgrade on the tool's own rules, ignoring any ambient .safeguard.toml
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --no-config
+```
+
+That makes it the flag to reach for when a run has to be reproducible or
+self-contained — verifying what a report would look like with nothing
+acknowledged, reproducing a CI result on a developer machine that has its own
+`.safeguard.toml`, or auditing whether a gate passes on its merits rather than
+on its suppressions.
+
+`--no-config` and `--config <PATH>` are **mutually exclusive**: passing both is
+rejected as a command-line error rather than resolved by precedence, since one
+asks for a specific config and the other for none, and guessing which was meant
+is exactly the wrong behavior for a safety gate. `--search-parent-config` is
+rejected alongside `--no-config` for the same reason. To run against a known
+config instead of the ambient one, pass `--config <PATH>` on its own.
+
 ### Multiple output formats
 
 Emit the same report in several formats and destinations in a single run:
