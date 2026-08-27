@@ -245,6 +245,38 @@ To see exactly where each value came from without running any comparison:
 soroban-upgrade-safeguard --manifest release.toml --explain-manifest
 ```
 
+#### Naming each pair
+
+`name` gives a pair a stable identity in the results. It is optional — when
+omitted, a pair is identified by the file name of its `new` build, so
+`token_v2.wasm` reports as `token_v2.wasm`:
+
+```toml
+[[pairs]]
+old  = "token_v1.wasm"
+new  = "token_v2.wasm"
+name = "token"
+```
+
+That name is what every batch output keys off:
+
+- the summary line and the `=== Contract: token ===` detail heading in text output;
+- the summary table row and the `## Details: token` heading in Markdown;
+- the `results[].name` field in JSON;
+- the `::group::token` log group in GitHub Actions output;
+- the file name written under `--per-contract-output-dir`.
+
+It also identifies a pair that *fails*: a pair whose comparison errors is
+reported under its name rather than a path, so the failing entry is
+recognisable at a glance. Because identity has to be unambiguous, two pairs
+resolving to the same name is a hard error, raised before any comparison runs
+and naming both manifests involved — which is the usual reason to set `name`
+explicitly, since two teams' `v2.wasm` files would otherwise collide.
+
+For a stable identifier meant for tooling rather than people — one that survives
+a name being reworded — use the separate [`id`](docs/batch_manifests.md#pair-ids)
+field.
+
 See [Batch Manifests](docs/batch_manifests.md) for the full schema, includes,
 schema coverage rules, path rules, and JSON provenance.
 
