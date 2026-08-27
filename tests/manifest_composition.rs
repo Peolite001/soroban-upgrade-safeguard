@@ -2035,3 +2035,166 @@ fn unlabeled_pairs_are_unaffected_in_a_mixed_batch() {
         .unwrap();
     assert_eq!(unlabeled_entry["labels"], serde_json::json!([]));
 }
+
+// ── Manifest Format Versioning ───────────────────────────────────────────────
+
+#[test]
+fn manifest_version_defaults_to_one_integration() {
+    let dir = temp_dir("mc-version-default");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "default-version"
+        "#,
+    );
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0, "legacy default version 1 must resolve successfully");
+}
+
+#[test]
+fn manifest_version_one_toml_integration() {
+    let dir = temp_dir("mc-version-one-toml");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        version = 1
+
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "version-one"
+        "#,
+    );
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0, "explicit version 1 TOML must resolve successfully");
+}
+
+#[test]
+fn manifest_version_one_json_integration() {
+    let dir = temp_dir("mc-version-one-json");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.json",
+        r#"{
+            "version": 1,
+            "defaults": { "base_dir": "wasm" },
+            "pairs": [
+                { "old": "v1.wasm", "new": "v1.wasm", "name": "version-one" }
+            ]
+        }"#,
+    );
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0, "explicit version 1 JSON must resolve successfully");
+}
+
+#[test]
+fn manifest_version_mismatch_toml_integration() {
+    let dir = temp_dir("mc-version-mismatch-toml");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        version = 2
+
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "version-two"
+        "#,
+    );
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("Unsupported manifest version"), "got: {combined}");
+    assert!(combined.contains("Supported version: 1"), "got: {combined}");
+    assert!(combined.contains("encountered: 2"), "got: {combined}");
+}
+
+#[test]
+fn manifest_version_mismatch_json_integration() {
+    let dir = temp_dir("mc-version-mismatch-json");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.json",
+        r#"{
+            "version": 2,
+            "defaults": { "base_dir": "wasm" },
+            "pairs": [
+                { "old": "v1.wasm", "new": "v1.wasm", "name": "version-two" }
+            ]
+        }"#,
+    );
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("Unsupported manifest version"), "got: {combined}");
+    assert!(combined.contains("Supported version: 1"), "got: {combined}");
+    assert!(combined.contains("encountered: 2"), "got: {combined}");
+}
+
+// ── Empty/Invalid Manifest Validation ────────────────────────────────────────
+
+#[test]
+fn manifest_whitespace_only_rejected_integration() {
+    let dir = temp_dir("mc-whitespace-only");
+    let root = write(&dir, "root.toml", "   \n\t  ");
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("is empty"), "got: {combined}");
+    assert!(combined.contains("[[pairs]]"), "got: {combined}");
+    assert!(combined.contains("\"pairs\":"), "got: {combined}");
+}
+
+#[test]
+fn manifest_empty_pairs_toml_rejected_integration() {
+    let dir = temp_dir("mc-empty-pairs-toml");
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        version = 1
+        "#,
+    );
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("contains no comparison pairs"), "got: {combined}");
+    assert!(combined.contains("[[pairs]]"), "got: {combined}");
+    assert!(combined.contains("\"pairs\":"), "got: {combined}");
+}
+
+#[test]
+fn manifest_empty_pairs_json_rejected_integration() {
+    let dir = temp_dir("mc-empty-pairs-json");
+    let root = write(
+        &dir,
+        "root.json",
+        r#"{"version": 1}"#,
+    );
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("contains no comparison pairs"), "got: {combined}");
+    assert!(combined.contains("[[pairs]]"), "got: {combined}");
+    assert!(combined.contains("\"pairs\":"), "got: {combined}");
+}

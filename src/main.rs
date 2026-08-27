@@ -476,6 +476,20 @@ struct Args {
     )]
     per_contract_output_dir: Option<PathBuf>,
 
+    /// Template for per-contract report filenames (e.g. "{name}_report.{ext}")
+    /// Documented placeholders:
+    ///   {name}  - Contract name
+    ///   {id}    - Pair identity
+    ///   {ext}   - Output extension for the format (e.g. "json", "md", "txt")
+    #[arg(
+        long = "per-contract-output-name-template",
+        alias = "report-name-template",
+        alias = "filename-template",
+        value_name = "TEMPLATE",
+        default_value = "{name}.{ext}"
+    )]
+    per_contract_output_name_template: String,
+
     /// Watch mode: re-run comparison when input files change
     #[arg(long)]
     watch: bool,
@@ -1019,7 +1033,7 @@ fn run_lockfile(args: &LockfileArgs) -> Result<()> {
             )
         })?;
     }
-    std::fs::write(&args.output, contents)
+    write_atomically(&args.output, &contents)
         .with_context(|| format!("Failed to write lockfile '{}'.", args.output.display()))?;
     println!(
         "{} {} ({})",
@@ -1187,7 +1201,7 @@ fn run_attest(args: &AttestArgs) -> Result<()> {
     })?;
     let signer = Ed25519Signer::from_pkcs8(&args.key_id, &key).map_err(|e| anyhow::anyhow!(e))?;
     let envelope = sign_statement(&statement, &signer).map_err(|e| anyhow::anyhow!(e))?;
-    std::fs::write(&args.output, serde_json::to_vec_pretty(&envelope)?)?;
+    write_atomically(&args.output, &serde_json::to_vec_pretty(&envelope)?)?;
     Ok(())
 }
 
@@ -1393,7 +1407,7 @@ fn run_upgrade_report(args: &UpgradeReportArgs) -> Result<()> {
 
     match &args.output {
         Some(path) => {
-            std::fs::write(path, &json).with_context(|| {
+            write_atomically(path, json.as_bytes()).with_context(|| {
                 format!("Failed to write upgraded report to '{}'", path.display())
             })?;
         }
@@ -1764,6 +1778,38 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         )?;
         (None, pairs, gaps, new_only)
     };
+
+    if args.per_contract_output_dir.is_some() {
+        validate_template(&args.per_contract_output_name_template)?;
+
+        let format = args.format.unwrap_or(OutputFormat::Text);
+        let ext = match format {
+            OutputFormat::Json => "json",
+            OutputFormat::Markdown => "md",
+            OutputFormat::Text => "txt",
+            OutputFormat::GithubActions => "txt",
+        };
+
+        let mut seen = std::collections::HashMap::new();
+        for pair in &pairs {
+            let filename = evaluate_template(&args.per_contract_output_name_template, &pair.name, &pair.id, ext)?;
+            if let Some(other) = seen.insert(filename.clone(), format!("pair '{}'", pair.name)) {
+                anyhow::bail!(
+                    "Output filename collision: both pair '{}' and {} resolve to the same filename '{}'",
+                    pair.name, other, filename
+                );
+            }
+        }
+        for gap in &gaps {
+            let filename = evaluate_template(&args.per_contract_output_name_template, &gap.name, &gap.name, ext)?;
+            if let Some(other) = seen.insert(filename.clone(), format!("gap '{}'", gap.name)) {
+                anyhow::bail!(
+                    "Output filename collision: both gap '{}' and {} resolve to the same filename '{}'",
+                    gap.name, other, filename
+                );
+            }
+        }
+    }
     let remote_config = remote_fetch_config(args);
     let oci_config = oci_fetch_config(args);
     let width = resolve_text_width(args.width, std::io::stdout().is_terminal());
@@ -1940,6 +1986,8 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             write_report_file(
                 output_dir,
                 &gap.name,
+                &gap.name,
+                &args.per_contract_output_name_template,
                 args.format.unwrap_or(OutputFormat::Text),
                 &content,
             )?;
@@ -2112,6 +2160,8 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             write_report_file(
                 output_dir,
                 &contract_name,
+                &contract_id,
+                &args.per_contract_output_name_template,
                 args.format.unwrap_or(OutputFormat::Text),
                 &content,
             )?;
@@ -3178,9 +3228,51 @@ fn render_github_actions(report: &report::SafetyReport) -> String {
     output
 }
 
+struct AtomicWriteCleanup<'a> {
+    active: bool,
+    temp_path: &'a Path,
+}
+
+impl<'a> Drop for AtomicWriteCleanup<'a> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = std::fs::remove_file(self.temp_path);
+        }
+    }
+}
+
+fn write_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("tmp")
+    ));
+
+    let mut cleanup = AtomicWriteCleanup {
+        active: true,
+        temp_path: &temp_path,
+    };
+
+    std::fs::write(&temp_path, content)?;
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&temp_path, metadata.permissions());
+    }
+
+    std::fs::rename(&temp_path, path)?;
+    cleanup.active = false;
+
+    Ok(())
+}
+
 fn emit_output(spec: &OutputSpec, content: &str) -> Result<()> {
     match &spec.path {
         Some(path) => {
+            write_atomically(path, content.as_bytes())?;
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!("Failed to create output directory '{}'.", parent.display())
@@ -4019,18 +4111,58 @@ fn render_report(
 fn write_report_file(
     output_dir: &Path,
     contract_name: &str,
+    pair_id: &str,
+    template: &str,
     format: OutputFormat,
     content: &str,
 ) -> Result<()> {
-    let filename = sanitize_report_filename(contract_name, format);
+    let ext = match format {
+        OutputFormat::Json => "json",
+        OutputFormat::Markdown => "md",
+        OutputFormat::Text => "txt",
+        OutputFormat::GithubActions => "txt",
+    };
+    let filename = evaluate_template(template, contract_name, pair_id, ext)?;
     let output_path = output_dir.join(filename);
-    let temp_path = output_path.with_extension(format!(
-        "{}.tmp",
-        output_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("tmp")
-    ));
+    write_atomically(&output_path, content.as_bytes())?;
+    Ok(())
+}
+
+fn validate_template(template: &str) -> Result<()> {
+    if template.contains('/') || template.contains('\\') {
+        anyhow::bail!("Template cannot contain path separators: '{}'", template);
+    }
+
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            let mut placeholder = String::new();
+            let mut closed = false;
+            while let Some(&next_ch) = chars.peek() {
+                if next_ch == '}' {
+                    chars.next();
+                    closed = true;
+                    break;
+                } else {
+                    placeholder.push(chars.next().unwrap());
+                }
+            }
+            if !closed {
+                anyhow::bail!("Unclosed placeholder in template: '{}'", template);
+            }
+            match placeholder.as_str() {
+                "name" | "id" | "ext" => {}
+                _ => anyhow::bail!("Unknown placeholder '{{{}}}' in template. Supported placeholders are: {{name}}, {{id}}, {{ext}}", placeholder),
+            }
+        } else if ch == '}' {
+            anyhow::bail!("Unmatched closing brace in template: '{}'", template);
+        }
+    }
+
+    let mocked = evaluate_template(template, "mock-name", "mock-id", "txt")?;
+    if mocked.is_empty() || mocked == "." || mocked == ".." {
+        anyhow::bail!("Template '{}' resolves to an invalid empty or dot-only filename", template);
+    }
 
     std::fs::create_dir_all(output_dir).with_context(|| {
         format!(
@@ -4049,30 +4181,44 @@ fn write_report_file(
     Ok(())
 }
 
-fn sanitize_report_filename(contract_name: &str, format: OutputFormat) -> PathBuf {
+fn evaluate_template(template: &str, name: &str, id: &str, ext: &str) -> Result<String> {
+    let name_sanitized = sanitize_component(name);
+    let id_sanitized = sanitize_component(id);
+    let ext_sanitized = sanitize_component(ext);
+
+    if name_sanitized.is_empty() {
+        anyhow::bail!("Contract name is empty");
+    }
+    if id_sanitized.is_empty() {
+        anyhow::bail!("Pair identity is empty");
+    }
+
+    let mut result = template.to_string();
+    result = result.replace("{name}", &name_sanitized);
+    result = result.replace("{id}", &id_sanitized);
+    result = result.replace("{ext}", &ext_sanitized);
+
+    if result.contains('/') || result.contains('\\') {
+        anyhow::bail!("Template '{}' resolved to a path containing separators: '{}'", template, result);
+    }
+
+    if result.is_empty() || result == "." || result == ".." {
+        anyhow::bail!("Template '{}' resolved to an invalid filename: '{}'", template, result);
+    }
+
+    Ok(result)
+}
+
+fn sanitize_component(component: &str) -> String {
     let mut sanitized = String::new();
-    for ch in contract_name.chars() {
+    for ch in component.chars() {
         if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' {
             sanitized.push(ch);
         } else {
             sanitized.push('_');
         }
     }
-
-    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
-        sanitized = "contract".to_string();
-    }
-
-    let extension = match format {
-        OutputFormat::Json => "json",
-        OutputFormat::Markdown => "md",
-        OutputFormat::Text => "txt",
-        OutputFormat::GithubActions => "txt",
-    };
-
-    let mut path = PathBuf::from(sanitized);
-    path.set_extension(extension);
-    path
+    sanitized
 }
 
 #[cfg(test)]
@@ -4398,5 +4544,62 @@ mod tests {
             Some(prev) => std::env::set_var("COLUMNS", prev),
             None => std::env::remove_var("COLUMNS"),
         }
+    }
+
+    #[test]
+    fn test_write_atomically_success() {
+        let dir = scratch("atomic-success");
+        let path = dir.join("report.json");
+        let content = b"{\"safe\": true}";
+        write_atomically(&path, content).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn test_write_atomically_cleanup_on_failure() {
+        let dir = scratch("atomic-failure");
+        let temp_path = dir.join("report.json.tmp");
+        std::fs::write(&temp_path, b"temp").unwrap();
+        assert!(temp_path.exists());
+        {
+            let _cleanup = AtomicWriteCleanup {
+                active: true,
+                temp_path: &temp_path,
+            };
+        }
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn test_write_atomically_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("atomic-perms");
+        let path = dir.join("report.json");
+        std::fs::write(&path, b"initial").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o400);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let new_content = b"new content";
+        write_atomically(&path, new_content).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), new_content);
+        let final_perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(final_perms.mode() & 0o777, 0o400);
+    }
+
+    #[test]
+    fn test_validate_template_valid() {
+        assert!(validate_template("{name}_{id}.{ext}").is_ok());
+        assert!(validate_template("{name}.{ext}").is_ok());
+        assert!(validate_template("report_{id}").is_ok());
+    }
+
+    #[test]
+    fn test_validate_template_invalid() {
+        assert!(validate_template("{name}/{id}.{ext}").is_err());
+        assert!(validate_template("{invalid}.{ext}").is_err());
+        assert!(validate_template("{name").is_err());
+        assert!(validate_template("}").is_err());
     }
 }
