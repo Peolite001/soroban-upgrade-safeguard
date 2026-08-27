@@ -334,6 +334,13 @@ struct Args {
     #[arg(long, requires = "manifest")]
     explain_manifest: bool,
 
+    /// Maximum number of pairs a composed manifest may contain. Rejected as a
+    /// configuration error before any WASM is loaded. Not settable from
+    /// within the manifest itself, so a runaway or malformed manifest cannot
+    /// raise its own ceiling.
+    #[arg(long, value_name = "N", default_value_t = manifest::DEFAULT_MAX_PAIRS)]
+    max_pairs: usize,
+
     /// Directory containing the old versions of the contracts for directory comparison
     #[arg(long, value_name = "OLD_DIR", requires = "new_dir")]
     old_dir: Option<PathBuf>,
@@ -1635,6 +1642,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         results.push(BatchResult::Error {
             id: gap.name.clone(),
             name: gap.name,
+            labels: Vec::new(),
             old_path: gap.old_path,
             new_path: None,
             old_storage_schema: None,
@@ -1649,6 +1657,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
     for (i, pair) in pairs.iter().enumerate() {
         let contract_name = pair.name.clone();
         let contract_id = pair.id.clone();
+        let contract_labels = pair.labels.clone();
         let settings = &pair.settings;
         let pair_suppressions = suppressions_for_pair(settings, &mut config_cache)?;
         let explain = settings.explain.value;
@@ -1788,6 +1797,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             results.push(BatchResult::Error {
                 name: contract_name,
                 id: contract_id,
+                labels: contract_labels,
                 old_path: pair.old.clone(),
                 new_path: Some(pair.new.clone()),
                 old_storage_schema: pair.old_storage_schema.clone(),
@@ -1799,6 +1809,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             results.push(BatchResult::Success {
                 name: contract_name,
                 id: contract_id,
+                labels: contract_labels,
                 old_path: pair.old.clone(),
                 new_path: pair.new.clone(),
                 old_storage_schema: pair.old_storage_schema.clone(),
@@ -1931,6 +1942,8 @@ enum BatchResult {
         /// Stable identifier for CI annotations and reruns. See
         /// [`manifest::ResolvedPair::id`].
         id: String,
+        /// Free-form grouping tags. See [`manifest::ResolvedPair::labels`].
+        labels: Vec<String>,
         old_path: PathBuf,
         new_path: PathBuf,
         old_storage_schema: Option<PathBuf>,
@@ -1940,6 +1953,7 @@ enum BatchResult {
     Error {
         name: String,
         id: String,
+        labels: Vec<String>,
         old_path: PathBuf,
         new_path: Option<PathBuf>,
         old_storage_schema: Option<PathBuf>,
@@ -1953,6 +1967,12 @@ impl BatchResult {
     fn name(&self) -> &str {
         match self {
             Self::Success { name, .. } | Self::Error { name, .. } => name,
+        }
+    }
+
+    fn labels(&self) -> &[String] {
+        match self {
+            Self::Success { labels, .. } | Self::Error { labels, .. } => labels,
         }
     }
 
@@ -1979,6 +1999,119 @@ impl BatchResult {
                 }
             }
         }
+    }
+
+    /// This result's stable verdict category for the batch summary. Every
+    /// result maps to exactly one, checked in priority order: a pair-level
+    /// failure is always `Errored` regardless of what its synthesized report
+    /// says; otherwise breaking changes make it `Unsafe` regardless of
+    /// coverage; otherwise a report produced without a storage schema
+    /// (interface-only) is `Incomplete` — safe as far as it could check, but
+    /// not fully verified; anything else is `Safe`.
+    fn verdict(&self) -> BatchVerdict {
+        match self {
+            Self::Error { .. } => BatchVerdict::Errored,
+            Self::Success { report, .. } => {
+                if !report.is_safe() {
+                    BatchVerdict::Unsafe
+                } else if !report.scope().storage_analyzed() {
+                    BatchVerdict::Incomplete
+                } else {
+                    BatchVerdict::Safe
+                }
+            }
+        }
+    }
+}
+
+/// Stable, machine-readable batch-verdict categories. `as_str()` values are
+/// part of the JSON output's public shape — do not rename without treating it
+/// as a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchVerdict {
+    /// No breaking changes, and storage layout was fully verified against a
+    /// declared schema.
+    Safe,
+    /// Breaking changes were found (the report itself reports unsafe).
+    Unsafe,
+    /// The pair itself failed to produce a report (e.g. a load or schema
+    /// error) — no verdict on compatibility was reached at all.
+    Errored,
+    /// No breaking changes were found, but coverage was reduced: no storage
+    /// schema was declared, so storage-layout compatibility is interface-only
+    /// rather than fully verified.
+    Incomplete,
+}
+
+impl BatchVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Unsafe => "unsafe",
+            Self::Errored => "errored",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// Compact counts of pair outcomes, grouped by [`BatchVerdict`]. Rendered as
+/// a summary section before the detailed per-pair results in every aggregate
+/// output format (text, Markdown, JSON). Purely a tally over existing
+/// [`BatchResult`]s — it does not alter any per-pair finding or report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BatchVerdictSummary {
+    safe: usize,
+    unsafe_count: usize,
+    errored: usize,
+    incomplete: usize,
+}
+
+impl BatchVerdictSummary {
+    fn from_results(results: &[BatchResult]) -> Self {
+        let mut summary = Self::default();
+        for result in results {
+            match result.verdict() {
+                BatchVerdict::Safe => summary.safe += 1,
+                BatchVerdict::Unsafe => summary.unsafe_count += 1,
+                BatchVerdict::Errored => summary.errored += 1,
+                BatchVerdict::Incomplete => summary.incomplete += 1,
+            }
+        }
+        summary
+    }
+
+    fn total(&self) -> usize {
+        self.safe + self.unsafe_count + self.errored + self.incomplete
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        // Keys are written as literals (rather than through `BatchVerdict::as_str()`)
+        // so they stay simple, direct `json!` object keys; `verdict_key_matches_as_str`
+        // guards the two from silently drifting apart.
+        serde_json::json!({
+            "safe": self.safe,
+            "unsafe": self.unsafe_count,
+            "errored": self.errored,
+            "incomplete": self.incomplete,
+            "total": self.total(),
+        })
+    }
+
+    /// One-line rendering shared by the text and Markdown renderers:
+    /// `2 safe, 1 unsafe, 1 errored, 1 incomplete (5 total)`.
+    fn to_line(self) -> String {
+        format!(
+            "{} {}, {} {}, {} {}, {} {} ({} total)",
+            self.safe,
+            BatchVerdict::Safe.as_str(),
+            self.unsafe_count,
+            BatchVerdict::Unsafe.as_str(),
+            self.errored,
+            BatchVerdict::Errored.as_str(),
+            self.incomplete,
+            BatchVerdict::Incomplete.as_str(),
+            self.total()
+        )
     }
 }
 
@@ -2010,6 +2143,8 @@ fn render_batch_summary(
         resolved_manifest,
     } = *summary;
 
+    let verdict_summary = BatchVerdictSummary::from_results(results);
+
     for output in outputs {
         let content = match output.format {
             OutputFormat::Json => {
@@ -2018,6 +2153,7 @@ fn render_batch_summary(
                     let mut entry = serde_json::json!({
                         "name": result.name(),
                         "id": result.id(),
+                        "labels": result.labels(),
                         "coverage": result.coverage(),
                         "report": result.report().to_json(),
                     });
@@ -2070,6 +2206,7 @@ fn render_batch_summary(
                     "is_safe": overall_safe,
                     "strict": strict,
                     "total_pairs": total_pairs,
+                    "summary": verdict_summary.to_json(),
                     "results": results_json,
                 });
                 // Only manifest runs have a composition to describe; directory
@@ -2092,11 +2229,25 @@ fn render_batch_summary(
                     "❌ FAILED (Some contracts have breaking changes)"
                 };
                 markdown.push_str(&format!("## Status: {}\n\n", status));
+
+                markdown.push_str("### Verdict Summary\n\n");
+                markdown.push_str("| Safe | Unsafe | Errored | Incomplete | Total |\n");
+                markdown.push_str("| :--- | :--- | :--- | :--- | :--- |\n");
+                markdown.push_str(&format!(
+                    "| {} | {} | {} | {} | {} |\n\n",
+                    verdict_summary.safe,
+                    verdict_summary.unsafe_count,
+                    verdict_summary.errored,
+                    verdict_summary.incomplete,
+                    verdict_summary.total()
+                ));
+
                 markdown.push_str("### Summary\n\n");
                 markdown.push_str(
-                    "| Contract | Status | Scope | Coverage | Critical | Warning | Info | Suppressed |\n",
+                    "| Contract | Status | Scope | Coverage | Critical | Warning | Info | Suppressed | Labels |\n",
                 );
-                markdown.push_str("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
+                markdown
+                    .push_str("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
 
                 for result in results {
                     let report = result.report();
@@ -2106,7 +2257,7 @@ fn render_batch_summary(
                         "❌ FAILED"
                     };
                     markdown.push_str(&format!(
-                        "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                         result.name(),
                         status_str,
                         report.scope().summary_line(),
@@ -2114,7 +2265,8 @@ fn render_batch_summary(
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
-                        report.suppressed_count()
+                        report.suppressed_count(),
+                        format_labels(result.labels(), "-")
                     ));
                 }
 
@@ -2122,6 +2274,12 @@ fn render_batch_summary(
 
                 for result in results {
                     markdown.push_str(&format!("## Details: {}\n\n", result.name()));
+                    if !result.labels().is_empty() {
+                        markdown.push_str(&format!(
+                            "**Labels**: {}\n\n",
+                            format_labels(result.labels(), "")
+                        ));
+                    }
                     let report = result.report();
                     if let BatchResult::Error { error, .. } = result {
                         markdown.push_str(&format!("**Pair error**: `{}`\n\n", error));
@@ -2151,6 +2309,10 @@ fn render_batch_summary(
                         .to_string()
                 };
                 text.push_str(&format!("Overall Status: {}\n\n", status));
+                text.push_str(&format!(
+                    "Verdict Summary: {}\n\n",
+                    verdict_summary.to_line()
+                ));
                 text.push_str("Summary of Contracts:\n");
                 for result in results {
                     let report = result.report();
@@ -2159,8 +2321,13 @@ fn render_batch_summary(
                     } else {
                         "❌ FAILED".red().bold().to_string()
                     };
+                    let labels_suffix = if result.labels().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {{{}}}", format_labels(result.labels(), ""))
+                    };
                     text.push_str(&format!(
-                        "  - {}: {} [{}; {}] ({} critical, {} warnings, {} info, {} suppressed)\n",
+                        "  - {}: {} [{}; {}] ({} critical, {} warnings, {} info, {} suppressed){}\n",
                         result.name().bold(),
                         status_str,
                         report.scope().summary_line(),
@@ -2168,7 +2335,8 @@ fn render_batch_summary(
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
-                        report.suppressed_count()
+                        report.suppressed_count(),
+                        labels_suffix
                     ));
                 }
 
@@ -2180,6 +2348,9 @@ fn render_batch_summary(
                         "=== Contract: {} ===\n",
                         result.name().bold().magenta()
                     ));
+                    if !result.labels().is_empty() {
+                        text.push_str(&format!("Labels: {}\n", format_labels(result.labels(), "")));
+                    }
                     if let BatchResult::Error { error, .. } = result {
                         text.push_str(&format!("Pair error: {}\n", error));
                     }
@@ -2471,6 +2642,17 @@ fn render_to_outputs(
     Ok(())
 }
 
+/// Render a pair's labels as a comma-joined list, or `empty` (e.g. `"-"` for
+/// a table cell, `""` to omit the line entirely) when there are none. Kept to
+/// plain ASCII rather than an em dash so it survives `--plain` unchanged.
+fn format_labels(labels: &[String], empty: &str) -> String {
+    if labels.is_empty() {
+        empty.to_string()
+    } else {
+        labels.join(", ")
+    }
+}
+
 /// Apply `--ascii`/`--plain` marker and separator substitution to rendered
 /// text/Markdown. `plain` implies (and supersedes) `ascii`.
 fn destyle_text(text: String, ascii: bool, plain: bool) -> String {
@@ -2743,6 +2925,10 @@ struct BatchPair {
     /// read an explicit one from, so it always falls back to `name`, the same
     /// deterministic rule manifest mode uses when `id` is omitted.
     id: String,
+    /// Free-form grouping tags for filtering and review. See
+    /// [`manifest::ResolvedPair::labels`]; always empty in directory-scan
+    /// mode, which has no manifest to read them from.
+    labels: Vec<String>,
     old: PathBuf,
     new: PathBuf,
     old_storage_schema: Option<PathBuf>,
@@ -2755,6 +2941,7 @@ impl From<manifest::ResolvedPair> for BatchPair {
         Self {
             name: p.name,
             id: p.id,
+            labels: p.labels,
             old: p.old,
             new: p.new,
             old_storage_schema: p.old_storage_schema,
@@ -3073,6 +3260,7 @@ fn cli_settings(args: &Args) -> manifest::CliSettings {
         explain: args.explain,
         ascii: args.ascii,
         no_timestamp: args.no_timestamp,
+        max_pairs: args.max_pairs,
     }
 }
 
@@ -3143,6 +3331,7 @@ fn scan_directories(
                 pairs.push(BatchPair {
                     name: derived.clone(),
                     id: derived,
+                    labels: Vec::new(),
                     old: path,
                     new: new_path,
                     old_storage_schema: None,
@@ -3231,6 +3420,50 @@ fn sanitize_report_filename(contract_name: &str, format: OutputFormat) -> PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_verdict_summary_totals_and_line_format() {
+        let summary = BatchVerdictSummary {
+            safe: 2,
+            unsafe_count: 1,
+            errored: 1,
+            incomplete: 1,
+        };
+        assert_eq!(summary.total(), 5);
+        assert_eq!(
+            summary.to_line(),
+            "2 safe, 1 unsafe, 1 errored, 1 incomplete (5 total)"
+        );
+    }
+
+    #[test]
+    fn batch_verdict_summary_json_keys_match_as_str() {
+        // Guards src/main.rs's `to_json()` literal keys against drifting away
+        // from `BatchVerdict::as_str()`, since the JSON impl intentionally
+        // writes them as plain literals rather than through the enum.
+        let summary = BatchVerdictSummary {
+            safe: 1,
+            unsafe_count: 2,
+            errored: 3,
+            incomplete: 4,
+        };
+        let json = summary.to_json();
+        assert_eq!(json[BatchVerdict::Safe.as_str()], 1);
+        assert_eq!(json[BatchVerdict::Unsafe.as_str()], 2);
+        assert_eq!(json[BatchVerdict::Errored.as_str()], 3);
+        assert_eq!(json[BatchVerdict::Incomplete.as_str()], 4);
+        assert_eq!(json["total"], 10);
+    }
+
+    #[test]
+    fn batch_verdict_summary_default_is_all_zero() {
+        let summary = BatchVerdictSummary::default();
+        assert_eq!(summary.total(), 0);
+        assert_eq!(
+            summary.to_line(),
+            "0 safe, 0 unsafe, 0 errored, 0 incomplete (0 total)"
+        );
+    }
 
     #[test]
     fn test_output_spec_from_str_format_only() {
