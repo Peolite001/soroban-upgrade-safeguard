@@ -116,9 +116,26 @@ pub const DEFAULT_MAX_PAIRS: usize = 500;
 /// hard error rather than a silently ignored setting — composition multiplies
 /// files, and a silently dropped `strict = true` in a fragment is precisely the
 /// failure mode this feature must not introduce.
-#[derive(Debug, Clone, Default, Deserialize)]
+fn default_manifest_version() -> u32 {
+    1
+}
+
+/// One manifest file exactly as written on disk, before composition.
+///
+/// Every struct in this schema uses `deny_unknown_fields` so a typo'd key is a
+/// hard error rather than a silently ignored setting — composition multiplies
+/// files, and a silently dropped `strict = true` in a fragment is precisely the
+/// failure mode this feature must not introduce.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawManifest {
+    /// The version of the manifest format.
+    ///
+    /// Defaults to `1` (the initial version) when omitted, preserving legacy
+    /// behavior for manifests written before format versioning was introduced.
+    /// Only version 1 is currently supported.
+    #[serde(default = "default_manifest_version")]
+    pub version: u32,
     /// Other manifest files to compose in, depth-first, in order.
     #[serde(default)]
     pub include: Vec<PathBuf>,
@@ -135,6 +152,18 @@ pub struct RawManifest {
     /// up; see `docs/batch_manifests.md`.
     #[serde(default)]
     pub dependencies: Vec<ContractDependency>,
+}
+
+impl Default for RawManifest {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            include: Vec::new(),
+            defaults: RawDefaults::default(),
+            pairs: Vec::new(),
+            dependencies: Vec::new(),
+        }
+    }
 }
 
 /// The `[defaults]` table: settings that apply to every pair.
@@ -532,6 +561,30 @@ pub fn resolve(root: &Path, cli: &CliSettings) -> Result<ResolvedManifest> {
     let mut stack: Vec<PathBuf> = Vec::new();
     visit(&root, &mut walk, &mut stack, 0)?;
 
+    if walk.pairs.is_empty() {
+        bail!(
+            "Manifest composition contains no comparison pairs. A manifest must declare at least one comparison pair.\n\
+             Minimal valid shape:\n\
+             \n\
+             # TOML\n\
+             [[pairs]]\n\
+             name = \"my-contract\"\n\
+             old = \"old.wasm\"\n\
+             new = \"new.wasm\"\n\
+             \n\
+             # JSON\n\
+             {{\n\
+               \"pairs\": [\n\
+                 {{\n\
+                   \"name\": \"my-contract\",\n\
+                   \"old\": \"old.wasm\",\n\
+                   \"new\": \"new.wasm\"\n\
+                 }}\n\
+               ]\n\
+             }}"
+        );
+    }
+
     // Checked ahead of the (more expensive) precedence fold, and long before
     // the batch loop would start loading WASM for each pair: a malformed or
     // accidentally generated manifest with thousands of pairs is rejected as
@@ -592,6 +645,14 @@ fn visit(path: &Path, walk: &mut Walk, stack: &mut Vec<PathBuf>, depth: usize) -
             )
         }
     })?;
+
+    if raw.version != 1 {
+        bail!(
+            "Unsupported manifest version. Supported version: 1, encountered: {} in '{}'",
+            raw.version,
+            path.display()
+        );
+    }
 
     let dir = parent_dir(path);
     stack.push(path.to_path_buf());
@@ -949,6 +1010,31 @@ pub fn cli_only_settings(cli: &CliSettings) -> ResolvedSettings {
 fn parse_file(path: &Path) -> Result<RawManifest> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read manifest file: {}", path.display()))?;
+
+    if content.trim().is_empty() {
+        bail!(
+            "Manifest file '{}' is empty. A manifest must declare at least one comparison pair.\n\
+             Minimal valid shape:\n\
+             \n\
+             # TOML\n\
+             [[pairs]]\n\
+             name = \"my-contract\"\n\
+             old = \"old.wasm\"\n\
+             new = \"new.wasm\"\n\
+             \n\
+             # JSON\n\
+             {{\n\
+               \"pairs\": [\n\
+                 {{\n\
+                   \"name\": \"my-contract\",\n\
+                   \"old\": \"old.wasm\",\n\
+                   \"new\": \"new.wasm\"\n\
+                 }}\n\
+               ]\n\
+             }}",
+            path.display()
+        );
+    }
 
     let json_first = path
         .extension()
@@ -2911,5 +2997,129 @@ mod tests {
         assert!(text.contains("root.toml"));
         assert!(text.contains("[1] a"));
         assert!(text.contains("strict"));
+    }
+
+    #[test]
+    fn manifest_version_defaults_to_one() {
+        let dir = temp_dir("version-default");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).expect("resolve failed");
+        assert_eq!(resolved.pairs.len(), 1);
+    }
+
+    #[test]
+    fn manifest_version_supported_one_toml() {
+        let dir = temp_dir("version-supported-toml");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            version = 1
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).expect("resolve failed");
+        assert_eq!(resolved.pairs.len(), 1);
+    }
+
+    #[test]
+    fn manifest_version_supported_one_json() {
+        let dir = temp_dir("version-supported-json");
+        let root = write(
+            &dir,
+            "root.json",
+            r#"{"version": 1, "pairs": [{"old": "a_v1.wasm", "new": "a_v2.wasm"}]}"#,
+        );
+        let resolved = resolve(&root, &CliSettings::default()).expect("resolve failed");
+        assert_eq!(resolved.pairs.len(), 1);
+    }
+
+    #[test]
+    fn manifest_version_mismatch_toml_rejected() {
+        let dir = temp_dir("version-mismatch-toml");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            version = 2
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
+        assert!(error.contains("Unsupported manifest version"), "got: {error}");
+        assert!(error.contains("Supported version: 1"), "got: {error}");
+        assert!(error.contains("encountered: 2"), "got: {error}");
+    }
+
+    #[test]
+    fn manifest_version_mismatch_json_rejected() {
+        let dir = temp_dir("version-mismatch-json");
+        let root = write(
+            &dir,
+            "root.json",
+            r#"{"version": 2, "pairs": [{"old": "a_v1.wasm", "new": "a_v2.wasm"}]}"#,
+        );
+        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
+        assert!(error.contains("Unsupported manifest version"), "got: {error}");
+        assert!(error.contains("Supported version: 1"), "got: {error}");
+        assert!(error.contains("encountered: 2"), "got: {error}");
+    }
+
+    #[test]
+    fn manifest_version_mismatch_in_include_rejected() {
+        let dir = temp_dir("version-mismatch-include");
+        write(
+            &dir,
+            "frag.toml",
+            r#"
+            version = 2
+            "#,
+        );
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            include = ["frag.toml"]
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
+        assert!(error.contains("Unsupported manifest version"), "got: {error}");
+        assert!(error.contains("Supported version: 1"), "got: {error}");
+        assert!(error.contains("encountered: 2"), "got: {error}");
+    }
+
+    #[test]
+    fn manifest_whitespace_only_rejected() {
+        let dir = temp_dir("manifest-whitespace");
+        let root = write(&dir, "root.toml", "   \n\t  \n");
+        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
+        assert!(error.contains("is empty"), "got: {error}");
+        assert!(error.contains("[[pairs]]"), "got: {error}");
+        assert!(error.contains("\"pairs\":"), "got: {error}");
+    }
+
+    #[test]
+    fn manifest_no_pairs_rejected() {
+        let dir = temp_dir("manifest-no-pairs");
+        let root = write(&dir, "root.toml", "version = 1");
+        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
+        assert!(error.contains("contains no comparison pairs"), "got: {error}");
+        assert!(error.contains("[[pairs]]"), "got: {error}");
+        assert!(error.contains("\"pairs\":"), "got: {error}");
     }
 }

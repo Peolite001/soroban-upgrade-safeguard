@@ -172,3 +172,52 @@ fn output_flag_safe_upgrade_writes_file_and_exits_zero() {
     let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
     assert_eq!(json["is_safe"], serde_json::Value::Bool(true));
 }
+
+// ──────────────────────────────────────────────────────────────────
+// Atomic Writing & Permissions Integration Tests
+// ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn output_flag_atomic_replacement_and_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Test for Text output replacement & permissions
+    let text_out = tmp("atomic_replace_text.txt");
+    std::fs::write(&text_out, b"old content").unwrap();
+    let mut perms = std::fs::metadata(&text_out).unwrap().permissions();
+    perms.set_mode(0o400);
+    std::fs::set_permissions(&text_out, perms).unwrap();
+
+    let (_stdout, _stderr, _code, file) = run_with_output("v1.wasm", "v2.wasm", "text", Some(&text_out));
+    let text_contents = file.expect("text output file should exist");
+    assert!(text_contents.contains("SOROBAN UPGRADE SAFETY REPORT"), "should contain report");
+    let final_perms = std::fs::metadata(&text_out).unwrap().permissions();
+    assert_eq!(final_perms.mode() & 0o777, 0o400);
+
+    // Test for Markdown output replacement & permissions
+    let md_out = tmp("atomic_replace_markdown.md");
+    std::fs::write(&md_out, b"old content").unwrap();
+    let mut perms = std::fs::metadata(&md_out).unwrap().permissions();
+    perms.set_mode(0o400);
+    std::fs::set_permissions(&md_out, perms).unwrap();
+
+    let (_stdout, _stderr, _code, file) = run_with_output("v1.wasm", "v2.wasm", "markdown", Some(&md_out));
+    let md_contents = file.expect("markdown output file should exist");
+    assert!(md_contents.contains("# Soroban Upgrade Safety Report"), "should contain report");
+    let final_perms = std::fs::metadata(&md_out).unwrap().permissions();
+    assert_eq!(final_perms.mode() & 0o777, 0o400);
+
+    // Test for JSON output replacement & permissions
+    let json_out = tmp("atomic_replace_json.json");
+    std::fs::write(&json_out, b"old content").unwrap();
+    let mut perms = std::fs::metadata(&json_out).unwrap().permissions();
+    perms.set_mode(0o400);
+    std::fs::set_permissions(&json_out, perms).unwrap();
+
+    let (_stdout, _stderr, _code, file) = run_with_output("v1.wasm", "v2.wasm", "json", Some(&json_out));
+    let json_contents = file.expect("json output file should exist");
+    let json: serde_json::Value = serde_json::from_str(&json_contents).unwrap();
+    assert!(json.get("is_safe").is_some());
+    let final_perms = std::fs::metadata(&json_out).unwrap().permissions();
+    assert_eq!(final_perms.mode() & 0o777, 0o400);
+}

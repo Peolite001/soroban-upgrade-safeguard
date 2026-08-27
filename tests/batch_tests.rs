@@ -506,3 +506,117 @@ fn batch_manifest_writes_per_contract_reports_to_output_dir() {
         "breaking report missing header"
     );
 }
+
+#[test]
+fn batch_manifest_writes_per_contract_custom_template() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("per_contract_custom_template");
+    let output_dir = tmp_dir.join("reports");
+    std::fs::create_dir_all(&tmp_dir).expect("failed to create tmp dir");
+
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_contract"
+        id = "my-clean-id"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_custom_template.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--per-contract-output-dir")
+        .arg(&output_dir)
+        .arg("--per-contract-output-name-template")
+        .arg("{id}_custom.{ext}")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("failed to run binary");
+
+    let code = output.status.code().expect("process terminated by signal");
+    assert_eq!(code, 0, "batch run must exit 0");
+
+    let clean_path = output_dir.join("my-clean-id_custom.json");
+    assert!(clean_path.exists(), "expected custom-named report file to exist");
+}
+
+#[test]
+fn batch_manifest_invalid_template_placeholder_fails() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("invalid_template");
+    let output_dir = tmp_dir.join("reports");
+
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_contract"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_invalid_template.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--per-contract-output-dir")
+        .arg(&output_dir)
+        .arg("--per-contract-output-name-template")
+        .arg("{invalid_placeholder}.{ext}")
+        .output()
+        .expect("failed to run binary");
+
+    let code = output.status.code().expect("process terminated by signal");
+    assert_eq!(code, 1, "batch run with invalid template must fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Unknown placeholder") || stderr.contains("invalid_placeholder"), "should report placeholder error");
+}
+
+#[test]
+fn batch_manifest_template_collision_fails() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("template_collision");
+    let output_dir = tmp_dir.join("reports");
+
+    let manifest_content = format!(
+        r#"
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_1"
+
+        [[pairs]]
+        old = {:?}
+        new = {:?}
+        name = "clean_2"
+        "#,
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap(),
+        wasm("v1.wasm").to_str().unwrap()
+    );
+
+    let manifest_path = write_manifest("manifest_collision.toml", &manifest_content);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--per-contract-output-dir")
+        .arg(&output_dir)
+        .arg("--per-contract-output-name-template")
+        .arg("static_name.{ext}")
+        .output()
+        .expect("failed to run binary");
+
+    let code = output.status.code().expect("process terminated by signal");
+    assert_eq!(code, 1, "batch run with template collision must fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("collision"), "should report collision error");
+}
