@@ -76,6 +76,12 @@ pub mod limits;
 mod limits;
 
 #[cfg(feature = "unstable")]
+#[cfg(feature = "unstable")]
+pub mod lint;
+#[cfg(not(feature = "unstable"))]
+mod lint;
+
+#[cfg(feature = "unstable")]
 pub mod manifest;
 #[cfg(not(feature = "unstable"))]
 mod manifest;
