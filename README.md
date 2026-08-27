@@ -43,6 +43,31 @@ soroban-upgrade-safeguard <OLD_WASM> <NEW_WASM>
 soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm
 ```
 
+### Comparing against a deployed contract (RPC baseline)
+
+Fetch the baseline directly from an on-chain contract instead of a local file
+— `<CONTRACT_ID>` is fetched over RPC, `<NEW_WASM>` is read from disk:
+
+```bash
+soroban-upgrade-safeguard \
+  --contract-id <CONTRACT_ID> \
+  --rpc-url <RPC_URL> \
+  <NEW_WASM>
+```
+
+For example:
+
+```bash
+soroban-upgrade-safeguard \
+  --contract-id CABCD1234... \
+  --rpc-url https://soroban-testnet.stellar.org \
+  ./wasm/v2.wasm
+```
+
+See [Zero-Trust RPC Baseline Retrieval](docs/documentation.md#zero-trust-rpc-baseline-retrieval)
+for the hash-verification pipeline, transport security rules, and
+authenticated-endpoint guidance to use before pointing this at production.
+
 ### Inspecting a single build
 
 ```bash
@@ -148,6 +173,20 @@ The tool auto-loads `.safeguard.toml` from the current directory, or use
 [`.safeguard.example.toml`](.safeguard.example.toml) for a documented template
 and the [documentation](docs/documentation.md#suppressing-known-breaking-changes)
 for the full `target` convention.
+
+### Output format
+
+By default, and whenever `--format` is omitted, the report prints as
+colored, human-readable **text**. Select another format explicitly with
+`--format`:
+
+```bash
+# JSON, for scripting and CI
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format json
+
+# Markdown, for PR descriptions and comments
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format markdown
+```
 
 ### Multiple output formats
 
