@@ -2431,6 +2431,38 @@ mod tests {
     }
 
     #[test]
+    fn empty_env_metadata_matching_on_both_sides_produces_no_finding() {
+        // A `contractenvmetav0` section that decoded successfully but carries
+        // zero entries is a valid legacy artifact, not malformed metadata.
+        // Two matching empty sections must not be flagged as changed.
+        let empty = ContractEnvMeta { entries: vec![] };
+        let mut report = DiffReport::default();
+        compare_env_metadata(Some(&empty), Some(&empty), &mut report);
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn env_metadata_empty_section_appearing_is_reported_distinctly_from_missing() {
+        // A present-but-empty section is a different fact from "no section
+        // at all": going from None to Some(empty) must still surface an
+        // appearance finding, and its summary must say "empty" rather than
+        // describing a protocol version that was never declared.
+        let empty = ContractEnvMeta { entries: vec![] };
+        let mut report = DiffReport::default();
+        compare_env_metadata(None, Some(&empty), &mut report);
+
+        assert_eq!(report.findings.len(), 1);
+        let finding = &report.findings[0];
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.category, FindingCategory::Environment.as_str());
+        assert!(
+            finding.message.contains("empty"),
+            "message should describe the section as empty, got: {}",
+            finding.message
+        );
+    }
+
+    #[test]
     fn env_metadata_protocol_change_is_warning() {
         let old = env_meta(21, 0);
         let new = env_meta(22, 0);

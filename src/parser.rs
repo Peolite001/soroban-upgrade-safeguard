@@ -416,6 +416,26 @@ mod tests {
     }
 
     #[test]
+    fn decode_env_meta_accepts_empty_bytes_as_a_valid_zero_entry_section() {
+        // A zero-byte `contractenvmetav0` section is a valid legacy
+        // artifact: it decodes successfully with no entries, distinct from
+        // a truncated or otherwise malformed section, which must error.
+        let meta = decode_env_meta(&[]).expect("empty section must decode");
+        assert!(meta.entries.is_empty());
+        assert_eq!(meta.interface_version(), None);
+        assert_eq!(meta.summary(), "empty");
+    }
+
+    #[test]
+    fn decode_env_meta_rejects_malformed_nonempty_bytes() {
+        // Bytes that are present but do not form a valid ScEnvMetaEntry must
+        // still fail, so a genuinely malformed section is never conflated
+        // with a valid empty one.
+        let garbage = [0xff, 0xff, 0xff, 0xff];
+        assert!(decode_env_meta(&garbage).is_err());
+    }
+
+    #[test]
     fn decode_spec_entries_reports_entry_index_and_offset_for_truncated_bytes() {
         let bytes = fixture_contractspec_bytes();
         let decoded_entries = decode_spec_entries(&bytes).expect("fixture spec must decode");
@@ -462,6 +482,25 @@ mod tests {
             }),
             "error chain should include the failing spec entry index, got: {messages:?}"
         );
+    }
+
+    #[test]
+    fn extract_metadata_distinguishes_missing_from_empty_env_meta_section() {
+        // No `contractenvmetav0` section at all must decode as `None`...
+        let without_section = wasm_with_imports(&[(0, 0)], &[]);
+        let metadata = extract_metadata(&without_section).expect("valid minimal module");
+        assert!(metadata.env_meta.is_none());
+
+        // ...while a present section with zero bytes must decode as
+        // `Some` with zero entries: the section existed, it just carried no
+        // optional fields. Collapsing the two into the same `None` result
+        // would hide that the section was ever emitted.
+        let with_empty_section = wasm_with_custom_section("contractenvmetav0", &[]);
+        let metadata = extract_metadata(&with_empty_section).expect("valid minimal module");
+        let meta = metadata
+            .env_meta
+            .expect("an empty section must still decode to Some");
+        assert!(meta.entries.is_empty());
     }
 
     #[test]
