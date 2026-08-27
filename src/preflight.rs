@@ -164,9 +164,8 @@ pub fn run_preflight_with_timeout(config: &RpcClientConfig, timeout: Duration) -
                 protocol.error = Some("response body is not valid JSON".to_string());
             }
             if capability.error.is_none() {
-                capability.error = Some(
-                    "could not evaluate endpoint capability: invalid JSON body".to_string(),
-                );
+                capability.error =
+                    Some("could not evaluate endpoint capability: invalid JSON body".to_string());
             }
             return PreflightReport {
                 rpc_endpoint,

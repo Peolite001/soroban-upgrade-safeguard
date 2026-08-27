@@ -707,11 +707,13 @@ fn query_rpc(
     for (name, value) in &headers.values {
         request = request.set(name, value);
     }
-    let response = request.send_json(payload).map_err(|e| Error::RpcTransport {
-        rpc_url: crate::rpc::redact_url(rpc_url),
-        details: format!("RPC request failed ({:?})", e.kind()),
-        source: None,
-    })?;
+    let response = request
+        .send_json(payload)
+        .map_err(|e| Error::RpcTransport {
+            rpc_url: crate::rpc::redact_url(rpc_url),
+            details: format!("RPC request failed ({:?})", e.kind()),
+            source: None,
+        })?;
 
     let content_type = response.header("Content-Type").map(str::to_string);
     if !is_json_content_type(content_type.as_deref()) {
@@ -1042,7 +1044,8 @@ mod expiration_tests {
 
     #[test]
     fn malformed_field_returns_none_without_error() {
-        let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": { "nested": true } });
+        let entry =
+            serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": { "nested": true } });
         assert_eq!(extract_entry_expiration(&entry), None);
 
         let entry = serde_json::json!({ "xdr": "ignored", "liveUntilLedgerSeq": "not-a-number" });
@@ -1070,10 +1073,10 @@ mod content_type_tests {
 
     #[test]
     fn accepts_json_with_charset_parameter() {
-        assert!(is_json_content_type(Some("application/json; charset=utf-8")));
         assert!(is_json_content_type(Some(
-            "application/json;charset=UTF-8"
+            "application/json; charset=utf-8"
         )));
+        assert!(is_json_content_type(Some("application/json;charset=UTF-8")));
     }
 
     #[test]

@@ -213,6 +213,8 @@ impl SuppressionConfig {
     /// Get the validated compatibility budgets.
     pub fn budgets(&self) -> &crate::budget::BudgetConfig {
         &self.budgets
+    }
+
     /// Get the require-reason policy.
     pub fn require_reason(&self) -> &RequireReasonPolicy {
         &self.require_reason
@@ -451,14 +453,22 @@ impl SuppressionConfig {
                 source: Some(Box::new(e)),
             })?;
 
-        config.budgets = crate::budget::BudgetConfig::from_file_entries(
-            std::mem::take(&mut config.raw_budget),
-        )
-        .map_err(|errors| Error::SuppressionConfig {
-            path: None,
-            details: format!("Invalid [[budget]] configuration: {}", errors.join("; ")),
-            source: None,
-        })?;
+        config.budgets =
+            crate::budget::BudgetConfig::from_file_entries(std::mem::take(&mut config.raw_budget))
+                .map_err(|errors| Error::SuppressionConfig {
+                    path: None,
+                    details: format!("Invalid [[budget]] configuration: {}", errors.join("; ")),
+                    source: None,
+                })?;
+
+        let missing_reasons = missing_required_reasons(&config.rules, &config.require_reason);
+        if !missing_reasons.is_empty() {
+            return Err(Error::SuppressionConfig {
+                path: None,
+                details: missing_reasons.join("; "),
+                source: None,
+            });
+        }
 
         Ok(config)
     }

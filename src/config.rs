@@ -177,6 +177,14 @@ pub struct FileConfig {
     /// Named policy profiles, keyed by name. See [`crate::profile`].
     #[serde(default)]
     pub profiles: BTreeMap<String, RawProfile>,
+
+    /// Contract pairs, present when this same file is also used as a batch
+    /// manifest (`--manifest <this file>`). Accepted-but-unused here so a
+    /// dual-purpose config/manifest file still loads under plain `--config`;
+    /// [`crate::manifest`] parses the file independently (and does use this)
+    /// when `--manifest` selects it.
+    #[serde(default)]
+    pub pairs: Vec<crate::manifest::RawPair>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

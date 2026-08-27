@@ -402,6 +402,7 @@ fn lint_duplicate_declarations(entries: &[ScSpecEntry], findings: &mut Vec<LintF
 
 // ── Cross-kind collisions and inconsistent origin metadata ─────────────────
 
+#[allow(clippy::type_complexity)]
 fn lint_cross_kind_and_origin(spec: &ContractSpec, findings: &mut Vec<LintFinding>) {
     // (kind label, name -> lib) pairs for every UDT kind that carries `lib` metadata.
     let kinds: [(&'static str, Box<dyn Fn(&str) -> Option<String>>); 3] = [
@@ -542,7 +543,8 @@ fn check_discriminants(
     cases: impl Iterator<Item = (String, u32)>,
     findings: &mut Vec<LintFinding>,
 ) {
-    let mut by_value: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+    let mut by_value: std::collections::BTreeMap<u32, Vec<String>> =
+        std::collections::BTreeMap::new();
     for (name, value) in cases {
         by_value.entry(value).or_default().push(name);
     }
@@ -579,9 +581,12 @@ fn lint_reference_graph(spec: &ContractSpec, findings: &mut Vec<LintFinding>) ->
         .collect();
 
     let mut reported_dangling: HashSet<String> = HashSet::new();
-    let mut report_dangling = |target: LintTarget, deps: &HashSet<String>, findings: &mut Vec<LintFinding>| {
+    let mut report_dangling = |target: LintTarget,
+                               deps: &HashSet<String>,
+                               findings: &mut Vec<LintFinding>| {
         for dep in deps {
-            if !known.contains(dep.as_str()) && reported_dangling.insert(format!("{target}::{dep}")) {
+            if !known.contains(dep.as_str()) && reported_dangling.insert(format!("{target}::{dep}"))
+            {
                 findings.push(LintFinding::new(
                     LintRuleId::DanglingTypeReference,
                     target.clone(),
@@ -596,7 +601,10 @@ fn lint_reference_graph(spec: &ContractSpec, findings: &mut Vec<LintFinding>) ->
     // Struct fields.
     for (name, s) in &spec.structs {
         for field in s.fields.iter() {
-            let deps = mapper.get_udt_dependencies(&field.type_);
+            let mut deps = mapper.get_udt_dependencies(&field.type_);
+            if let ScSpecTypeDef::Udt(udt) = &field.type_ {
+                deps.insert(udt.name.to_string());
+            }
             report_dangling(
                 LintTarget::with_member("struct", name.as_str(), field.name.to_string()),
                 &deps,
@@ -611,7 +619,10 @@ fn lint_reference_graph(spec: &ContractSpec, findings: &mut Vec<LintFinding>) ->
         for case in u.cases.iter() {
             if let ScSpecUdtUnionCaseV0::TupleV0(t) = case {
                 for ty in t.type_.iter() {
-                    let deps = mapper.get_udt_dependencies(ty);
+                    let mut deps = mapper.get_udt_dependencies(ty);
+                    if let ScSpecTypeDef::Udt(udt) = ty {
+                        deps.insert(udt.name.to_string());
+                    }
                     report_dangling(
                         LintTarget::with_member("union", name.as_str(), t.name.to_string()),
                         &deps,
@@ -626,24 +637,24 @@ fn lint_reference_graph(spec: &ContractSpec, findings: &mut Vec<LintFinding>) ->
     // Function inputs/outputs -- these are also the roots of reachability.
     for (name, f) in &spec.functions {
         for input in f.inputs.iter() {
-            let deps = mapper.get_udt_dependencies(&input.type_);
+            let mut deps = mapper.get_udt_dependencies(&input.type_);
+            if let ScSpecTypeDef::Udt(udt) = &input.type_ {
+                deps.insert(udt.name.to_string());
+            }
             report_dangling(
                 LintTarget::with_member("function", name.as_str(), input.name.to_string()),
                 &deps,
                 findings,
             );
             reachable.extend(deps);
-            if let ScSpecTypeDef::Udt(udt) = &input.type_ {
-                reachable.insert(udt.name.to_string());
-            }
         }
         for output in f.outputs.iter() {
-            let deps = mapper.get_udt_dependencies(output);
+            let mut deps = mapper.get_udt_dependencies(output);
+            if let ScSpecTypeDef::Udt(udt) = output {
+                deps.insert(udt.name.to_string());
+            }
             report_dangling(LintTarget::new("function", name.as_str()), &deps, findings);
             reachable.extend(deps);
-            if let ScSpecTypeDef::Udt(udt) = output {
-                reachable.insert(udt.name.to_string());
-            }
         }
     }
 
@@ -658,7 +669,11 @@ fn lint_reference_graph(spec: &ContractSpec, findings: &mut Vec<LintFinding>) ->
 /// `Result<_, Error>` output, not a named `Udt` reference to a specific
 /// error-enum declaration, so error enums are never structurally
 /// "reachable" in this graph even when they are genuinely used.
-fn lint_unreachable(spec: &ContractSpec, reachable: &HashSet<String>, findings: &mut Vec<LintFinding>) {
+fn lint_unreachable(
+    spec: &ContractSpec,
+    reachable: &HashSet<String>,
+    findings: &mut Vec<LintFinding>,
+) {
     for (name, _) in spec.structs.iter().filter(|(n, _)| !reachable.contains(*n)) {
         findings.push(unreachable_finding("struct", name));
     }
@@ -926,10 +941,7 @@ mod tests {
             .try_into()
             .unwrap(),
         };
-        let entries = vec![
-            ScSpecEntry::UdtStructV0(s),
-            ScSpecEntry::UdtErrorEnumV0(e),
-        ];
+        let entries = vec![ScSpecEntry::UdtStructV0(s), ScSpecEntry::UdtErrorEnumV0(e)];
 
         let report = lint(&entries, &default_options());
         let unreachable: Vec<_> = report

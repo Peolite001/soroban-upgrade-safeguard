@@ -129,7 +129,8 @@ fn an_unwritable_output_directory_names_the_path() {
     );
     let combined = run.combined();
     assert!(
-        combined.contains(&output.display().to_string()) || combined.contains(&dir.display().to_string()),
+        combined.contains(&output.display().to_string())
+            || combined.contains(&dir.display().to_string()),
         "error should name the failing output path, got: {combined}"
     );
 }

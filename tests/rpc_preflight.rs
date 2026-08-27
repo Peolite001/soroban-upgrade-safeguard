@@ -95,8 +95,11 @@ fn preflight_success_reports_all_checks_passing() {
         }
     })
     .to_string();
-    let (addr, _listener) =
-        start_mock_response("HTTP/1.0 200 OK", "Content-Type: application/json\r\n", &body);
+    let (addr, _listener) = start_mock_response(
+        "HTTP/1.0 200 OK",
+        "Content-Type: application/json\r\n",
+        &body,
+    );
 
     let config = RpcClientConfig::new(format!("http://{addr}")).unwrap();
     let report = run_preflight_with_timeout(&config, Duration::from_secs(5));
@@ -198,8 +201,11 @@ fn preflight_id_mismatch_reports_protocol_failure() {
         "result": { "status": "healthy" }
     })
     .to_string();
-    let (addr, _listener) =
-        start_mock_response("HTTP/1.0 200 OK", "Content-Type: application/json\r\n", &body);
+    let (addr, _listener) = start_mock_response(
+        "HTTP/1.0 200 OK",
+        "Content-Type: application/json\r\n",
+        &body,
+    );
 
     let config = RpcClientConfig::new(format!("http://{addr}")).unwrap();
     let report = run_preflight_with_timeout(&config, Duration::from_secs(5));
@@ -218,8 +224,11 @@ fn preflight_rpc_error_response_passes_protocol_but_fails_capability() {
         "error": { "code": -32601, "message": "method not found" }
     })
     .to_string();
-    let (addr, _listener) =
-        start_mock_response("HTTP/1.0 200 OK", "Content-Type: application/json\r\n", &body);
+    let (addr, _listener) = start_mock_response(
+        "HTTP/1.0 200 OK",
+        "Content-Type: application/json\r\n",
+        &body,
+    );
 
     let config = RpcClientConfig::new(format!("http://{addr}")).unwrap();
     let report = run_preflight_with_timeout(&config, Duration::from_secs(5));
@@ -248,8 +257,11 @@ fn preflight_cli_subcommand_exits_zero_on_success() {
         "result": { "status": "healthy", "latestLedger": 42 }
     })
     .to_string();
-    let (addr, _listener) =
-        start_mock_response("HTTP/1.0 200 OK", "Content-Type: application/json\r\n", &body);
+    let (addr, _listener) = start_mock_response(
+        "HTTP/1.0 200 OK",
+        "Content-Type: application/json\r\n",
+        &body,
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
         .args(["preflight", "--rpc-url", &format!("http://{addr}")])

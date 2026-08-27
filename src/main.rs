@@ -14,8 +14,9 @@ use soroban_upgrade_safeguard::{
         VerificationPolicy,
     },
     color::{should_disable_color, ColorMode},
-    diff, limits::ResourcePolicy, lint, loader, manifest,
-    diff, loader, manifest, migration,
+    diff,
+    limits::ResourcePolicy,
+    lint, loader, manifest, migration,
     oci::{self, OciArtifactKind, OciFetchConfig, OciReference},
     parser, preflight,
     remote::{self, RemoteFetchConfig, RemoteRef},
@@ -23,10 +24,9 @@ use soroban_upgrade_safeguard::{
     report,
     rpc::RpcClientConfig,
     spec,
-    spec_json::ExtractedSpec,
+    spec_json::{ExtractedSpec, InterfaceLockfile},
     storage_inference,
     storage_schema::{SchemaFormat, StorageSchema},
-    spec_json::{ExtractedSpec, InterfaceLockfile},
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
@@ -118,7 +118,12 @@ fn resolve_ancestor_config(enabled: bool) -> Result<Option<PathBuf>> {
         multiple => {
             let list = multiple
                 .iter()
-                .map(|p| format!("  - {}", loader::normalize_path_display(&p.display().to_string())))
+                .map(|p| {
+                    format!(
+                        "  - {}",
+                        loader::normalize_path_display(&p.display().to_string())
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             anyhow::bail!(
@@ -644,6 +649,8 @@ enum Command {
     Stream(StreamArgs),
     /// Validate one contract spec (and optional storage schema) in isolation
     Lint(LintArgs),
+    /// Validate RPC connectivity and JSON-RPC protocol shape without fetching contract code
+    Preflight(PreflightArgs),
 }
 
 /// `lint`: validate a single decoded contract spec (and optional storage
@@ -701,8 +708,6 @@ enum LintOutputFormat {
     Text,
     Json,
     Markdown,
-    /// Validate RPC connectivity and JSON-RPC protocol shape without fetching contract code
-    Preflight(PreflightArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -1202,9 +1207,8 @@ fn run_lint(args: &LintArgs) -> Result<()> {
 
     let schema = match &args.storage_schema {
         Some(path) => {
-            let content = std::fs::read_to_string(path).with_context(|| {
-                format!("Failed to read storage schema '{}'", path.display())
-            })?;
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read storage schema '{}'", path.display()))?;
             let format = match path.extension().and_then(|e| e.to_str()) {
                 Some("toml") => SchemaFormat::Toml,
                 _ => SchemaFormat::Json,
@@ -1247,7 +1251,9 @@ fn run_lint(args: &LintArgs) -> Result<()> {
     match args.format {
         LintOutputFormat::Text => print!("{}", report.render_text(args.explain)),
         LintOutputFormat::Markdown => print!("{}", report.render_markdown(args.explain)),
-        LintOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report.to_json_value())?),
+        LintOutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report.to_json_value())?)
+        }
     }
 
     if report.has_errors() {
@@ -1953,7 +1959,12 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
 
         let mut seen = std::collections::HashMap::new();
         for pair in &pairs {
-            let filename = evaluate_template(&args.per_contract_output_name_template, &pair.name, &pair.id, ext)?;
+            let filename = evaluate_template(
+                &args.per_contract_output_name_template,
+                &pair.name,
+                &pair.id,
+                ext,
+            )?;
             if let Some(other) = seen.insert(filename.clone(), format!("pair '{}'", pair.name)) {
                 anyhow::bail!(
                     "Output filename collision: both pair '{}' and {} resolve to the same filename '{}'",
@@ -1962,7 +1973,12 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             }
         }
         for gap in &gaps {
-            let filename = evaluate_template(&args.per_contract_output_name_template, &gap.name, &gap.name, ext)?;
+            let filename = evaluate_template(
+                &args.per_contract_output_name_template,
+                &gap.name,
+                &gap.name,
+                ext,
+            )?;
             if let Some(other) = seen.insert(filename.clone(), format!("gap '{}'", gap.name)) {
                 anyhow::bail!(
                     "Output filename collision: both gap '{}' and {} resolve to the same filename '{}'",
@@ -3171,7 +3187,10 @@ fn run_single(
         let status = soroban_upgrade_safeguard::watch_status::WatchStatus::starting(cycle);
         if let Some(ref path) = status_path {
             if let Err(e) = status.write_to(path) {
-                eprintln!("Warning: failed to write watch status file {}: {e}", path.display());
+                eprintln!(
+                    "Warning: failed to write watch status file {}: {e}",
+                    path.display()
+                );
             }
         }
         let result = run_comparison(progress);
@@ -3245,6 +3264,7 @@ fn is_batch_mode(args: &Args) -> bool {
     args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_to_outputs(
     report: &report::SafetyReport,
     outputs: &[OutputSpec],
@@ -3439,27 +3459,8 @@ fn write_atomically(path: &Path, content: &[u8]) -> Result<()> {
 fn emit_output(spec: &OutputSpec, content: &str) -> Result<()> {
     match &spec.path {
         Some(path) => {
-            write_atomically(path, content.as_bytes())?;
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("Failed to create output directory '{}'.", parent.display())
-                })?;
-            }
-            let temp_path = path.with_extension(format!(
-                "{}.tmp",
-                path.extension()
-                    .and_then(|ext| ext.to_str())
-                    .unwrap_or("tmp")
-            ));
-            std::fs::write(&temp_path, content).with_context(|| {
-                format!("Failed to write output file '{}'.", temp_path.display())
-            })?;
-            std::fs::rename(&temp_path, path).with_context(|| {
-                format!(
-                    "Failed to move written output into place at '{}'.",
-                    path.display()
-                )
-            })?;
+            write_atomically(path, content.as_bytes())
+                .with_context(|| format!("Failed to write output file '{}'.", path.display()))?;
         }
         None => {
             println!("{content}");
@@ -3550,90 +3551,90 @@ fn run_watch_mode(
     );
 
     let loop_result = (|| -> Result<()> {
-    loop {
-        if watch_shutdown_requested() {
-            eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
-            return Ok(());
-        }
+        loop {
+            if watch_shutdown_requested() {
+                eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+                return Ok(());
+            }
 
-        match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
-            Ok(_event) => {
-                // Brief debounce window: wait for more events
-                loop {
-                    match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(_) => {}
-                        Err(mpsc::RecvTimeoutError::Timeout) => break,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            return Err(anyhow::anyhow!("File watcher channel disconnected"));
-                        }
-                    }
-                    if watch_shutdown_requested() {
-                        break;
-                    }
-                }
-
-                if watch_shutdown_requested() {
-                    eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
-                    return Ok(());
-                }
-
-                // Check that watched files exist before re-running
-                let all_exist = watch_paths.iter().all(|p| p.exists());
-                if !all_exist {
-                    eprintln!("⚠️  Watched file(s) missing, waiting for them to reappear...");
-                    // Poll until files exist or timeout
-                    let start = std::time::Instant::now();
-                    let timeout = Duration::from_secs(30);
+            match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
+                Ok(_event) => {
+                    // Brief debounce window: wait for more events
                     loop {
-                        if watch_paths.iter().all(|p| p.exists()) {
-                            break;
+                        match rx.recv_timeout(Duration::from_millis(50)) {
+                            Ok(_) => {}
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                return Err(anyhow::anyhow!("File watcher channel disconnected"));
+                            }
                         }
                         if watch_shutdown_requested() {
-                            eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
-                            return Ok(());
-                        }
-                        if start.elapsed() > timeout {
-                            eprintln!("⚠️  Timed out waiting for files to reappear");
                             break;
                         }
-                        std::thread::sleep(Duration::from_millis(200));
                     }
-                }
 
-                // Clear terminal
-                print!("\x1B[2J\x1B[H");
+                    if watch_shutdown_requested() {
+                        eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+                        return Ok(());
+                    }
 
-                let progress = |line: String| {
-                    eprintln!("{line}");
-                };
-
-                eprintln!("🔄 Change detected, re-running comparison...\n");
-
-                match run_comparison(&progress) {
-                    Ok(safe) => {
-                        if safe {
-                            eprintln!("\n✅ Comparison passed");
-                        } else {
-                            eprintln!("\n❌ Comparison failed (breaking changes detected)");
+                    // Check that watched files exist before re-running
+                    let all_exist = watch_paths.iter().all(|p| p.exists());
+                    if !all_exist {
+                        eprintln!("⚠️  Watched file(s) missing, waiting for them to reappear...");
+                        // Poll until files exist or timeout
+                        let start = std::time::Instant::now();
+                        let timeout = Duration::from_secs(30);
+                        loop {
+                            if watch_paths.iter().all(|p| p.exists()) {
+                                break;
+                            }
+                            if watch_shutdown_requested() {
+                                eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+                                return Ok(());
+                            }
+                            if start.elapsed() > timeout {
+                                eprintln!("⚠️  Timed out waiting for files to reappear");
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(200));
                         }
                     }
-                    Err(e) => {
-                        eprintln!("\n⚠️  Error during comparison: {e:#}");
-                    }
-                }
 
-                eprintln!(
+                    // Clear terminal
+                    print!("\x1B[2J\x1B[H");
+
+                    let progress = |line: String| {
+                        eprintln!("{line}");
+                    };
+
+                    eprintln!("🔄 Change detected, re-running comparison...\n");
+
+                    match run_comparison(&progress) {
+                        Ok(safe) => {
+                            if safe {
+                                eprintln!("\n✅ Comparison passed");
+                            } else {
+                                eprintln!("\n❌ Comparison failed (breaking changes detected)");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("\n⚠️  Error during comparison: {e:#}");
+                        }
+                    }
+
+                    eprintln!(
                     "\n👀 Watch mode active (debounce: {debounce_ms}ms). Waiting for file changes... (Ctrl+C or SIGTERM to stop)\n"
                 );
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // No event - if this is the first run, just continue
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(anyhow::anyhow!("File watcher channel disconnected"));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // No event - if this is the first run, just continue
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow::anyhow!("File watcher channel disconnected"));
+                }
             }
         }
-    }
     })();
 
     if let Some(path) = status_path {
@@ -4291,7 +4292,8 @@ fn write_report_file(
     };
     let filename = evaluate_template(template, contract_name, pair_id, ext)?;
     let output_path = output_dir.join(filename);
-    write_atomically(&output_path, content.as_bytes())?;
+    write_atomically(&output_path, content.as_bytes())
+        .with_context(|| format!("Failed to write output file '{}'.", output_path.display()))?;
     Ok(())
 }
 
@@ -4328,23 +4330,12 @@ fn validate_template(template: &str) -> Result<()> {
 
     let mocked = evaluate_template(template, "mock-name", "mock-id", "txt")?;
     if mocked.is_empty() || mocked == "." || mocked == ".." {
-        anyhow::bail!("Template '{}' resolves to an invalid empty or dot-only filename", template);
+        anyhow::bail!(
+            "Template '{}' resolves to an invalid empty or dot-only filename",
+            template
+        );
     }
 
-    std::fs::create_dir_all(output_dir).with_context(|| {
-        format!(
-            "Failed to create output directory '{}'.",
-            output_dir.display()
-        )
-    })?;
-    std::fs::write(&temp_path, content)
-        .with_context(|| format!("Failed to write output file '{}'.", temp_path.display()))?;
-    std::fs::rename(&temp_path, &output_path).with_context(|| {
-        format!(
-            "Failed to move written output into place at '{}'.",
-            output_path.display()
-        )
-    })?;
     Ok(())
 }
 
@@ -4366,11 +4357,19 @@ fn evaluate_template(template: &str, name: &str, id: &str, ext: &str) -> Result<
     result = result.replace("{ext}", &ext_sanitized);
 
     if result.contains('/') || result.contains('\\') {
-        anyhow::bail!("Template '{}' resolved to a path containing separators: '{}'", template, result);
+        anyhow::bail!(
+            "Template '{}' resolved to a path containing separators: '{}'",
+            template,
+            result
+        );
     }
 
     if result.is_empty() || result == "." || result == ".." {
-        anyhow::bail!("Template '{}' resolved to an invalid filename: '{}'", template, result);
+        anyhow::bail!(
+            "Template '{}' resolved to an invalid filename: '{}'",
+            template,
+            result
+        );
     }
 
     Ok(result)
@@ -4493,7 +4492,10 @@ mod ancestor_config_tests {
 
         assert_eq!(
             find_ancestor_configs(&nested),
-            vec![mid.join(DEFAULT_CONFIG_FILE), root.join(DEFAULT_CONFIG_FILE)]
+            vec![
+                mid.join(DEFAULT_CONFIG_FILE),
+                root.join(DEFAULT_CONFIG_FILE)
+            ]
         );
     }
 
@@ -4508,6 +4510,15 @@ mod ancestor_config_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh scratch directory for one test, under the OS temp dir.
+    fn scratch(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("safeguard-main-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("failed to create scratch dir");
+        path
+    }
 
     #[test]
     fn batch_verdict_summary_totals_and_line_format() {

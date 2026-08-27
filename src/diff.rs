@@ -291,7 +291,9 @@ fn references_type_inner(
             }
             false
         }
-        ScSpecTypeDef::Option(opt) => references_type_inner(&opt.value_type, target_name, spec, visited),
+        ScSpecTypeDef::Option(opt) => {
+            references_type_inner(&opt.value_type, target_name, spec, visited)
+        }
         ScSpecTypeDef::Result(res) => {
             references_type_inner(&res.ok_type, target_name, spec, visited)
                 || references_type_inner(&res.error_type, target_name, spec, visited)

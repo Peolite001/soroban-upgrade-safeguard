@@ -523,8 +523,16 @@ fn dev_profile_runs_against_documented_v1_v2_fixture_clean_checkout_smoke() {
     let new_wasm = repo.join("tests").join("wasm").join("v2.wasm");
 
     assert!(dev_path.exists(), "dev profile must be checked in");
-    assert!(old_wasm.exists(), "v1 fixture missing: {}", old_wasm.display());
-    assert!(new_wasm.exists(), "v2 fixture missing: {}", new_wasm.display());
+    assert!(
+        old_wasm.exists(),
+        "v1 fixture missing: {}",
+        old_wasm.display()
+    );
+    assert!(
+        new_wasm.exists(),
+        "v2 fixture missing: {}",
+        new_wasm.display()
+    );
 
     let args = Args {
         wasm_paths: vec![old_wasm.clone(), new_wasm.clone()],

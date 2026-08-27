@@ -543,7 +543,10 @@ fn batch_manifest_writes_per_contract_custom_template() {
     assert_eq!(code, 0, "batch run must exit 0");
 
     let clean_path = output_dir.join("my-clean-id_custom.json");
-    assert!(clean_path.exists(), "expected custom-named report file to exist");
+    assert!(
+        clean_path.exists(),
+        "expected custom-named report file to exist"
+    );
 }
 
 #[test]
@@ -577,7 +580,10 @@ fn batch_manifest_invalid_template_placeholder_fails() {
     let code = output.status.code().expect("process terminated by signal");
     assert_eq!(code, 1, "batch run with invalid template must fail");
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("Unknown placeholder") || stderr.contains("invalid_placeholder"), "should report placeholder error");
+    assert!(
+        stderr.contains("Unknown placeholder") || stderr.contains("invalid_placeholder"),
+        "should report placeholder error"
+    );
 }
 
 #[test]
@@ -618,5 +624,8 @@ fn batch_manifest_template_collision_fails() {
     let code = output.status.code().expect("process terminated by signal");
     assert_eq!(code, 1, "batch run with template collision must fail");
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("collision"), "should report collision error");
+    assert!(
+        stderr.contains("collision"),
+        "should report collision error"
+    );
 }

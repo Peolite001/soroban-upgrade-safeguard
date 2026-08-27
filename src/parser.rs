@@ -332,7 +332,11 @@ mod tests {
         let wasm = wasm_with_two_custom_sections("contractspecv0", &section, &section);
 
         let metadata = extract_metadata(&wasm).expect("split identical sections must not fail");
-        assert_eq!(metadata.spec.len(), 2, "both sections' entries are concatenated");
+        assert_eq!(
+            metadata.spec.len(),
+            2,
+            "both sections' entries are concatenated"
+        );
 
         let spec = crate::spec::ContractSpec::from_entries(&metadata.spec);
         assert_eq!(
@@ -357,7 +361,10 @@ mod tests {
         assert_eq!(metadata.spec.len(), 2);
 
         let spec = crate::spec::ContractSpec::from_entries(&metadata.spec);
-        let resolved = spec.functions().get("hello").expect("function must resolve");
+        let resolved = spec
+            .functions()
+            .get("hello")
+            .expect("function must resolve");
         assert_eq!(resolved.doc.to_string(), "from section 0");
     }
 

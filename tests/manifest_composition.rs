@@ -1536,12 +1536,19 @@ fn batch_summary_counts_every_verdict_category_in_json() {
     let root = write_mixed_verdict_manifest(&dir);
 
     let run = run_manifest(&root, &[]);
-    assert_eq!(run.code, 1, "an unsafe/errored pair in the batch must fail the run");
+    assert_eq!(
+        run.code, 1,
+        "an unsafe/errored pair in the batch must fail the run"
+    );
     let json = run.json();
 
     assert_eq!(json["summary"]["safe"], 1, "summary: {}", json["summary"]);
     assert_eq!(json["summary"]["unsafe"], 1, "summary: {}", json["summary"]);
-    assert_eq!(json["summary"]["errored"], 1, "summary: {}", json["summary"]);
+    assert_eq!(
+        json["summary"]["errored"], 1,
+        "summary: {}",
+        json["summary"]
+    );
     assert_eq!(
         json["summary"]["incomplete"], 1,
         "summary: {}",
@@ -1585,7 +1592,8 @@ fn batch_summary_appears_before_detailed_results_in_text_output() {
         .find("Verdict Summary:")
         .expect("text output must include a Verdict Summary line");
     assert!(
-        run.stdout.contains("1 safe, 1 unsafe, 1 errored, 1 incomplete (4 total)"),
+        run.stdout
+            .contains("1 safe, 1 unsafe, 1 errored, 1 incomplete (4 total)"),
         "counts must match the mixed batch, got:\n{}",
         run.stdout
     );
@@ -1607,12 +1615,7 @@ fn batch_summary_appears_before_detailed_results_in_markdown_output() {
 
     let run = run_in(
         None,
-        &[
-            "--manifest",
-            root.to_str().unwrap(),
-            "--format",
-            "markdown",
-        ],
+        &["--manifest", root.to_str().unwrap(), "--format", "markdown"],
     );
     assert_eq!(run.code, 1);
 
@@ -1744,7 +1747,11 @@ fn max_pairs_exactly_at_the_custom_limit_runs_normally() {
         None,
         &["--manifest", root.to_str().unwrap(), "--max-pairs", "2"],
     );
-    assert_eq!(run.code, 0, "a manifest exactly at the limit must run: {}{}", run.stdout, run.stderr);
+    assert_eq!(
+        run.code, 0,
+        "a manifest exactly at the limit must run: {}{}",
+        run.stdout, run.stderr
+    );
 }
 
 #[test]
@@ -1888,12 +1895,7 @@ fn labels_appear_in_markdown_output() {
 
     let run = run_in(
         None,
-        &[
-            "--manifest",
-            root.to_str().unwrap(),
-            "--format",
-            "markdown",
-        ],
+        &["--manifest", root.to_str().unwrap(), "--format", "markdown"],
     );
     assert_eq!(run.code, 0);
     assert!(run.stdout.contains("Labels"), "got:\n{}", run.stdout);
@@ -2056,7 +2058,10 @@ fn manifest_version_defaults_to_one_integration() {
         "#,
     );
     let run = run_manifest(&root, &[]);
-    assert_eq!(run.code, 0, "legacy default version 1 must resolve successfully");
+    assert_eq!(
+        run.code, 0,
+        "legacy default version 1 must resolve successfully"
+    );
 }
 
 #[test]
@@ -2079,7 +2084,10 @@ fn manifest_version_one_toml_integration() {
         "#,
     );
     let run = run_manifest(&root, &[]);
-    assert_eq!(run.code, 0, "explicit version 1 TOML must resolve successfully");
+    assert_eq!(
+        run.code, 0,
+        "explicit version 1 TOML must resolve successfully"
+    );
 }
 
 #[test]
@@ -2098,7 +2106,10 @@ fn manifest_version_one_json_integration() {
         }"#,
     );
     let run = run_manifest(&root, &[]);
-    assert_eq!(run.code, 0, "explicit version 1 JSON must resolve successfully");
+    assert_eq!(
+        run.code, 0,
+        "explicit version 1 JSON must resolve successfully"
+    );
 }
 
 #[test]
@@ -2123,7 +2134,10 @@ fn manifest_version_mismatch_toml_integration() {
     let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
     assert_eq!(run.code, 1);
     let combined = format!("{}{}", run.stdout, run.stderr);
-    assert!(combined.contains("Unsupported manifest version"), "got: {combined}");
+    assert!(
+        combined.contains("Unsupported manifest version"),
+        "got: {combined}"
+    );
     assert!(combined.contains("Supported version: 1"), "got: {combined}");
     assert!(combined.contains("encountered: 2"), "got: {combined}");
 }
@@ -2146,7 +2160,10 @@ fn manifest_version_mismatch_json_integration() {
     let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
     assert_eq!(run.code, 1);
     let combined = format!("{}{}", run.stdout, run.stderr);
-    assert!(combined.contains("Unsupported manifest version"), "got: {combined}");
+    assert!(
+        combined.contains("Unsupported manifest version"),
+        "got: {combined}"
+    );
     assert!(combined.contains("Supported version: 1"), "got: {combined}");
     assert!(combined.contains("encountered: 2"), "got: {combined}");
 }
@@ -2178,7 +2195,10 @@ fn manifest_empty_pairs_toml_rejected_integration() {
     let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
     assert_eq!(run.code, 1);
     let combined = format!("{}{}", run.stdout, run.stderr);
-    assert!(combined.contains("contains no comparison pairs"), "got: {combined}");
+    assert!(
+        combined.contains("contains no comparison pairs"),
+        "got: {combined}"
+    );
     assert!(combined.contains("[[pairs]]"), "got: {combined}");
     assert!(combined.contains("\"pairs\":"), "got: {combined}");
 }
@@ -2186,15 +2206,14 @@ fn manifest_empty_pairs_toml_rejected_integration() {
 #[test]
 fn manifest_empty_pairs_json_rejected_integration() {
     let dir = temp_dir("mc-empty-pairs-json");
-    let root = write(
-        &dir,
-        "root.json",
-        r#"{"version": 1}"#,
-    );
+    let root = write(&dir, "root.json", r#"{"version": 1}"#);
     let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
     assert_eq!(run.code, 1);
     let combined = format!("{}{}", run.stdout, run.stderr);
-    assert!(combined.contains("contains no comparison pairs"), "got: {combined}");
+    assert!(
+        combined.contains("contains no comparison pairs"),
+        "got: {combined}"
+    );
     assert!(combined.contains("[[pairs]]"), "got: {combined}");
     assert!(combined.contains("\"pairs\":"), "got: {combined}");
 }

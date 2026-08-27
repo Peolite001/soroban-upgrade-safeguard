@@ -55,21 +55,41 @@ impl<'a> LayoutMapper<'a> {
         Self { spec }
     }
 
-    /// Recursively find all `Udt` names referenced by the given TypeDef.
+    /// Recursively find all `Udt` names the given TypeDef depends on.
+    ///
+    /// When `type_def` is itself a bare `Udt` reference, that type's own name
+    /// is deliberately excluded from the result (it is the subject being
+    /// expanded, not one of its own dependencies) *unless* a cycle leads back
+    /// to it, in which case it legitimately is one of its own transitive
+    /// dependencies.
     pub fn get_udt_dependencies(&self, type_def: &ScSpecTypeDef) -> HashSet<String> {
         let mut deps = HashSet::new();
-        self.extract_udts(type_def, &mut deps);
+        let mut visited = HashSet::new();
+        if let ScSpecTypeDef::Udt(udt) = type_def {
+            let name = udt.name.to_string();
+            visited.insert(name.clone());
+            self.expand_udt_members(&name, &mut deps, &mut visited);
+        } else {
+            self.extract_udts(type_def, &mut deps, &mut visited);
+        }
         deps
     }
 
-    /// Builds a graph mapping each UDT name to a list of other UDT names that depend on it.
+    /// Builds a graph mapping each UDT name to the list of other UDT names
+    /// that directly (one hop, after unwrapping containers) reference it as
+    /// a field or case-payload type. Unlike [`Self::get_udt_dependencies`],
+    /// this is intentionally *not* transitive: [`crate::diff`]'s cascade
+    /// detection walks this graph itself to propagate a break through
+    /// multiple hops, and a transitive edge set here would wrongly fold a
+    /// UDT that merely participates in a cycle into its own reverse entry.
     pub fn build_reverse_dependencies(&self) -> HashMap<String, Vec<String>> {
         let mut reverse_deps: HashMap<String, Vec<String>> = HashMap::new();
 
         for (name, struct_def) in &self.spec.structs {
             let fields: &[stellar_xdr::curr::ScSpecUdtStructFieldV0] = struct_def.fields.as_ref();
             for field in fields {
-                let deps = self.get_udt_dependencies(&field.type_);
+                let mut deps = HashSet::new();
+                self.direct_udt_refs(&field.type_, &mut deps);
                 for dep in deps {
                     reverse_deps.entry(dep).or_default().push(name.clone());
                 }
@@ -82,7 +102,8 @@ impl<'a> LayoutMapper<'a> {
                 if let ScSpecUdtUnionCaseV0::TupleV0(tuple) = case {
                     let types: &[stellar_xdr::curr::ScSpecTypeDef] = tuple.type_.as_ref();
                     for t in types {
-                        let deps = self.get_udt_dependencies(t);
+                        let mut deps = HashSet::new();
+                        self.direct_udt_refs(t, &mut deps);
                         for dep in deps {
                             reverse_deps.entry(dep).or_default().push(name.clone());
                         }
@@ -99,52 +120,95 @@ impl<'a> LayoutMapper<'a> {
         reverse_deps
     }
 
-    fn extract_udts(&self, type_def: &ScSpecTypeDef, deps: &mut HashSet<String>) {
+    /// Unwrap containers (`Option`/`Result`/`Vec`/`Map`/`Tuple`) to find the
+    /// `Udt` names directly present in `type_def`'s own signature, without
+    /// expanding into any referenced UDT's body. Used for one-hop edges; see
+    /// [`Self::build_reverse_dependencies`].
+    fn direct_udt_refs(&self, type_def: &ScSpecTypeDef, out: &mut HashSet<String>) {
         match type_def {
-            ScSpecTypeDef::Option(opt) => self.extract_udts(&opt.value_type, deps),
+            ScSpecTypeDef::Option(opt) => self.direct_udt_refs(&opt.value_type, out),
             ScSpecTypeDef::Result(res) => {
-                self.extract_udts(&res.ok_type, deps);
-                self.extract_udts(&res.error_type, deps);
+                self.direct_udt_refs(&res.ok_type, out);
+                self.direct_udt_refs(&res.error_type, out);
             }
-            ScSpecTypeDef::Vec(vec) => self.extract_udts(&vec.element_type, deps),
+            ScSpecTypeDef::Vec(vec) => self.direct_udt_refs(&vec.element_type, out),
             ScSpecTypeDef::Map(map) => {
-                self.extract_udts(&map.key_type, deps);
-                self.extract_udts(&map.value_type, deps);
+                self.direct_udt_refs(&map.key_type, out);
+                self.direct_udt_refs(&map.value_type, out);
             }
             ScSpecTypeDef::Tuple(tuple) => {
                 let types: &[stellar_xdr::curr::ScSpecTypeDef] = tuple.value_types.as_ref();
                 for t in types {
-                    self.extract_udts(t, deps);
+                    self.direct_udt_refs(t, out);
+                }
+            }
+            ScSpecTypeDef::Udt(udt) => {
+                out.insert(udt.name.to_string());
+            }
+            _ => {} // Primitive types
+        }
+    }
+
+    /// Expand the members of the UDT named `name` (a struct's fields or a
+    /// union's tuple-case payloads), recording every `Udt` reference found —
+    /// including `name` itself, should a cycle lead back to it.
+    fn expand_udt_members(
+        &self,
+        name: &str,
+        deps: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+    ) {
+        if let Some(struct_def) = self.spec.structs.get(name) {
+            let fields: &[stellar_xdr::curr::ScSpecUdtStructFieldV0] = struct_def.fields.as_ref();
+            for field in fields {
+                self.extract_udts(&field.type_, deps, visited);
+            }
+        } else if let Some(union_def) = self.spec.unions.get(name) {
+            let cases: &[stellar_xdr::curr::ScSpecUdtUnionCaseV0] = union_def.cases.as_ref();
+            for case in cases {
+                match case {
+                    ScSpecUdtUnionCaseV0::TupleV0(tuple) => {
+                        let types: &[stellar_xdr::curr::ScSpecTypeDef] = tuple.type_.as_ref();
+                        for t in types {
+                            self.extract_udts(t, deps, visited);
+                        }
+                    }
+                    ScSpecUdtUnionCaseV0::VoidV0(_) => {}
+                }
+            }
+        }
+        // Enums and ErrorEnums are primitives, no nested types.
+    }
+
+    fn extract_udts(
+        &self,
+        type_def: &ScSpecTypeDef,
+        deps: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+    ) {
+        match type_def {
+            ScSpecTypeDef::Option(opt) => self.extract_udts(&opt.value_type, deps, visited),
+            ScSpecTypeDef::Result(res) => {
+                self.extract_udts(&res.ok_type, deps, visited);
+                self.extract_udts(&res.error_type, deps, visited);
+            }
+            ScSpecTypeDef::Vec(vec) => self.extract_udts(&vec.element_type, deps, visited),
+            ScSpecTypeDef::Map(map) => {
+                self.extract_udts(&map.key_type, deps, visited);
+                self.extract_udts(&map.value_type, deps, visited);
+            }
+            ScSpecTypeDef::Tuple(tuple) => {
+                let types: &[stellar_xdr::curr::ScSpecTypeDef] = tuple.value_types.as_ref();
+                for t in types {
+                    self.extract_udts(t, deps, visited);
                 }
             }
             ScSpecTypeDef::Udt(udt) => {
                 let name = udt.name.to_string();
+                deps.insert(name.clone());
                 // Prevent infinite recursion if types are cyclic
-                if deps.insert(name.clone()) {
-                    // It's a new UDT we haven't seen. Let's recursively find its members.
-                    if let Some(struct_def) = self.spec.structs.get(&name) {
-                        let fields: &[stellar_xdr::curr::ScSpecUdtStructFieldV0] =
-                            struct_def.fields.as_ref();
-                        for field in fields {
-                            self.extract_udts(&field.type_, deps);
-                        }
-                    } else if let Some(union_def) = self.spec.unions.get(&name) {
-                        let cases: &[stellar_xdr::curr::ScSpecUdtUnionCaseV0] =
-                            union_def.cases.as_ref();
-                        for case in cases {
-                            match case {
-                                ScSpecUdtUnionCaseV0::TupleV0(tuple) => {
-                                    let types: &[stellar_xdr::curr::ScSpecTypeDef] =
-                                        tuple.type_.as_ref();
-                                    for t in types {
-                                        self.extract_udts(t, deps);
-                                    }
-                                }
-                                ScSpecUdtUnionCaseV0::VoidV0(_) => {}
-                            }
-                        }
-                    }
-                    // Enums and ErrorEnums are primitives, no nested types.
+                if visited.insert(name.clone()) {
+                    self.expand_udt_members(&name, deps, visited);
                 }
             }
             _ => {} // Primitive types
@@ -189,11 +253,7 @@ mod tests {
         );
     }
 
-    fn insert_union(
-        spec: &mut ContractSpec,
-        name: &str,
-        cases: Vec<(&str, Vec<ScSpecTypeDef>)>,
-    ) {
+    fn insert_union(spec: &mut ContractSpec, name: &str, cases: Vec<(&str, Vec<ScSpecTypeDef>)>) {
         let mut xdr_cases: Vec<ScSpecUdtUnionCaseV0> = Vec::new();
         for (case_name, payloads) in cases {
             if payloads.is_empty() {
@@ -230,12 +290,18 @@ mod tests {
             "Mid",
             vec![
                 ("direct", udt("Leaf")),
-                ("wrapped_opt", ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
-                    value_type: Box::new(udt("Leaf")),
-                }))),
-                ("wrapped_vec", ScSpecTypeDef::Vec(Box::new(ScSpecTypeVec {
-                    element_type: Box::new(udt("Leaf")),
-                }))),
+                (
+                    "wrapped_opt",
+                    ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+                        value_type: Box::new(udt("Leaf")),
+                    })),
+                ),
+                (
+                    "wrapped_vec",
+                    ScSpecTypeDef::Vec(Box::new(ScSpecTypeVec {
+                        element_type: Box::new(udt("Leaf")),
+                    })),
+                ),
             ],
         );
 
@@ -244,17 +310,26 @@ mod tests {
             "Root",
             vec![
                 ("mid", udt("Mid")),
-                ("map_of_leaf_to_mid", ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
-                    key_type: Box::new(udt("Leaf")),
-                    value_type: Box::new(udt("Mid")),
-                }))),
-                ("result_leaf_mid", ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
-                    ok_type: Box::new(udt("Leaf")),
-                    error_type: Box::new(udt("Mid")),
-                }))),
-                ("tuple_mid_leaf", ScSpecTypeDef::Tuple(Box::new(ScSpecTypeTuple {
-                    value_types: VecM::try_from(vec![udt("Mid"), udt("Leaf")]).unwrap(),
-                }))),
+                (
+                    "map_of_leaf_to_mid",
+                    ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
+                        key_type: Box::new(udt("Leaf")),
+                        value_type: Box::new(udt("Mid")),
+                    })),
+                ),
+                (
+                    "result_leaf_mid",
+                    ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+                        ok_type: Box::new(udt("Leaf")),
+                        error_type: Box::new(udt("Mid")),
+                    })),
+                ),
+                (
+                    "tuple_mid_leaf",
+                    ScSpecTypeDef::Tuple(Box::new(ScSpecTypeTuple {
+                        value_types: VecM::try_from(vec![udt("Mid"), udt("Leaf")]).unwrap(),
+                    })),
+                ),
             ],
         );
 
@@ -357,7 +432,11 @@ mod tests {
             "Every UDT used as a field type anywhere must appear as a reverse key"
         );
 
-        assert_eq!(reverse["CycleA"], vec!["CycleB".to_string()]);
+        assert_eq!(
+            reverse["CycleA"],
+            vec!["CycleB".to_string(), "U".to_string()],
+            "CycleA is referenced from CycleB's field and from union case Pair"
+        );
         assert_eq!(reverse["CycleB"], vec!["CycleA".to_string()]);
 
         assert_eq!(

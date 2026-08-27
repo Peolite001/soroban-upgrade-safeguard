@@ -452,13 +452,13 @@ mod tests {
     #[test]
     fn normalize_rejects_malformed_urls() {
         let cases = [
-            "example.test/rpc",       // no scheme
-            "ftp://example.test",     // unsupported scheme
-            "https://",               // no host
-            "https:///rpc",           // no host, path only
+            "example.test/rpc",             // no scheme
+            "ftp://example.test",           // unsupported scheme
+            "https://",                     // no host
+            "https:///rpc",                 // no host, path only
             "https://example.test:abc/rpc", // non-numeric port
-            "https://:8080/rpc",      // empty host with port
-            "http://[::1/rpc",        // unterminated IPv6 literal
+            "https://:8080/rpc",            // empty host with port
+            "http://[::1/rpc",              // unterminated IPv6 literal
         ];
         for case in cases {
             let err = normalize_url(case)

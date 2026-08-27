@@ -669,7 +669,7 @@ impl RenderableReport {
         }
 
         if !self.budget_violations.is_empty() {
-            output.push_str("\n");
+            output.push('\n');
             output.push_str(
                 &"========================================\n"
                     .bold()
@@ -1371,7 +1371,11 @@ mod tests {
         let text = report.generate_summary_text_with_width(false, Some(200));
         let lines = wrapped_finding_lines(&text);
 
-        assert_eq!(lines, vec![format!("🔴 {message}")], "full text was:\n{text}");
+        assert_eq!(
+            lines,
+            vec![format!("🔴 {message}")],
+            "full text was:\n{text}"
+        );
     }
 
     #[test]
@@ -1383,7 +1387,11 @@ mod tests {
         let text = report.generate_summary_text(false);
         let lines = wrapped_finding_lines(&text);
 
-        assert_eq!(lines, vec![format!("🔴 {message}")], "full text was:\n{text}");
+        assert_eq!(
+            lines,
+            vec![format!("🔴 {message}")],
+            "full text was:\n{text}"
+        );
     }
 
     #[test]

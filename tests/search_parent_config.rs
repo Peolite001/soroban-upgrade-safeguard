@@ -42,8 +42,10 @@ fn all_critical_suppressions() -> &'static str {
 /// `<root>/services/api/src/` is a plausible nested working directory three
 /// levels down. Returns `(root, nested)`.
 fn workspace(name: &str) -> (PathBuf, PathBuf) {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("search-parent-config-{name}-{}", std::process::id()));
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "search-parent-config-{name}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     let nested = root.join("services").join("api").join("src");
     std::fs::create_dir_all(&nested).expect("failed to create nested dir");
@@ -189,8 +191,10 @@ fn search_parent_config_stops_at_the_workspace_boundary() {
     // private tree (rather than reaching into the shared parent of
     // `workspace()`'s directory) so a failed assertion can never leave a
     // stray `.safeguard.toml` behind for a later test run to trip over.
-    let outer = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("search-parent-config-boundary-{}", std::process::id()));
+    let outer = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "search-parent-config-boundary-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&outer);
     let root = outer.join("repo");
     let nested = root.join("services").join("api").join("src");

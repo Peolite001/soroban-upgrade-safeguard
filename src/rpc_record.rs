@@ -273,6 +273,7 @@ fn fetch_wasm_recording(
         sha256: sha256_hex(&wasm_bytes),
         bytes: wasm_bytes,
         rpc_provenance: None,
+        symlink: None,
     })
 }
 
@@ -432,6 +433,7 @@ pub fn replay_wasm_from_bundle_struct(bundle: &ReplayBundle) -> Result<WasmModul
         sha256: sha,
         bytes: wasm_bytes,
         rpc_provenance: None,
+        symlink: None,
     })
 }
 

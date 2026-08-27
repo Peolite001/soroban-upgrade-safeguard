@@ -200,11 +200,7 @@ fn narrow_width_wraps_batch_text_output_too() {
     );
     let manifest_path = write_manifest("text_width_batch_manifest.toml", &manifest_content);
 
-    let default_output = run(&[
-        "--manifest",
-        manifest_path.to_str().unwrap(),
-        "--quiet",
-    ]);
+    let default_output = run(&["--manifest", manifest_path.to_str().unwrap(), "--quiet"]);
     let narrow_output = run(&[
         "--manifest",
         manifest_path.to_str().unwrap(),

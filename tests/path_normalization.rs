@@ -123,7 +123,10 @@ fn batch_json_path_fields_never_contain_a_backslash() {
     let result = &json["results"][0];
     for field in ["old", "new"] {
         let value = result[field].as_str().unwrap_or_else(|| {
-            panic!("results[0].{field} must be a string, got {:?}", result[field])
+            panic!(
+                "results[0].{field} must be a string, got {:?}",
+                result[field]
+            )
         });
         assert!(
             !value.contains('\\'),
@@ -317,7 +320,8 @@ fn a_missing_file_error_still_names_the_exact_path_given() {
     // unmodified by report-facing normalization (which only applies to the
     // path recorded for a successfully loaded module, not to error text).
     assert!(
-        run.stderr.contains(missing.file_name().unwrap().to_str().unwrap()),
+        run.stderr
+            .contains(missing.file_name().unwrap().to_str().unwrap()),
         "error should name the missing file: {}",
         run.stderr
     );

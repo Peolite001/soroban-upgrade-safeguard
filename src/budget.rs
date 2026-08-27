@@ -67,17 +67,13 @@ use crate::report::ReportedFinding;
 /// Which finding count a budget entry evaluates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BudgetMetric {
     /// Every finding the entry's scope claims, suppressed or not.
     Raw,
     /// Only findings not acknowledged by a suppression rule.
+    #[default]
     Unsuppressed,
-}
-
-impl Default for BudgetMetric {
-    fn default() -> Self {
-        BudgetMetric::Unsuppressed
-    }
 }
 
 impl BudgetMetric {
@@ -218,9 +214,7 @@ impl BudgetConfig {
                         if is_known_rule_id(rule_id) {
                             Some(BudgetScope::Rule(rule_id.clone()))
                         } else {
-                            errors.push(format!(
-                                "budget #{position}: unknown rule_id '{rule_id}'"
-                            ));
+                            errors.push(format!("budget #{position}: unknown rule_id '{rule_id}'"));
                             None
                         }
                     }
@@ -429,7 +423,14 @@ mod tests {
     fn reported(category: &str, axes: Vec<CompatibilityAxis>, suppressed: bool) -> ReportedFinding {
         ReportedFinding {
             rule_id: crate::suppression::canonical_rule_id(category),
-            finding: Finding::new(axes.clone(), category.to_string(), "msg".into(), None, None, None),
+            finding: Finding::new(
+                axes.clone(),
+                category.to_string(),
+                "msg".into(),
+                None,
+                None,
+                None,
+            ),
             axes,
             suppressed,
             suppression_reason: None,
@@ -449,8 +450,16 @@ mod tests {
     #[test]
     fn global_budget_counts_unclaimed_findings() {
         let findings = vec![
-            reported("Enum Case Added", vec![CompatibilityAxis::SourceLevel], false),
-            reported("Function Added", vec![CompatibilityAxis::SourceLevel], false),
+            reported(
+                "Enum Case Added",
+                vec![CompatibilityAxis::SourceLevel],
+                false,
+            ),
+            reported(
+                "Function Added",
+                vec![CompatibilityAxis::SourceLevel],
+                false,
+            ),
         ];
         let refs: Vec<&ReportedFinding> = findings.iter().collect();
         let entries = vec![entry(BudgetScope::Global, BudgetMetric::Unsuppressed, 1)];
@@ -475,7 +484,11 @@ mod tests {
                 vec![CompatibilityAxis::EventIndexer],
                 false,
             ),
-            reported("Function Added", vec![CompatibilityAxis::SourceLevel], false),
+            reported(
+                "Function Added",
+                vec![CompatibilityAxis::SourceLevel],
+                false,
+            ),
         ];
         let refs: Vec<&ReportedFinding> = findings.iter().collect();
         let entries = vec![
@@ -534,7 +547,11 @@ mod tests {
     fn unsuppressed_metric_ignores_suppressed_findings() {
         let findings = vec![
             reported("Function Added", vec![CompatibilityAxis::SourceLevel], true),
-            reported("Function Added", vec![CompatibilityAxis::SourceLevel], false),
+            reported(
+                "Function Added",
+                vec![CompatibilityAxis::SourceLevel],
+                false,
+            ),
         ];
         let refs: Vec<&ReportedFinding> = findings.iter().collect();
         let entries = vec![entry(BudgetScope::Global, BudgetMetric::Unsuppressed, 1)];
@@ -547,7 +564,11 @@ mod tests {
     fn raw_metric_counts_suppressed_findings_too() {
         let findings = vec![
             reported("Function Added", vec![CompatibilityAxis::SourceLevel], true),
-            reported("Function Added", vec![CompatibilityAxis::SourceLevel], false),
+            reported(
+                "Function Added",
+                vec![CompatibilityAxis::SourceLevel],
+                false,
+            ),
         ];
         let refs: Vec<&ReportedFinding> = findings.iter().collect();
         let entries = vec![entry(BudgetScope::Global, BudgetMetric::Raw, 1)];
@@ -565,7 +586,11 @@ mod tests {
                 vec![CompatibilityAxis::StorageLayout],
                 false,
             ),
-            reported("Function Added", vec![CompatibilityAxis::SourceLevel], false),
+            reported(
+                "Function Added",
+                vec![CompatibilityAxis::SourceLevel],
+                false,
+            ),
         ];
         let refs: Vec<&ReportedFinding> = findings.iter().collect();
         let mut critical_only = entry(BudgetScope::Global, BudgetMetric::Raw, 0);

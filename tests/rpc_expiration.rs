@@ -124,7 +124,10 @@ fn build_instance_entry_xdr(wasm_hash: &[u8; 32], durability: ContractDataDurabi
 
 /// Build a `getLedgerEntries` JSON-RPC success response for one entry,
 /// optionally attaching a `liveUntilLedgerSeq` value of any JSON shape.
-fn build_rpc_entries_response(xdr: &str, live_until: Option<serde_json::Value>) -> serde_json::Value {
+fn build_rpc_entries_response(
+    xdr: &str,
+    live_until: Option<serde_json::Value>,
+) -> serde_json::Value {
     let mut entry = serde_json::json!({
         "key": "ignored",
         "xdr": xdr,

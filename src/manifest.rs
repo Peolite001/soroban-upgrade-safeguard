@@ -317,7 +317,11 @@ impl std::fmt::Display for Origin {
             Origin::Cli => write!(f, "cli"),
             Origin::Env => write!(f, "env"),
             Origin::File(path) => {
-                write!(f, "{}", crate::loader::normalize_path_display(&path.display().to_string()))
+                write!(
+                    f,
+                    "{}",
+                    crate::loader::normalize_path_display(&path.display().to_string())
+                )
             }
         }
     }
@@ -719,9 +723,9 @@ fn visit(path: &Path, walk: &mut Walk, stack: &mut Vec<PathBuf>, depth: usize) -
 /// explicit `is_empty` guard.)
 fn is_valid_token(value: &str, extra: &[char]) -> bool {
     !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || extra.contains(&c))
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || extra.contains(&c)
+        })
 }
 
 fn is_valid_pair_id(id: &str) -> bool {
@@ -1127,7 +1131,7 @@ impl ResolvedManifest {
             "sources": self
                 .sources
                 .iter()
-                .map(display_path)
+                .map(|p| display_path(p))
                 .collect::<Vec<_>>(),
             "pairs": self.pairs.iter().map(ResolvedPair::to_json).collect::<Vec<_>>(),
             "dependencies": self.dependencies,
@@ -2153,7 +2157,9 @@ mod tests {
         // ahead of the (more expensive) duplicate-detection fold.
         let dir = temp_dir("max-pairs-before-fold");
         let mut body = pairs_toml(3);
-        body.push_str("[[pairs]]\nold = \"dup_v1.wasm\"\nnew = \"dup_v2.wasm\"\nname = \"same\"\n\n");
+        body.push_str(
+            "[[pairs]]\nold = \"dup_v1.wasm\"\nnew = \"dup_v2.wasm\"\nname = \"same\"\n\n",
+        );
         body.push_str("[[pairs]]\nold = \"dup_v1.wasm\"\nnew = \"dup_v2.wasm\"\nname = \"same\"\n");
         let root = write(&dir, "root.toml", &body);
         let cli = CliSettings {
@@ -2511,9 +2517,12 @@ mod tests {
             labels = ["service:token", "stage:prod"]
             "#,
         );
-        let resolved = resolve(&root, &CliSettings::default())
-            .expect("key:value labels must be accepted");
-        assert_eq!(resolved.pairs[0].labels, vec!["service:token", "stage:prod"]);
+        let resolved =
+            resolve(&root, &CliSettings::default()).expect("key:value labels must be accepted");
+        assert_eq!(
+            resolved.pairs[0].labels,
+            vec!["service:token", "stage:prod"]
+        );
     }
 
     #[test]
@@ -2532,7 +2541,10 @@ mod tests {
             "#,
         );
         let error = format!("{:#}", resolve(&root, &CliSettings::default()).unwrap_err());
-        assert!(error.contains("Invalid pair id 'stage:prod'"), "got: {error}");
+        assert!(
+            error.contains("Invalid pair id 'stage:prod'"),
+            "got: {error}"
+        );
     }
 
     #[test]
@@ -2677,7 +2689,10 @@ mod tests {
         );
         let resolved = resolve(&root, &CliSettings::default()).unwrap();
         let json = resolved.to_json();
-        assert_eq!(json["pairs"][0]["labels"], serde_json::json!(["prod", "payments"]));
+        assert_eq!(
+            json["pairs"][0]["labels"],
+            serde_json::json!(["prod", "payments"])
+        );
     }
 
     #[test]
@@ -3062,8 +3077,13 @@ mod tests {
             new = "a_v2.wasm"
             "#,
         );
-        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
-        assert!(error.contains("Unsupported manifest version"), "got: {error}");
+        let error = resolve(&root, &CliSettings::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Unsupported manifest version"),
+            "got: {error}"
+        );
         assert!(error.contains("Supported version: 1"), "got: {error}");
         assert!(error.contains("encountered: 2"), "got: {error}");
     }
@@ -3076,8 +3096,13 @@ mod tests {
             "root.json",
             r#"{"version": 2, "pairs": [{"old": "a_v1.wasm", "new": "a_v2.wasm"}]}"#,
         );
-        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
-        assert!(error.contains("Unsupported manifest version"), "got: {error}");
+        let error = resolve(&root, &CliSettings::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Unsupported manifest version"),
+            "got: {error}"
+        );
         assert!(error.contains("Supported version: 1"), "got: {error}");
         assert!(error.contains("encountered: 2"), "got: {error}");
     }
@@ -3102,8 +3127,13 @@ mod tests {
             new = "a_v2.wasm"
             "#,
         );
-        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
-        assert!(error.contains("Unsupported manifest version"), "got: {error}");
+        let error = resolve(&root, &CliSettings::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Unsupported manifest version"),
+            "got: {error}"
+        );
         assert!(error.contains("Supported version: 1"), "got: {error}");
         assert!(error.contains("encountered: 2"), "got: {error}");
     }
@@ -3112,7 +3142,11 @@ mod tests {
     fn manifest_whitespace_only_rejected() {
         let dir = temp_dir("manifest-whitespace");
         let root = write(&dir, "root.toml", "   \n\t  \n");
-        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
+        // The "is empty" diagnostic is the underlying cause, wrapped by an
+        // outer "Failed to load manifest" context; `to_string()` only shows
+        // the outermost message, so the full chain is needed here (as the
+        // CLI itself prints via `{:?}` when a run fails).
+        let error = format!("{:?}", resolve(&root, &CliSettings::default()).unwrap_err());
         assert!(error.contains("is empty"), "got: {error}");
         assert!(error.contains("[[pairs]]"), "got: {error}");
         assert!(error.contains("\"pairs\":"), "got: {error}");
@@ -3122,8 +3156,13 @@ mod tests {
     fn manifest_no_pairs_rejected() {
         let dir = temp_dir("manifest-no-pairs");
         let root = write(&dir, "root.toml", "version = 1");
-        let error = resolve(&root, &CliSettings::default()).unwrap_err().to_string();
-        assert!(error.contains("contains no comparison pairs"), "got: {error}");
+        let error = resolve(&root, &CliSettings::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("contains no comparison pairs"),
+            "got: {error}"
+        );
         assert!(error.contains("[[pairs]]"), "got: {error}");
         assert!(error.contains("\"pairs\":"), "got: {error}");
     }

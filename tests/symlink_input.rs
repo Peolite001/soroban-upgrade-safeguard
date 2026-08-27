@@ -174,7 +174,12 @@ fn a_relative_symlink_input_reports_a_relative_requested_path() {
     // current directory.
     let run = run_in(
         Some(&dir),
-        &[wasm("v1.wasm").to_str().unwrap(), "new.wasm", "--format", "json"],
+        &[
+            wasm("v1.wasm").to_str().unwrap(),
+            "new.wasm",
+            "--format",
+            "json",
+        ],
     );
     assert_eq!(run.code, Some(0), "{}", run.combined());
     let json = run.json();

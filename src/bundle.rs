@@ -47,28 +47,15 @@ pub struct BundleInspection {
     pub members: BTreeMap<String, MemberInfo>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CreateOptions {
     pub no_timestamp: bool,
     pub generator: Option<String>,
     pub provenance: BTreeMap<String, String>,
 }
 
-impl Default for CreateOptions {
-    fn default() -> Self {
-        Self {
-            no_timestamp: false,
-            generator: None,
-            provenance: BTreeMap::new(),
-        }
-    }
-}
-
 fn default_generator() -> String {
-    format!(
-        "soroban-upgrade-safeguard/{}",
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("soroban-upgrade-safeguard/{}", env!("CARGO_PKG_VERSION"))
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -120,7 +107,9 @@ fn validate_member_name(name: &str) -> Result<()> {
     for comp in p.components() {
         match comp {
             Component::Normal(_) => {}
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::ParentDir
             | Component::CurDir => {
                 bail!("Member path must be relative and contain no '..' or '.'");
             }
@@ -182,7 +171,10 @@ pub fn create_bundle(
         let meta = fs::metadata(src_path)
             .with_context(|| format!("Missing member source: {}", src_path.display()))?;
         if !meta.is_file() {
-            bail!("Member source is not a regular file: {}", src_path.display());
+            bail!(
+                "Member source is not a regular file: {}",
+                src_path.display()
+            );
         }
         let size = meta.len();
         if size > MAX_MEMBER_BYTES as u64 {
@@ -196,19 +188,15 @@ pub fn create_bundle(
             .checked_add(size)
             .ok_or_else(|| anyhow!("Total member bytes overflow"))?;
         if total_bytes > MAX_TOTAL_BYTES {
-            bail!(
-                "Bundle total exceeds max size of {} bytes",
-                MAX_TOTAL_BYTES
-            );
+            bail!("Bundle total exceeds max size of {} bytes", MAX_TOTAL_BYTES);
         }
 
         let (sha, actual_size) = sha256_file(src_path)?;
 
         let dest = canonical_member_path(bundle_dir, name)?;
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create parent dir for member '{}'", name)
-            })?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create parent dir for member '{}'", name))?;
         }
         fs::copy(src_path, &dest).with_context(|| {
             format!(
@@ -228,17 +216,12 @@ pub fn create_bundle(
         );
     }
 
-    let generator = opts
-        .generator
-        .clone()
-        .unwrap_or_else(default_generator);
+    let generator = opts.generator.clone().unwrap_or_else(default_generator);
 
     let created_at = if opts.no_timestamp {
         None
     } else {
-        Some(
-            chrono_like_now_iso(),
-        )
+        Some(chrono_like_now_iso())
     };
 
     let provenance = opts.provenance.clone();
@@ -279,10 +262,7 @@ fn chrono_like_now_iso() -> String {
     };
     let secs = dur.as_secs();
     let (y, mo, d, h, mi, s) = secs_to_ymdhms(secs);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, mo, d, h, mi, s
-    )
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
 }
 
 fn secs_to_ymdhms(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
@@ -295,7 +275,7 @@ fn secs_to_ymdhms(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let mut days = secs;
     let mut y: u32 = 1970;
     loop {
-        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
         let ydays = if leap { 366 } else { 365 };
         if days < ydays as u64 {
             break;
@@ -303,8 +283,21 @@ fn secs_to_ymdhms(mut secs: u64) -> (u32, u32, u32, u32, u32, u32) {
         days -= ydays as u64;
         y += 1;
     }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let mdays = [31u32, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+    let mdays = [
+        31u32,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut mo: u32 = 0;
     for (i, &md) in mdays.iter().enumerate() {
         if days < md as u64 {
@@ -349,8 +342,8 @@ pub fn verify_bundle(bundle_dir: &Path) -> Result<BundleManifest> {
         validate_member_name(name)
             .with_context(|| format!("Manifest contains invalid member name: {}", name))?;
         let path = canonical_member_path(bundle_dir, name)?;
-        let (sha, size) = sha256_file(&path)
-            .with_context(|| format!("Failed to rehash member '{}'", name))?;
+        let (sha, size) =
+            sha256_file(&path).with_context(|| format!("Failed to rehash member '{}'", name))?;
         if sha != info.sha256 {
             bail!(
                 "Hash mismatch for member '{}': expected {} got {}",
@@ -415,8 +408,7 @@ pub fn read_member(bundle_dir: &Path, name: &str) -> Result<Vec<u8>> {
     validate_member_name(name)?;
     let _ = &load_manifest(bundle_dir)?;
     let path = canonical_member_path(bundle_dir, name)?;
-    let meta = fs::metadata(&path)
-        .with_context(|| format!("Missing bundle member: {}", name))?;
+    let meta = fs::metadata(&path).with_context(|| format!("Missing bundle member: {}", name))?;
     if meta.len() > MAX_MEMBER_BYTES as u64 {
         bail!(
             "Member '{}' exceeds max size of {} bytes when reading",
