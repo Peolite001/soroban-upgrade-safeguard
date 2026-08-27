@@ -1743,7 +1743,8 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
     // Manifest mode resolves includes, defaults and per-pair overrides up front —
     // including duplicate-identity detection, so a collision fails before any
     // pair runs rather than mid-loop with earlier reports already on disk.
-    let (resolved_manifest, pairs, mut gaps) = if let Some(manifest_path) = &args.manifest {
+    let (resolved_manifest, pairs, mut gaps, new_only) = if let Some(manifest_path) = &args.manifest
+    {
         let resolved = manifest::resolve(manifest_path, &cli)?;
         let pairs: Vec<BatchPair> = resolved
             .pairs
@@ -1751,15 +1752,17 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             .cloned()
             .map(BatchPair::from)
             .collect();
-        (Some(resolved), pairs, Vec::new())
+        // A manifest names both sides of every pair explicitly, so there is no
+        // directory to sweep and no such thing as an unmatched artifact.
+        (Some(resolved), pairs, Vec::new(), Vec::new())
     } else {
         let settings = manifest::cli_only_settings(&cli);
-        let (pairs, gaps) = scan_directories(
+        let (pairs, gaps, new_only) = scan_directories(
             args.old_dir.as_ref().unwrap(),
             args.new_dir.as_ref().unwrap(),
             &settings,
         )?;
-        (None, pairs, gaps)
+        (None, pairs, gaps, new_only)
     };
     let remote_config = remote_fetch_config(args);
     let oci_config = oci_fetch_config(args);
@@ -1776,6 +1779,28 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         pairs.len(),
         gaps.len()
     ));
+
+    // New-only artifacts are reported here and nowhere else. They are not
+    // comparison pairs: they never enter `results`, never claim a slot in the
+    // `[n/total]` counter, and never move the verdict — there is no old build to
+    // judge them against. This goes to stderr rather than through `progress`
+    // because it is a diagnostic, not narration, and `--quiet` exists to silence
+    // the latter; a likely naming mistake should still reach a quiet CI log.
+    if !new_only.is_empty() {
+        eprintln!(
+            "Warning: {} .wasm file(s) in the new directory have no counterpart in \
+             the old directory and were not compared:",
+            new_only.len()
+        );
+        for contract in &new_only {
+            eprintln!("  - {} ({})", contract.name, contract.new_path.display());
+        }
+        eprintln!(
+            "  A new contract is expected here; a renamed one is not. If any of these \
+             is a rename, the old-side file must share its name for the upgrade to be \
+             checked."
+        );
+    }
 
     let mut results = Vec::new();
     let mut overall_safe = true;
@@ -3848,11 +3873,26 @@ struct GapContract {
     old_path: PathBuf,
 }
 
+/// A `.wasm` file present in the new directory with no counterpart in the old
+/// one.
+///
+/// This is deliberately *not* a [`GapContract`]. An old-only artifact is a
+/// contract that disappeared, which is a breaking change and becomes a Critical
+/// finding. A new-only artifact has nothing to be compared against, so it
+/// cannot produce a verdict at all — but it is just as likely to be a rename
+/// applied to one side only as it is a genuinely new contract, and the tool
+/// cannot tell which from the file alone. Reporting it as a warning is what
+/// keeps a one-sided rename from shipping as a contract nobody checked.
+struct NewOnlyContract {
+    name: String,
+    new_path: PathBuf,
+}
+
 fn scan_directories(
     old_dir: &Path,
     new_dir: &Path,
     settings: &manifest::ResolvedSettings,
-) -> Result<(Vec<BatchPair>, Vec<GapContract>)> {
+) -> Result<(Vec<BatchPair>, Vec<GapContract>, Vec<NewOnlyContract>)> {
     if !old_dir.is_dir() {
         anyhow::bail!("Old directory '{}' is not a directory", old_dir.display());
     }
@@ -3898,11 +3938,59 @@ fn scan_directories(
         }
     }
 
-    if pairs.is_empty() && gaps.is_empty() {
-        anyhow::bail!("No .wasm files found in '{}'", old_dir.display());
+    // The reverse sweep: new-side artifacts the old-side loop never looked at.
+    // The match test mirrors that loop exactly — a pair is formed when the same
+    // file name exists as a file on both sides — so the two views can never
+    // disagree about what counts as matched.
+    let mut new_only = Vec::new();
+    for entry in std::fs::read_dir(new_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file()
+            || !path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+        {
+            continue;
+        }
+        let filename = path.file_name().unwrap();
+        if old_dir.join(filename).is_file() {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| filename.to_string_lossy().to_string());
+        new_only.push(NewOnlyContract {
+            name,
+            new_path: path,
+        });
     }
 
-    Ok((pairs, gaps))
+    // `read_dir` yields entries in unspecified order; sort so the warning reads
+    // the same way on every run and in every CI log.
+    new_only.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if pairs.is_empty() && gaps.is_empty() {
+        if new_only.is_empty() {
+            anyhow::bail!("No .wasm files found in '{}'", old_dir.display());
+        }
+        // Every artifact sits on the new side only. Bailing with just "no files
+        // in the old directory" would describe the symptom; reversed directory
+        // arguments are by far the likeliest cause, so name it.
+        anyhow::bail!(
+            "No .wasm files found in '{}', but '{}' contains {} .wasm file(s). \
+             Directory mode only compares files that share a name in both \
+             directories — check that --old-dir and --new-dir are not reversed.",
+            old_dir.display(),
+            new_dir.display(),
+            new_only.len(),
+        );
+    }
+
+    Ok((pairs, gaps, new_only))
 }
 
 #[allow(dead_code)]
