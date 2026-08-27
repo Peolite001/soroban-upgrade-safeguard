@@ -2,6 +2,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ring::digest::{digest, SHA256};
+use serde::{Deserialize, Serialize};
 use stellar_xdr::curr::{
     ContractDataEntry, ContractExecutable, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData,
     LedgerKey, LedgerKeyContractCode, LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal,
@@ -14,6 +15,50 @@ use crate::oci::{self, OciArtifact, OciArtifactKind, OciFetchConfig, OciReferenc
 use crate::remote::{self, FetchedArtifact, RemoteFetchConfig, RemoteRef};
 use crate::rpc::RpcClientConfig;
 
+/// Normalize a path string for display in a report (JSON or human-readable):
+/// convert backslashes to forward slashes so a report generated on Windows
+/// and one generated on Unix show the same path *shape*, and diffing,
+/// snapshotting, or parsing report output doesn't have to special-case the
+/// producing platform's separator.
+///
+/// Deliberately just a separator swap, nothing more:
+///
+/// - It does **not** canonicalize or make the path absolute. A relative path
+///   given as `../other/contract.wasm` stays relative and stays exactly that
+///   many directories long — normalizing it to an absolute path would fold
+///   in the current directory and everything above the input, which is
+///   exactly the "unrelated directories" a report must not leak. The
+///   original, OS-native path is always still the one used for the actual
+///   filesystem read and for error messages — this function is display-only.
+/// - It does **not** lose the ability to tell two different paths apart:
+///   `a/b.wasm` and `a\b.wasm` normalize to the same `a/b.wasm`, which is
+///   correct — they name the same file on the platform that produced either
+///   of them (Windows accepts `/` as a separator too) — while two inputs
+///   that were genuinely different paths remain different strings after
+///   normalization.
+///
+/// Windows also allows `/` directly, so this never changes what the path
+/// *means* on either platform — only how it prints.
+pub fn normalize_path_display(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// Symlink resolution recorded for a local input: what was asked for, and
+/// what was actually read after following every hop of the chain. `None` on
+/// [`WasmModule::symlink`] means the input was a direct file (or came from a
+/// non-filesystem source), not that resolution was skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymlinkResolution {
+    /// The path exactly as given, before resolution, with display
+    /// normalization applied (see [`normalize_path_display`]).
+    pub requested: String,
+    /// The final, fully resolved (canonical) path that was actually read —
+    /// the end of the chain for one or more hops. Absolute by construction
+    /// (symlink resolution requires it to unambiguously identify the real
+    /// file), with display normalization applied.
+    pub resolved: String,
+}
+
 /// Holds raw WASM bytes alongside the validated file path.
 #[derive(Debug, Clone)]
 pub struct WasmModule {
@@ -25,6 +70,10 @@ pub struct WasmModule {
     pub sha256: String,
     /// Provenance metadata captured if loaded from RPC.
     pub rpc_provenance: Option<crate::rpc::RpcProvenance>,
+    /// Set when this module was loaded from a local path that was (or passed
+    /// through) a symlink. `None` for a direct file, or for any non-local
+    /// source (stdin, RPC, a `https://` URL, an `oci://` reference).
+    pub symlink: Option<SymlinkResolution>,
 }
 
 /// Compute the lowercase hex SHA-256 of a byte slice.
@@ -38,8 +87,70 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Reads a WASM file from disk, validates it is a valid WASM binary,
 /// and returns a `WasmModule` ready for further analysis.
+///
+/// A symlinked input is followed transparently (through however many hops
+/// the chain has) and recorded in [`WasmModule::symlink`]. Use
+/// [`load_wasm_with_policy`] to reject symlinked inputs outright instead.
 pub fn load_wasm(path: &Path) -> Result<WasmModule, Error> {
-    // 1. Check the file exists
+    load_wasm_with_policy(path, false)
+}
+
+/// Like [`load_wasm`], but with explicit control over symlinked inputs.
+///
+/// When `reject_symlinks` is `true`, a `path` that is itself a symlink (or
+/// resolves through one) fails with [`Error::SymlinkRejected`] instead of
+/// being followed — for pipelines where an input must be a direct file, not
+/// whatever it happens to point at. A broken link or a symlink cycle is
+/// always an error, regardless of this setting.
+pub fn load_wasm_with_policy(path: &Path, reject_symlinks: bool) -> Result<WasmModule, Error> {
+    // 1. Determine whether `path` itself names a symlink, without following
+    // it — `Path::exists`/`fs::metadata` would silently follow through to
+    // the target and never tell us.
+    let is_symlink = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type().is_symlink(),
+        Err(_) => {
+            // No entry at all (not even a broken symlink) — fall through to
+            // the existing "file not found" handling below, which produces a
+            // clearer message than the raw `symlink_metadata` error would.
+            false
+        }
+    };
+
+    let symlink = if is_symlink {
+        if reject_symlinks {
+            // Resolve on a best-effort basis purely so the rejection message
+            // can name what the link points to; a failure to resolve doesn't
+            // change the outcome (still rejected), so it's not propagated.
+            let resolved = std::fs::canonicalize(path).ok();
+            return Err(Error::SymlinkRejected {
+                path: path.to_path_buf(),
+                resolved,
+            });
+        }
+
+        let resolved = std::fs::canonicalize(path).map_err(|e| {
+            // `canonicalize` fails on a broken target (NotFound) or a
+            // symlink cycle (ELOOP on Unix); either way, name the link so
+            // the failure is diagnosable instead of a bare OS error.
+            Error::FileAccess {
+                path: path.to_path_buf(),
+                details: format!(
+                    "Failed to resolve symlink '{}' to a real file",
+                    path.display()
+                ),
+                source: Some(Box::new(e)),
+            }
+        })?;
+
+        Some(SymlinkResolution {
+            requested: normalize_path_display(&path.to_string_lossy()),
+            resolved: normalize_path_display(&resolved.to_string_lossy()),
+        })
+    } else {
+        None
+    };
+
+    // 2. Check the file exists (following the symlink, if any, to its target).
     if !path.exists() {
         return Err(Error::FileAccess {
             path: path.to_path_buf(),
@@ -48,7 +159,7 @@ pub fn load_wasm(path: &Path) -> Result<WasmModule, Error> {
         });
     }
 
-    // 2. Read all bytes into memory
+    // 3. Read all bytes into memory
     let bytes = std::fs::read(path).map_err(|e| Error::FileAccess {
         path: path.to_path_buf(),
         details: format!("Failed to read file: {}", path.display()),
@@ -59,6 +170,7 @@ pub fn load_wasm(path: &Path) -> Result<WasmModule, Error> {
         bytes,
         path.to_path_buf(),
         path.to_string_lossy().into_owned(),
+        symlink,
     )
 }
 
@@ -74,7 +186,7 @@ pub fn load_wasm_from_stdin(stdin: &mut impl Read) -> Result<WasmModule, Error> 
             source: Some(Box::new(e)),
         })?;
 
-    wasm_module_from_bytes(bytes, PathBuf::from("-"), "-".to_string())
+    wasm_module_from_bytes(bytes, PathBuf::from("-"), "-".to_string(), None)
 }
 
 /// Downloads a WASM binary from an `https://…#sha256=<hex>` reference,
@@ -93,6 +205,7 @@ pub fn load_wasm_from_url(
         artifact.bytes.clone(),
         PathBuf::from(&artifact.final_url),
         artifact.final_url.clone(),
+        None,
     )?;
     Ok((module, artifact))
 }
@@ -115,7 +228,8 @@ pub fn load_wasm_from_oci(
         "oci://{}/{}@{}",
         artifact.registry, artifact.repository, artifact.layer_digest
     );
-    let module = wasm_module_from_bytes(artifact.bytes.clone(), PathBuf::from(&label), label)?;
+    let module =
+        wasm_module_from_bytes(artifact.bytes.clone(), PathBuf::from(&label), label, None)?;
     Ok((module, artifact))
 }
 
@@ -123,6 +237,7 @@ fn wasm_module_from_bytes(
     bytes: Vec<u8>,
     validation_path: PathBuf,
     display_path: String,
+    symlink: Option<SymlinkResolution>,
 ) -> Result<WasmModule, Error> {
     // 3. Validate the WASM magic header (0x00 0x61 0x73 0x6d)
     if bytes.len() < 4 || &bytes[0..4] != b"\0asm" {
@@ -146,10 +261,14 @@ fn wasm_module_from_bytes(
     })?;
 
     Ok(WasmModule {
-        path: display_path,
+        // Normalized here, at the point the path is recorded for the report,
+        // rather than earlier — the validation errors above intentionally
+        // still show `display_path` exactly as given, for diagnostics.
+        path: normalize_path_display(&display_path),
         sha256: sha256_hex(&bytes),
         bytes,
         rpc_provenance: None,
+        symlink,
     })
 }
 
@@ -510,6 +629,7 @@ fn fetch_wasm_from_rpc_inner(
             sha256: sha256_hex(&wasm_bytes),
             bytes: wasm_bytes,
             rpc_provenance: Some(provenance),
+            symlink: None,
         });
     }
 }
@@ -781,6 +901,105 @@ fn fetch_instance_storage_from_rpc_with_provenance_inner(
             live_until_ledger_seq: instance_expiration,
         },
     ))
+}
+
+#[cfg(test)]
+mod path_display_tests {
+    use super::normalize_path_display;
+
+    // These are pure string-transformation tests — they exercise
+    // `normalize_path_display` against hand-built strings representing what
+    // either platform could have produced, rather than depending on which
+    // platform the test itself happens to run on. That's what makes them a
+    // real cross-platform check: a run on Linux CI still verifies the exact
+    // Windows-style inputs a Windows user would pass.
+
+    #[test]
+    fn converts_backslashes_to_forward_slashes() {
+        assert_eq!(
+            normalize_path_display("sub\\dir\\contract.wasm"),
+            "sub/dir/contract.wasm"
+        );
+    }
+
+    #[test]
+    fn already_forward_slash_paths_are_unchanged() {
+        let path = "sub/dir/contract.wasm";
+        assert_eq!(normalize_path_display(path), path);
+    }
+
+    #[test]
+    fn mixed_separators_normalize_consistently() {
+        assert_eq!(
+            normalize_path_display("sub\\dir/contract.wasm"),
+            "sub/dir/contract.wasm"
+        );
+    }
+
+    #[test]
+    fn a_bare_filename_with_no_separators_is_unchanged() {
+        assert_eq!(normalize_path_display("contract.wasm"), "contract.wasm");
+    }
+
+    #[test]
+    fn empty_string_is_unchanged() {
+        assert_eq!(normalize_path_display(""), "");
+    }
+
+    #[test]
+    fn a_windows_drive_letter_path_normalizes() {
+        assert_eq!(
+            normalize_path_display("C:\\Users\\dev\\contract.wasm"),
+            "C:/Users/dev/contract.wasm"
+        );
+    }
+
+    #[test]
+    fn a_windows_unc_path_normalizes() {
+        assert_eq!(
+            normalize_path_display("\\\\server\\share\\contract.wasm"),
+            "//server/share/contract.wasm"
+        );
+    }
+
+    #[test]
+    fn a_relative_path_with_parent_references_stays_relative() {
+        // Normalization must not canonicalize or absolutize — a `..`-relative
+        // path stays exactly as many directories long, so a report never
+        // gains directory structure beyond what was actually supplied.
+        assert_eq!(
+            normalize_path_display("..\\..\\shared\\contract.wasm"),
+            "../../shared/contract.wasm"
+        );
+    }
+
+    #[test]
+    fn distinct_paths_remain_distinct_after_normalization() {
+        // The property that matters for "distinguishing equivalent paths":
+        // two genuinely different paths must not collapse to the same string.
+        assert_ne!(
+            normalize_path_display("a\\b.wasm"),
+            normalize_path_display("a\\c.wasm")
+        );
+    }
+
+    #[test]
+    fn equivalent_paths_from_either_platform_normalize_to_the_same_string() {
+        // The same logical path, written the way either platform would
+        // naturally produce it, must read identically in a report — this is
+        // what makes a snapshot taken on one OS comparable to a run on another.
+        assert_eq!(
+            normalize_path_display("sub\\dir\\contract.wasm"),
+            normalize_path_display("sub/dir/contract.wasm")
+        );
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let once = normalize_path_display("sub\\dir\\contract.wasm");
+        let twice = normalize_path_display(&once);
+        assert_eq!(once, twice);
+    }
 }
 
 #[cfg(test)]

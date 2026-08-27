@@ -260,7 +260,75 @@ RPC mode fetches the baseline from chain and verifies it cryptographically; mani
 directory, and glob modes run batch comparisons. The full usage strings and options
 match the CLI help output (`--help`) and the `override_usage` in `src/main.rs`.
 
-Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), and the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)).
+Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)), and `--no-symlinks` for local paths (see [Local file inputs](#local-file-inputs)).
+
+### Local file inputs
+
+A local WASM path is followed transparently whether it is a direct file or a
+symlink — including a chain of several symlinks — so this has always worked
+without any special handling. What was missing was any record of *which* one
+happened: two runs against the same command line could silently analyze
+different bytes if a symlink was repointed in between, with nothing in the
+report to show it.
+
+#### Policy
+
+By default, a symlinked input is followed and the resolution recorded — see
+Provenance below. `--no-symlinks` switches to the stricter policy some
+pipelines need: a local path that is itself a symlink (or resolves through
+one) is rejected outright, before the file is read, rather than silently
+analyzing whatever it happens to point at:
+
+```bash
+soroban-upgrade-safeguard old.wasm new.wasm --no-symlinks
+```
+
+A broken symlink (pointing at a target that no longer exists) or a symlink
+cycle is always an error, regardless of `--no-symlinks` — there is no
+permissive interpretation of a link that cannot actually be followed.
+
+`--no-symlinks` applies to the positional comparison arguments, `extract
+--wasm`, and each `old`/`new` entry in a `--manifest` batch file. It has no
+effect on non-local inputs (`https://`, `oci://`, RPC, stdin), which were
+never symlinks to begin with.
+
+#### Provenance
+
+When an input path is a symlink, the report's provenance block records both
+the path exactly as given and the fully resolved target that was actually
+read and analyzed:
+
+```
+Symlink:  ./current -> /srv/releases/contract-v2.4.1.wasm
+```
+
+The same pair appears as `provenance.symlinks` in JSON output (`requested`/
+`resolved` per entry), empty when neither input was a symlink. Recording
+happens whether or not `--no-symlinks` is set; the flag controls whether a
+symlinked input is *allowed*, not whether the tool notices one.
+
+#### Path display
+
+Every path a report shows — batch JSON's `results[].old`/`new`/
+`old_storage_schema`/`new_storage_schema`, `manifest.pairs[]` and its
+settings' `origin`, `--explain-manifest` output, and the symlink
+`requested`/`resolved` pair above — is normalized to forward slashes before
+it's written, regardless of which platform produced it. A batch run on
+Windows and the same run on Linux or macOS therefore report identical path
+*shapes*, which is what makes a saved JSON report, or a snapshot built from
+one, comparable across the machines that might generate or consume it —
+without that, a report built on Windows would embed `old\v1.wasm` where one
+built elsewhere embeds `old/v1.wasm`, a spurious difference that has nothing
+to do with the comparison itself.
+
+Normalization only ever swaps separators — it never canonicalizes a path or
+makes a relative one absolute, so a report never gains directory structure
+beyond what was actually supplied (a relative input stays exactly as many
+directories long). It also only ever applies to a path *recorded* for a
+report; a diagnostic message for a problem with the path itself (a missing
+file, an unreadable manifest, a broken symlink) still shows the path exactly
+as given, unmodified, since that is what the reader needs to locate the real
+file on their own filesystem.
 
 ### Interface lockfiles
 
@@ -1153,6 +1221,51 @@ malformed, that is a hard error rather than a silent no-op, so a typo never
 quietly disables suppression — the same way it always has for `--config`.
 Only the auto-discovered `.safeguard.toml` default stays optional: if it
 simply isn't there, the tool proceeds with no suppressions.
+
+#### Searching parent directories
+
+Running the tool from a workspace subdirectory — a monorepo package, a
+service's own folder — means the current directory usually doesn't have a
+`.safeguard.toml` of its own even when the repository root does, so the
+plain current-directory check above misses it. `--search-parent-config` is
+an **opt-in** ancestor search for exactly that case: only when the flag is
+passed does the tool look above the current directory at all.
+
+```bash
+cd services/api  # no .safeguard.toml here; the repo root has one
+soroban-upgrade-safeguard old.wasm new.wasm --search-parent-config
+```
+
+The search walks upward from the current directory and stops at the first
+of two boundaries:
+
+- **The workspace root** — the first ancestor directory containing a `.git`
+  entry (a directory for a normal checkout, or a file for a worktree or
+  submodule). This directory is itself still searched before the walk
+  stops.
+- **The filesystem root**, if no `.git` is ever found.
+
+A `.safeguard.toml` above that boundary is never picked up, no matter how
+far up the search would otherwise be allowed to go — the point is to find
+"the repository's config," not every config anywhere above the current
+directory.
+
+**More than one candidate along the way is a hard error, not a guess.**
+If two ancestor directories each have their own `.safeguard.toml`, the tool
+cannot know which one you meant, and silently picking the nearest would make
+the effective config depend on exactly which subdirectory you happened to
+run from — the kind of ambiguity this option exists to resolve, not
+reproduce one level up. The error lists every candidate found; pass
+`--config` explicitly to choose one.
+
+`--search-parent-config` is the lowest-priority source: `--config`, then
+`SOROBAN_SAFEGUARD_CONFIG`, then the current directory, all still win over
+it, and it conflicts with `--no-config` at the flag-parsing level (searching
+for a config while also saying not to load one is contradictory). Whichever
+file it finds is echoed in the same `Suppression config: <path> (source:
+--search-parent-config)` diagnostic described above, and in `--manifest`
+mode's `--explain-manifest` output the same way the current-directory
+default is.
 
 Each `[[suppress]]` entry acknowledges exactly one finding. The stable key is
 `rule_id`, and the legacy `category` field is still accepted as a compatibility

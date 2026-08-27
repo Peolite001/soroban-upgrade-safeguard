@@ -25,6 +25,7 @@ pub enum ErrorKind {
     OciFetch,
     RpcSnapshotConsistency,
     RpcIdMismatch,
+    SymlinkRejected,
 }
 
 /// The canonical error type for the soroban-upgrade-safeguard library.
@@ -52,6 +53,7 @@ pub enum ErrorKind {
 /// | [`RemoteFetch`](Error::RemoteFetch) | Downloading a `https://` input artifact failed (transport, size, redirect, or transport-policy violation) |
 /// | [`OciFetch`](Error::OciFetch) | Resolving an `oci://` input artifact failed (manifest/blob transport, auth, or media-type selection) |
 /// | [`RpcIdMismatch`](Error::RpcIdMismatch) | A JSON-RPC response's `id` was missing or did not match the request's `id` |
+/// | [`SymlinkRejected`](Error::SymlinkRejected) | A local input path was a symlink while `--no-symlinks` was in effect |
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -142,6 +144,16 @@ pub enum Error {
         /// response omitted the field entirely.
         received_id: Option<String>,
     },
+    /// A local input path was (or passed through) a symlink while symlinks
+    /// were rejected by policy (`--no-symlinks`). Distinct from
+    /// [`FileAccess`](Error::FileAccess), which covers a symlink that is
+    /// simply unreadable (broken target, cycle) regardless of policy.
+    SymlinkRejected {
+        /// The path exactly as given on the command line.
+        path: PathBuf,
+        /// The fully resolved target, when it could be determined.
+        resolved: Option<PathBuf>,
+    },
 }
 
 impl Error {
@@ -169,6 +181,7 @@ impl Error {
             Error::OciFetch { .. } => ErrorKind::OciFetch,
             Error::RpcSnapshotConsistency { .. } => ErrorKind::RpcSnapshotConsistency,
             Error::RpcIdMismatch { .. } => ErrorKind::RpcIdMismatch,
+            Error::SymlinkRejected { .. } => ErrorKind::SymlinkRejected,
         }
     }
 
@@ -209,6 +222,7 @@ impl Error {
             Error::SuppressionConfig {
                 path: Some(path), ..
             } => Some(path),
+            Error::SymlinkRejected { path, .. } => Some(path),
             _ => None,
         }
     }
@@ -344,6 +358,21 @@ impl fmt::Display for Error {
                     "RPC response from '{rpc_url}' is missing its 'id' field (expected '{expected_id}')"
                 ),
             },
+            Error::SymlinkRejected { path, resolved } => match resolved {
+                Some(target) => write!(
+                    f,
+                    "Symlink input rejected by policy: '{}' resolves to '{}'. \
+                     Pass a direct file, or drop --no-symlinks to allow symlinked inputs.",
+                    path.display(),
+                    target.display()
+                ),
+                None => write!(
+                    f,
+                    "Symlink input rejected by policy: '{}'. \
+                     Pass a direct file, or drop --no-symlinks to allow symlinked inputs.",
+                    path.display()
+                ),
+            },
         }
     }
 }
@@ -390,6 +419,7 @@ impl std::error::Error for Error {
                 .map(|s| s.as_ref() as &dyn std::error::Error),
             Error::RpcSnapshotConsistency { .. } => None,
             Error::RpcIdMismatch { .. } => None,
+            Error::SymlinkRejected { .. } => None,
         }
     }
 }

@@ -287,7 +287,9 @@ impl std::fmt::Display for Origin {
             Origin::BuiltIn => write!(f, "built-in"),
             Origin::Cli => write!(f, "cli"),
             Origin::Env => write!(f, "env"),
-            Origin::File(path) => write!(f, "{}", path.display()),
+            Origin::File(path) => {
+                write!(f, "{}", crate::loader::normalize_path_display(&path.display().to_string()))
+            }
         }
     }
 }
@@ -444,6 +446,16 @@ pub struct CliSettings {
     /// overrides it, which is what a reader of the precedence table would
     /// expect.
     pub default_config: Option<PathBuf>,
+    /// A `.safeguard.toml` found by `--search-parent-config` in an ancestor
+    /// of the current directory, when nothing more specific (`--config`, the
+    /// environment variable, or [`Self::default_config`]) named one.
+    ///
+    /// Sits at the same [`Origin::BuiltIn`] level as `default_config` — it is
+    /// the same kind of thing, a compiled-in fallback, just with a wider
+    /// search radius the caller opted into. Populating this field is where
+    /// `--search-parent-config` is entirely gated: when the flag is off, the
+    /// caller never computes a value for it, and this field is always `None`.
+    pub ancestor_config: Option<PathBuf>,
     /// `--no-config`: wins over every layer and yields no suppression config.
     pub no_config: bool,
     pub strict: bool,
@@ -464,6 +476,7 @@ impl Default for CliSettings {
             config: None,
             env_config: None,
             default_config: None,
+            ancestor_config: None,
             no_config: false,
             strict: false,
             explain: false,
@@ -820,17 +833,23 @@ fn fold_settings(layers: &[Layer], pair: &Layer, cli: &CliSettings) -> ResolvedS
             origin: Origin::Cli,
         }
     } else {
-        let mut current = match (&cli.config, &cli.env_config, &cli.default_config) {
-            (Some(path), _, _) => Sourced {
+        let mut current = match (
+            &cli.config,
+            &cli.env_config,
+            &cli.default_config,
+            &cli.ancestor_config,
+        ) {
+            (Some(path), _, _, _) => Sourced {
                 value: Some(path.clone()),
                 origin: Origin::Cli,
             },
-            (None, Some(path), _) => Sourced {
+            (None, Some(path), _, _) => Sourced {
                 value: Some(path.clone()),
                 origin: Origin::Env,
             },
-            (None, None, Some(path)) => Sourced::built_in(Some(path.clone())),
-            (None, None, None) => Sourced::built_in(None),
+            (None, None, Some(path), _) => Sourced::built_in(Some(path.clone())),
+            (None, None, None, Some(path)) => Sourced::built_in(Some(path.clone())),
+            (None, None, None, None) => Sourced::built_in(None),
         };
         for layer in chain() {
             if let Some(path) = &layer.config {
@@ -987,6 +1006,16 @@ fn canonical_identity(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Render `path` for report-facing output (JSON, `--explain-manifest`) with
+/// display normalization applied (see
+/// [`crate::loader::normalize_path_display`]). Deliberately **not** used for
+/// diagnostic-only messages like the include-cycle chain below, which show
+/// the path exactly as the filesystem gave it to help track down the actual
+/// file.
+fn display_path(path: &Path) -> String {
+    crate::loader::normalize_path_display(&path.display().to_string())
+}
+
 fn chain_display(stack: &[PathBuf], next: &Path) -> String {
     stack
         .iter()
@@ -1003,11 +1032,11 @@ impl ResolvedManifest {
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
-            "root": self.root.display().to_string(),
+            "root": display_path(&self.root),
             "sources": self
                 .sources
                 .iter()
-                .map(|p| p.display().to_string())
+                .map(display_path)
                 .collect::<Vec<_>>(),
             "pairs": self.pairs.iter().map(ResolvedPair::to_json).collect::<Vec<_>>(),
             "dependencies": self.dependencies,
@@ -1019,10 +1048,10 @@ impl ResolvedManifest {
         let mut out = String::new();
         out.push_str("Manifest resolution\n");
         out.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-        out.push_str(&format!("root:    {}\n", self.root.display()));
+        out.push_str(&format!("root:    {}\n", display_path(&self.root)));
         out.push_str("sources:\n");
         for source in &self.sources {
-            out.push_str(&format!("  - {}\n", source.display()));
+            out.push_str(&format!("  - {}\n", display_path(source)));
         }
 
         out.push_str(&format!("\npairs ({}):\n", self.pairs.len()));
@@ -1034,15 +1063,15 @@ impl ResolvedManifest {
             }
             out.push_str(&format!(
                 "      defined in: {}\n",
-                pair.defined_in.display()
+                display_path(&pair.defined_in)
             ));
-            out.push_str(&format!("      old:        {}\n", pair.old.display()));
-            out.push_str(&format!("      new:        {}\n", pair.new.display()));
+            out.push_str(&format!("      old:        {}\n", display_path(&pair.old)));
+            out.push_str(&format!("      new:        {}\n", display_path(&pair.new)));
             if let Some(path) = &pair.old_storage_schema {
-                out.push_str(&format!("      old schema:  {}\n", path.display()));
+                out.push_str(&format!("      old schema:  {}\n", display_path(path)));
             }
             if let Some(path) = &pair.new_storage_schema {
-                out.push_str(&format!("      new schema:  {}\n", path.display()));
+                out.push_str(&format!("      new schema:  {}\n", display_path(path)));
             }
             for (key, value, origin) in pair.settings.rows() {
                 // Width covers the longest key (`policy.gate_runtime_surface`)
@@ -1072,7 +1101,7 @@ impl ResolvedManifest {
                     dep.dependency.caller,
                     dep.dependency.callee,
                     functions,
-                    dep.defined_in.display()
+                    display_path(&dep.defined_in)
                 ));
             }
         }
@@ -1087,17 +1116,11 @@ impl ResolvedPair {
             "name": self.name,
             "id": self.id,
             "labels": self.labels,
-            "defined_in": self.defined_in.display().to_string(),
-            "old": self.old.display().to_string(),
-            "new": self.new.display().to_string(),
-            "old_storage_schema": self
-                .old_storage_schema
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            "new_storage_schema": self
-                .new_storage_schema
-                .as_ref()
-                .map(|path| path.display().to_string()),
+            "defined_in": display_path(&self.defined_in),
+            "old": display_path(&self.old),
+            "new": display_path(&self.new),
+            "old_storage_schema": self.old_storage_schema.as_deref().map(display_path),
+            "new_storage_schema": self.new_storage_schema.as_deref().map(display_path),
             "settings": self.settings.to_json(),
         })
     }
@@ -1107,7 +1130,7 @@ impl ResolvedSettings {
     /// `(key, rendered value, origin)` for every setting, in a stable order.
     fn rows(&self) -> Vec<(&'static str, String, String)> {
         let render_path = |s: &Sourced<Option<PathBuf>>| match &s.value {
-            Some(path) => path.display().to_string(),
+            Some(path) => display_path(path),
             None => "(none)".to_string(),
         };
         vec![
@@ -1189,7 +1212,7 @@ impl ResolvedSettings {
         map.insert(
             "config".to_string(),
             serde_json::json!({
-                "value": self.config.value.as_ref().map(|p| p.display().to_string()),
+                "value": self.config.value.as_deref().map(display_path),
                 "origin": self.config.origin,
             }),
         );
@@ -1605,6 +1628,154 @@ mod tests {
         let resolved = resolve(&root, &cli).unwrap();
         assert_eq!(resolved.pairs[0].settings.config.value, None);
         assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Cli);
+    }
+
+    // ── ancestor_config (--search-parent-config) ────────────────────────────
+
+    #[test]
+    fn ancestor_config_is_used_when_nothing_more_specific_resolves() {
+        let dir = temp_dir("ancestor-config-fallback");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/repo/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::BuiltIn);
+    }
+
+    #[test]
+    fn default_config_outranks_ancestor_config() {
+        let dir = temp_dir("default-outranks-ancestor-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            default_config: Some(PathBuf::from(".safeguard.toml")),
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from(".safeguard.toml")),
+            "the current-directory default must win over an ancestor match"
+        );
+    }
+
+    #[test]
+    fn env_config_outranks_ancestor_config() {
+        let dir = temp_dir("env-outranks-ancestor-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            env_config: Some(PathBuf::from("/env/.safeguard.toml")),
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/env/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Env);
+    }
+
+    #[test]
+    fn cli_config_outranks_ancestor_config() {
+        let dir = temp_dir("cli-outranks-ancestor-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            config: Some(PathBuf::from("/cli/.safeguard.toml")),
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(PathBuf::from("/cli/.safeguard.toml"))
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::Cli);
+    }
+
+    #[test]
+    fn no_config_outranks_ancestor_config() {
+        let dir = temp_dir("no-config-outranks-ancestor-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old = "a_v1.wasm"
+            new = "a_v2.wasm"
+            "#,
+        );
+        let cli = CliSettings {
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            no_config: true,
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(resolved.pairs[0].settings.config.value, None);
+    }
+
+    #[test]
+    fn a_manifest_naming_its_own_config_outranks_ancestor_config() {
+        let dir = temp_dir("manifest-outranks-ancestor-config");
+        let root = write(
+            &dir,
+            "root.toml",
+            r#"
+            [[pairs]]
+            old    = "a_v1.wasm"
+            new    = "a_v2.wasm"
+            config = "team.safeguard.toml"
+            "#,
+        );
+        let cli = CliSettings {
+            ancestor_config: Some(PathBuf::from("/repo/.safeguard.toml")),
+            ..CliSettings::default()
+        };
+        let resolved = resolve(&root, &cli).unwrap();
+        assert_eq!(
+            resolved.pairs[0].settings.config.value,
+            Some(dir.join("team.safeguard.toml")),
+            "a pair naming its own config is more specific than any CLI-level fallback"
+        );
+        assert_eq!(resolved.pairs[0].settings.config.origin, Origin::File(root));
     }
 
     #[test]
