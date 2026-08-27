@@ -183,7 +183,7 @@ pub fn extract_runtime_surface(
         let payload = payload.map_err(|e| Error::WasmValidation {
             path: None,
             details: "Failed to parse WASM payload for runtime surface".to_string(),
-            byte_offset: None,
+            byte_offset: Some(e.offset() as u64),
             source: Some(Box::new(e)),
         })?;
 
@@ -193,7 +193,7 @@ pub fn extract_runtime_surface(
                     let import = import.map_err(|e| Error::WasmValidation {
                         path: None,
                         details: "Failed to parse WASM import in runtime surface".to_string(),
-                        byte_offset: None,
+                        byte_offset: Some(e.offset() as u64),
                         source: Some(Box::new(e)),
                     })?;
 
@@ -266,7 +266,7 @@ pub fn extract_runtime_surface(
                     let mem_ty = mem.map_err(|e| Error::WasmValidation {
                         path: None,
                         details: "Failed to parse WASM memory section".to_string(),
-                        byte_offset: None,
+                        byte_offset: Some(e.offset() as u64),
                         source: Some(Box::new(e)),
                     })?;
 
@@ -295,7 +295,7 @@ pub fn extract_runtime_surface(
                     let tab = tab.map_err(|e| Error::WasmValidation {
                         path: None,
                         details: "Failed to parse WASM table section".to_string(),
-                        byte_offset: None,
+                        byte_offset: Some(e.offset() as u64),
                         source: Some(Box::new(e)),
                     })?;
 
@@ -323,7 +323,7 @@ pub fn extract_runtime_surface(
                     let glob = glob.map_err(|e| Error::WasmValidation {
                         path: None,
                         details: "Failed to parse WASM global section".to_string(),
-                        byte_offset: None,
+                        byte_offset: Some(e.offset() as u64),
                         source: Some(Box::new(e)),
                     })?;
 
@@ -355,7 +355,7 @@ pub fn extract_runtime_surface(
                     let elem = elem.map_err(|e| Error::WasmValidation {
                         path: None,
                         details: "Failed to parse WASM element section".to_string(),
-                        byte_offset: None,
+                        byte_offset: Some(e.offset() as u64),
                         source: Some(Box::new(e)),
                     })?;
 
@@ -402,7 +402,7 @@ pub fn extract_runtime_surface(
                     let data = data.map_err(|e| Error::WasmValidation {
                         path: None,
                         details: "Failed to parse WASM data section".to_string(),
-                        byte_offset: None,
+                        byte_offset: Some(e.offset() as u64),
                         source: Some(Box::new(e)),
                     })?;
 

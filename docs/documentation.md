@@ -75,6 +75,8 @@ Scope:  Exported interface + environment metadata only — storage layout is NOT
 
 ## Installation
 
+For a full breakdown of which Rust toolchain, Soroban protocol metadata version, and report schema version are supported by each release, see the [Release Compatibility Table](compatibility-table.md).
+
 Install the published crate from crates.io:
 
 ```bash
@@ -229,15 +231,22 @@ soroban-upgrade-safeguard --contract-id <ID> --rpc-url <URL> <NEW_WASM>
 soroban-upgrade-safeguard --manifest <MANIFEST_PATH>
 ```
 
-  A manifest can also compose other manifests (`include`), share settings across
-  pairs (`[defaults]`), and override them per pair. See
-  [Batch Manifests](batch_manifests.md) for the schema, the precedence rules,
-  path resolution, and `--explain-manifest`.
+A manifest can also compose other manifests (`include`), share settings across
+pairs (`[defaults]`), and override them per pair. See
+[Batch Manifests](batch_manifests.md) for the schema, the precedence rules,
+path resolution, and `--explain-manifest`.
 
 - Directory scan (pair by file stem):
 
 ```bash
 soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>
+```
+
+- Interface lockfile mode (one candidate WASM):
+
+```bash
+soroban-upgrade-safeguard <NEW_WASM> \
+  --interface-lockfile <LOCKFILE>
 ```
 
 - Glob pair mode (pair matches by file stem):
@@ -251,7 +260,211 @@ RPC mode fetches the baseline from chain and verifies it cryptographically; mani
 directory, and glob modes run batch comparisons. The full usage strings and options
 match the CLI help output (`--help`) and the `override_usage` in `src/main.rs`.
 
-Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), and the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)).
+Common flags: `--format <text|json|markdown|html|github-actions|junit>`, `--explain`, `--strict`, `--expect-bump <patch|minor|major>`, `--config <PATH>`, the resource-limit overrides `--max-xdr-depth`, `--max-xdr-len`, `--max-entries`, and `--max-walk-depth` (see [Resource Limits](#resource-limits-and-hardening-against-malicious-input)), the `https://` input overrides `--remote-max-bytes`, `--remote-timeout-secs`, `--remote-max-redirects`, `--remote-cache-dir`, `--no-remote-cache`, and `--clear-remote-cache` (see [Remote HTTPS inputs](#remote-https-inputs)), and `--no-symlinks` for local paths (see [Local file inputs](#local-file-inputs)).
+
+### Report output destinations
+
+By default a report is printed to stdout in the format chosen by `--format`
+(`text` if `--format` is omitted). `--output` adds an explicit destination and
+can be repeated to emit the same report as several formats/files in one run
+(see [Multiple output formats](../README.md#multiple-output-formats) for
+worked examples):
+
+```bash
+# stdout only, text (the default — no --output needed)
+soroban-upgrade-safeguard old.wasm new.wasm
+
+# format-only destination: still stdout, just a different format
+soroban-upgrade-safeguard old.wasm new.wasm --output json
+
+# FORMAT:PATH: write that format to a file instead of stdout
+soroban-upgrade-safeguard old.wasm new.wasm --output json:report.json
+
+# repeat --output for multiple destinations in one run
+soroban-upgrade-safeguard old.wasm new.wasm \
+  --output json:report.json \
+  --output markdown:report.md
+```
+
+A bare path passed to `--output` (no `FORMAT:` prefix, e.g. `--output
+report.txt`) is a file destination whose format comes from `--format`,
+falling back to `text` if `--format` is also omitted. Any parent directories
+in an `--output` file path that don't already exist are created
+automatically.
+
+Decorative and progress lines (headers, per-file "report written to ..."
+notices, suppression-config diagnostics) are ordinarily printed to stdout
+alongside a `text` report. But whenever stdout would otherwise carry a clean,
+parseable document — because the stdout format is `json`, `markdown`, or
+`github-actions`, or because any `--output` targets a file in addition to
+stdout — progress lines are written to stderr instead, so stdout stays safe
+to pipe or redirect into a file without decorative noise mixed in. `--quiet`
+suppresses these lines entirely, on either stream.
+
+### Directory scan
+
+```bash
+soroban-upgrade-safeguard --old-dir <OLD_DIR> --new-dir <NEW_DIR>
+```
+
+Files are matched by exact filename, with the `.wasm` extension compared
+case-insensitively. Both directories are enumerated, so an artifact on either
+side without a counterpart on the other is accounted for, producing three kinds
+of outcome:
+
+- **Matched** (same filename present in both directories): the pair is
+  compared exactly like a two-build comparison and folded into the batch
+  results.
+- **Old-only** (present in `<OLD_DIR>`, missing from `<NEW_DIR>`): recorded as
+  a Critical `contract-missing-from-new` finding — removing a deployed
+  contract from the new build would break every client that depends on it.
+  This is not merely a warning: it unconditionally sets the batch's overall
+  verdict to unsafe (non-zero exit), the same as any other Critical finding,
+  regardless of `--strict`.
+- **New-only** (present in `<NEW_DIR>` only): reported as a warning naming each
+  unmatched file, but never treated as a comparison pair. There is no old build
+  to judge it against, so it produces no findings, takes no slot in the batch
+  counter, and cannot move the verdict or the exit code. The warning exists
+  because the tool cannot tell an intentionally added contract from a rename
+  applied to only one side, and the second case would otherwise ship a contract
+  nobody checked. It is written to stderr as a diagnostic rather than as
+  progress output, so `--quiet` does not suppress it. If you want every added
+  artifact accounted for as an explicit, verifiable pair instead, list pairs in
+  a [manifest](batch_manifests.md).
+
+  When `<OLD_DIR>` holds no `.wasm` files at all but `<NEW_DIR>` does, the run
+  fails with an error that says so and points at reversed `--old-dir`/`--new-dir`
+  arguments, which is overwhelmingly the cause.
+
+### Local file inputs
+
+A local WASM path is followed transparently whether it is a direct file or a
+symlink — including a chain of several symlinks — so this has always worked
+without any special handling. What was missing was any record of *which* one
+happened: two runs against the same command line could silently analyze
+different bytes if a symlink was repointed in between, with nothing in the
+report to show it.
+
+#### Policy
+
+By default, a symlinked input is followed and the resolution recorded — see
+Provenance below. `--no-symlinks` switches to the stricter policy some
+pipelines need: a local path that is itself a symlink (or resolves through
+one) is rejected outright, before the file is read, rather than silently
+analyzing whatever it happens to point at:
+
+```bash
+soroban-upgrade-safeguard old.wasm new.wasm --no-symlinks
+```
+
+A broken symlink (pointing at a target that no longer exists) or a symlink
+cycle is always an error, regardless of `--no-symlinks` — there is no
+permissive interpretation of a link that cannot actually be followed.
+
+`--no-symlinks` applies to the positional comparison arguments, `extract
+--wasm`, and each `old`/`new` entry in a `--manifest` batch file. It has no
+effect on non-local inputs (`https://`, `oci://`, RPC, stdin), which were
+never symlinks to begin with.
+
+#### Provenance
+
+When an input path is a symlink, the report's provenance block records both
+the path exactly as given and the fully resolved target that was actually
+read and analyzed:
+
+```
+Symlink:  ./current -> /srv/releases/contract-v2.4.1.wasm
+```
+
+The same pair appears as `provenance.symlinks` in JSON output (`requested`/
+`resolved` per entry), empty when neither input was a symlink. Recording
+happens whether or not `--no-symlinks` is set; the flag controls whether a
+symlinked input is *allowed*, not whether the tool notices one.
+
+#### Path display
+
+Every path a report shows — batch JSON's `results[].old`/`new`/
+`old_storage_schema`/`new_storage_schema`, `manifest.pairs[]` and its
+settings' `origin`, `--explain-manifest` output, and the symlink
+`requested`/`resolved` pair above — is normalized to forward slashes before
+it's written, regardless of which platform produced it. A batch run on
+Windows and the same run on Linux or macOS therefore report identical path
+*shapes*, which is what makes a saved JSON report, or a snapshot built from
+one, comparable across the machines that might generate or consume it —
+without that, a report built on Windows would embed `old\v1.wasm` where one
+built elsewhere embeds `old/v1.wasm`, a spurious difference that has nothing
+to do with the comparison itself.
+
+Normalization only ever swaps separators — it never canonicalizes a path or
+makes a relative one absolute, so a report never gains directory structure
+beyond what was actually supplied (a relative input stays exactly as many
+directories long). It also only ever applies to a path *recorded* for a
+report; a diagnostic message for a problem with the path itself (a missing
+file, an unreadable manifest, a broken symlink) still shows the path exactly
+as given, unmodified, since that is what the reader needs to locate the real
+file on their own filesystem.
+
+### Hash-only extraction
+
+```bash
+soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only
+```
+
+`extract --hash-only` prints nothing but the interface hash — no surrounding
+JSON report document, just the bare hex digest on its own line. The digest is
+the same order-independent SHA-256 the tool uses everywhere else (lockfiles,
+`--interface-lockfile` checks): it covers the analyzed WASM's exported
+interface — its functions and user-defined types — not the raw WASM bytes,
+so two builds that differ only in compiler version, doc comments, or section
+ordering still hash identically. See [Interface Hash](../src/interface_hash.rs)
+for exactly what is and is not covered.
+
+Because the output is a single line with nothing else on stdout, it's suited
+to capturing directly in a script — for a cache key, or a cheap "did the
+interface change?" check without running a full comparison:
+
+```bash
+hash="$(soroban-upgrade-safeguard extract ./wasm/v1.wasm --hash-only)"
+```
+
+### Interface lockfiles
+
+An interface lockfile pins the exported `contractspecv0` interface in a deterministic,
+version-controlled JSON artifact. Generate one from an approved build:
+
+```bash
+soroban-upgrade-safeguard lockfile ./wasm/v1.wasm \
+  --output ./wasm/contract.interface.lock.json
+```
+
+The command refuses to replace an existing file unless `--force` is provided. Use
+that flag only when the public interface change is intentional:
+
+```bash
+soroban-upgrade-safeguard lockfile ./wasm/v2.wasm \
+  --output ./wasm/contract.interface.lock.json --force
+```
+
+Review the resulting JSON diff as an API change. Named collections are sorted for
+stable diffs, while function parameters, struct fields, and union cases retain
+declaration order because those positions affect compatibility. Documentation is
+kept in the artifact so informational documentation findings remain available.
+The stored interface hash is checked against the structured content when the file
+is loaded, preventing a hand-edited or stale lockfile from silently being trusted.
+
+Run the lockfile check in CI with the candidate build as the only positional input:
+
+```bash
+soroban-upgrade-safeguard ./wasm/candidate.wasm \
+  --interface-lockfile ./wasm/contract.interface.lock.json \
+  --format json
+```
+
+A matching interface exits `0`. Drift exits non-zero and uses the normal diff
+categories, severities, suppression handling, and report formats. Lockfile mode
+deliberately analyzes the exported interface only; it does not compare environment
+metadata, host imports, runtime surface, storage schemas, or empirical storage
+observations. Use a two-build comparison when those dimensions are required.
 
 ### Spec JSON input mode
 
@@ -274,10 +487,7 @@ The file must be a JSON object with a single `entries` array. Each element is a 
 
 ```json
 {
-  "entries": [
-    "AAAAAQAAAA...",
-    "AAAAAQAAAB..."
-  ]
+  "entries": ["AAAAAQAAAA...", "AAAAAQAAAB..."]
 }
 ```
 
@@ -293,13 +503,13 @@ stellar contract inspect --wasm contract.wasm --output xdr-base64-array \
 
 A spec JSON file contains only the `contractspecv0` interface entries. Comparisons that require data from the full WASM binary are skipped when one or both sides is a spec file, and the report records exactly what was skipped:
 
-| Comparison | WASM vs WASM | Spec vs WASM / WASM vs Spec | Spec vs Spec |
-| :--- | :---: | :---: | :---: |
-| Exported interface (functions, types) | ✅ | ✅ | ✅ |
-| Environment metadata (`contractenvmetav0`) | ✅ | ⚠️ skipped | ⚠️ skipped |
-| Build metadata (`contractmetav0`) | ✅ | ⚠️ skipped | ⚠️ skipped |
-| Export section (binary vs spec agreement) | ✅ | ⚠️ skipped | ⚠️ skipped |
-| Import section (host-function diff) | ✅ | ⚠️ skipped | ⚠️ skipped |
+| Comparison                                 | WASM vs WASM | Spec vs WASM / WASM vs Spec | Spec vs Spec |
+| :----------------------------------------- | :----------: | :-------------------------: | :----------: |
+| Exported interface (functions, types)      |      ✅      |             ✅              |      ✅      |
+| Environment metadata (`contractenvmetav0`) |      ✅      |         ⚠️ skipped          |  ⚠️ skipped  |
+| Build metadata (`contractmetav0`)          |      ✅      |         ⚠️ skipped          |  ⚠️ skipped  |
+| Export section (binary vs spec agreement)  |      ✅      |         ⚠️ skipped          |  ⚠️ skipped  |
+| Import section (host-function diff)        |      ✅      |         ⚠️ skipped          |  ⚠️ skipped  |
 
 Skipped comparisons are reported as "not available" in the analysis scope rather than silently ignored, so the verdict is never read as broader than what actually ran. The exported interface comparison — the primary safety gate — always runs regardless of input mode.
 
@@ -335,11 +545,11 @@ inside that directory, locates the produced `.wasm` artifact via `cargo metadata
 
 #### Toolchain requirements
 
-| Requirement | How to satisfy |
-| :--- | :--- |
-| **Cargo** on `$PATH` | Install Rust via [rustup.rs](https://rustup.rs) |
-| **`wasm32-unknown-unknown` target** installed | `rustup target add wasm32-unknown-unknown` |
-| **`crate-type = ["cdylib"]`** in `[lib]` | Required for Cargo to produce a `.wasm` artifact |
+| Requirement                                   | How to satisfy                                   |
+| :-------------------------------------------- | :----------------------------------------------- |
+| **Cargo** on `$PATH`                          | Install Rust via [rustup.rs](https://rustup.rs)  |
+| **`wasm32-unknown-unknown` target** installed | `rustup target add wasm32-unknown-unknown`       |
+| **`crate-type = ["cdylib"]`** in `[lib]`      | Required for Cargo to produce a `.wasm` artifact |
 
 Both requirements are checked before the build starts. A missing target produces a clear error with the exact `rustup` command to run rather than a cryptic rustc error.
 
@@ -433,7 +643,7 @@ Credential resolution follows `docker login`/`docker pull` exactly: a plaintext 
 
 #### Caching
 
-Every fetch is keyed by the resolved *layer* digest (not the manifest digest), so a verified blob is cached content-addressed and can be served again without re-fetching. The cache lives under `--oci-cache-dir` (default: a `soroban-upgrade-safeguard/oci-cache` directory under the OS temp dir, or the path in `SOROBAN_SAFEGUARD_OCI_CACHE` if set). `--no-oci-cache` bypasses both reading and writing the cache for a single run; `--clear-oci-cache` deletes the whole cache directory and exits. The manifest itself is still fetched on every run (its digest is what determines the layer to check the cache for), but the potentially much larger blob download is skipped on a cache hit.
+Every fetch is keyed by the resolved _layer_ digest (not the manifest digest), so a verified blob is cached content-addressed and can be served again without re-fetching. The cache lives under `--oci-cache-dir` (default: a `soroban-upgrade-safeguard/oci-cache` directory under the OS temp dir, or the path in `SOROBAN_SAFEGUARD_OCI_CACHE` if set). `--no-oci-cache` bypasses both reading and writing the cache for a single run; `--clear-oci-cache` deletes the whole cache directory and exits. The manifest itself is still fetched on every run (its digest is what determines the layer to check the cache for), but the potentially much larger blob download is skipped on a cache hit.
 
 #### Provenance
 
@@ -443,7 +653,7 @@ An OCI fetch prints a line naming the registry, repository, resolved layer diges
 
 The analysis runs as a short pipeline. Each stage lives in its own module under `src/`.
 
-1. **Load and validate (`loader.rs`).** Each file is read from disk and checked for the WASM magic header. The tool accepts both binary WASM (`.wasm`) and WebAssembly Text format (`.wat`). A `.wat` file is detected by its extension or by the absence of the `\0asm` magic bytes, assembled to binary using the `wat` crate, and then validated identically to a binary input — nothing downstream is aware of the distinction. A malformed `.wat` produces a clear assembly error naming the file and the parse problem. The tool then walks every WASM payload to confirm the binary is structurally well formed before any deeper work happens. A corrupt or non-WASM file fails fast with a clear message.
+1. **Load and validate (`loader.rs`).** Each file is read from disk and checked for the WASM magic header. The tool accepts both binary WASM (`.wasm`) and WebAssembly Text format (`.wat`). A `.wat` file is detected by its extension or by the absence of the `\0asm` magic bytes, assembled to binary using the `wat` crate, and then validated identically to a binary input — nothing downstream is aware of the distinction. A malformed `.wat` produces a clear assembly error naming the file and the parse problem. The tool then walks every WASM payload to confirm the binary is structurally well formed before any deeper work happens. A corrupt or non-WASM file fails fast with a clear message that names the byte offset the underlying WASM parser reported for the malformed payload (e.g. `WASM validation error at byte offset 42: ...`), so a corrupt binary can be inspected directly with a hex editor rather than only reported as "malformed." The offset is available both in that human-readable message and programmatically, via `Error::byte_offset()` on the structured error — `None` for failures that have no meaningful position (a bad magic-byte check that never reaches the parser, for instance).
 
    When the baseline is fetched from an RPC endpoint (`--contract-id` / `--rpc-url`), the loader applies a **zero-trust pipeline**: the URL is validated for transport security (HTTPS required unless `--allow-http-local` is set), the RPC response entries are checked for matching ledger keys, and the SHA-256 hash of the fetched bytecode is verified against the on-chain contract instance hash. An optional `--expected-wasm-hash` flag provides additional hash pinning.
 
@@ -480,6 +690,48 @@ soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm \
 ```
 
 Both flags are required together. Supplying only one is an error, because a single snapshot cannot show a change. Keep the manifest versioned next to your contract and update it in the same commit that changes a storage type.
+
+#### Schemas in batch manifests
+
+Each `[[pairs]]` entry may provide its own `old_storage_schema` and
+`new_storage_schema` fields. Schema-backed and interface-only comparisons can
+therefore coexist in one batch:
+
+```toml
+[[pairs]]
+old = "artifacts/token_v1.wasm"
+new = "artifacts/token_v2.wasm"
+name = "token"
+old_storage_schema = "schemas/token_v1.json"
+new_storage_schema = "schemas/token_v2.json"
+
+[[pairs]]
+old = "artifacts/oracle_v1.wasm"
+new = "artifacts/oracle_v2.wasm"
+name = "oracle"
+```
+
+The equivalent JSON fields may use ergonomic hyphenated names:
+
+```json
+{
+  "pairs": [
+    {
+      "old": "artifacts/token_v1.wasm",
+      "new": "artifacts/token_v2.wasm",
+      "name": "token",
+      "old-storage-schema": "schemas/token_v1.json",
+      "new-storage-schema": "schemas/token_v2.json"
+    }
+  ]
+}
+```
+
+Schema paths resolve relative to the manifest file that declares the pair,
+just like `old` and `new`. Both schema fields are required together. A partial,
+missing, or invalid schema is a pair-level error: it fails the batch verdict,
+but unrelated pairs continue to run. Directory scan mode remains
+interface-only because it has no schema discovery step.
 
 ### Manifest format
 
@@ -536,15 +788,15 @@ kind = "enum"
 
 Type strings use the same Rust-like spelling the report prints, so a type named in a finding can be pasted straight back into a manifest.
 
-| Spelling | Meaning |
-| :--- | :--- |
-| `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, `u256`, `i256` | scalars |
-| `Bytes`, `String`, `Symbol`, `Address`, `Timepoint`, `Duration` | built-ins |
-| `Val`, `Error`, `()` | raw value, error, void |
-| `Option<T>`, `Vec<T>`, `Map<K, V>`, `Result<T, E>` | containers |
-| `BytesN<32>` | fixed-length bytes |
-| `(Address, u32)` | tuple |
-| `PositionState` | a user-defined type, exported or declared in the manifest |
+| Spelling                                                           | Meaning                                                   |
+| :----------------------------------------------------------------- | :-------------------------------------------------------- |
+| `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, `u256`, `i256` | scalars                                                   |
+| `Bytes`, `String`, `Symbol`, `Address`, `Timepoint`, `Duration`    | built-ins                                                 |
+| `Val`, `Error`, `()`                                               | raw value, error, void                                    |
+| `Option<T>`, `Vec<T>`, `Map<K, V>`, `Result<T, E>`                 | containers                                                |
+| `BytesN<32>`                                                       | fixed-length bytes                                        |
+| `(Address, u32)`                                                   | tuple                                                     |
+| `PositionState`                                                    | a user-defined type, exported or declared in the manifest |
 
 ### Validation and reconciliation
 
@@ -589,7 +841,9 @@ Storage findings count toward `is_safe` and therefore toward the exit code, so a
 
 Coverage is bounded by what you declare. A storage type you forget to declare is not analyzed, and the report does not pretend otherwise. If a declaration references a type that is neither declared in the manifest nor exported by the contract, that dangling reference is reported as an informational finding rather than quietly skipped.
 
-Storage schemas apply to a single contract pair and are refused in batch mode, since one manifest cannot describe several different contracts.
+In batch output, each pair reports `schema-backed`, `interface-only`, or
+`error` coverage. A passing interface-only pair certifies only its exported
+interface and environment metadata; it must not be read as storage verified.
 
 ## Detection Categories
 
@@ -670,8 +924,8 @@ A WASM import that a contract did not need before can raise the minimum Stellar 
 
 A contract spec identifies every user-defined type by name, but a name is not an identity. Two questions have to be kept apart:
 
-- **Is this the same type as before?** — a *structural* question.
-- **What kind of thing is it?** — a *semantic* question, covered in [Type Classification](#type-classification).
+- **Is this the same type as before?** — a _structural_ question.
+- **What kind of thing is it?** — a _semantic_ question, covered in [Type Classification](#type-classification).
 
 ### Why name matching alone is not enough
 
@@ -752,16 +1006,16 @@ When a classification came from the opt-in heuristic rather than a declaration, 
 
 Earlier versions folded the event guess into the category string itself. Those names are no longer emitted, but suppression configs that use them keep working — each is mapped onto its structural replacement:
 
-| Pre-1.0 category | Stable category |
-| :--- | :--- |
-| `Event Definition Removed` | `Struct Removed` |
-| `Event Field Removed` | `Struct Field Removed` |
-| `Event Field Reordered` | `Struct Field Reordered` |
-| `Event Field Type Changed` | `Struct Field Type Changed` |
-| `Event Enum Removed` | `Enum Removed` |
-| `Event Enum Case Removed` | `Enum Case Removed` |
-| `Event Enum Case Value Changed` | `Enum Case Value Changed` |
-| `Event Enum Case Added` | `Enum Case Added` |
+| Pre-1.0 category                | Stable category             |
+| :------------------------------ | :-------------------------- |
+| `Event Definition Removed`      | `Struct Removed`            |
+| `Event Field Removed`           | `Struct Field Removed`      |
+| `Event Field Reordered`         | `Struct Field Reordered`    |
+| `Event Field Type Changed`      | `Struct Field Type Changed` |
+| `Event Enum Removed`            | `Enum Removed`              |
+| `Event Enum Case Removed`       | `Enum Case Removed`         |
+| `Event Enum Case Value Changed` | `Enum Case Value Changed`   |
+| `Event Enum Case Added`         | `Enum Case Added`           |
 
 New rules should use the stable names. `Error Enum …` categories are unrelated to events and were never remapped.
 
@@ -775,56 +1029,56 @@ Every detection rule has a stable `rule_id` that is independent of the human
 readable category label. The table below lists the registered rules, their
 severity, and the guidance used when `--explain` is enabled.
 
-| rule_id | Label | Severity | Guidance |
-| :--- | :--- | :--- | :--- |
-| `environment` | Environment | Info | Verify the target network supports the new protocol version and adjust tooling as needed. |
-| `function_removed` | Function Removed | Critical | Restore the function or deprecate it in client integrations. |
-| `function_documentation_changed` | Function Documentation Changed | Info | Keep downstream consumers aware of the updated docs and behavior. |
-| `function_added` | Function Added | Info | Inform integrations about the new function. |
-| `function_signature_changed` | Function Signature Changed | Critical | Update call sites and tests to match the new parameter structure. |
-| `parameter_renamed` | Parameter Renamed | Warning | Update named-argument integrations to use the new parameter name. |
-| `parameter_reordered` | Parameter Reordered | Critical | Restore the original parameter order. |
-| `parameter_type_changed` | Parameter Type Changed | Critical | Update caller arguments and SDKs to use the new type. |
-| `return_type_changed` | Return Type Changed | Critical | Update caller expectations and SDKs to the new return type. |
-| `event_definition_removed` | Event Definition Removed | Critical | Update or remove downstream event consumers. |
-| `struct_removed` | Struct Removed | Critical | Restore the struct or migrate any stored data that depends on it. |
-| `struct_documentation_changed` | Struct Documentation Changed | Info | Keep documentation aligned with the intended struct usage. |
-| `struct_added` | Struct Added | Info | Inform consumers about the new struct. |
-| `struct_field_removed` | Struct Field Removed | Critical | Restore the field or perform a storage migration. |
-| `event_field_removed` | Event Field Removed | Critical | Update indexers and consumers that expect the removed field. |
-| `struct_field_reordered` | Struct Field Reordered | Critical | Restore the original field order. |
-| `event_field_reordered` | Event Field Reordered | Critical | Update consumers to handle the new field ordering. |
-| `struct_field_type_changed` | Struct Field Type Changed | Critical | Revert the type change or migrate existing data. |
-| `event_field_type_changed` | Event Field Type Changed | Critical | Update event consumers to handle the new field type. |
-| `struct_field_added` | Struct Field Added | Warning | Ensure consumers and storage migrations handle the new field. |
-| `event_enum_removed` | Event Enum Removed | Critical | Restore the enum or update downstream event consumers. |
-| `enum_removed` | Enum Removed | Critical | Restore the enum or migrate any stored data that uses it. |
-| `enum_documentation_changed` | Enum Documentation Changed | Info | Ensure the updated docs are clear for consumers. |
-| `enum_added` | Enum Added | Info | Inform consumers about the new enum type. |
-| `enum_case_removed` | Enum Case Removed | Critical | Restore the case or migrate data that depends on it. |
-| `event_enum_case_removed` | Event Enum Case Removed | Critical | Restore the case or update event consumers. |
-| `enum_case_value_changed` | Enum Case Value Changed | Critical | Revert the value change to preserve serialization compatibility. |
-| `event_enum_case_value_changed` | Event Enum Case Value Changed | Critical | Revert the change or update event consumers. |
-| `enum_case_added` | Enum Case Added | Info | Ensure consumers can handle the new case. |
-| `event_enum_case_added` | Event Enum Case Added | Info | Update consumers to handle the new event enum case. |
-| `union_removed` | Union Removed | Critical | Restore the union or migrate data that uses it. |
-| `union_added` | Union Added | Info | Inform consumers about the new union type. |
-| `union_case_removed` | Union Case Removed | Critical | Restore the case or migrate existing data. |
-| `union_case_reordered` | Union Case Reordered | Critical | Restore the original case order. |
-| `union_case_type_changed` | Union Case Type Changed | Critical | Revert the type change or migrate data. |
-| `union_case_added` | Union Case Added | Info | Ensure consumers can handle the new union case. |
-| `error_enum_removed` | Error Enum Removed | Critical | Restore the error enum or update clients. |
-| `error_enum_added` | Error Enum Added | Info | Inform client integrations about the new error enum. |
-| `error_enum_case_removed` | Error Enum Case Removed | Critical | Restore the case or update client error handling. |
-| `error_enum_case_value_changed` | Error Enum Case Value Changed | Critical | Revert the value change to preserve error-code compatibility. |
-| `error_enum_case_added` | Error Enum Case Added | Info | Ensure clients can handle the new error case. |
-| `cascading_layout_break` | Cascading Layout Break | Critical | Resolve the underlying layout break in the referenced type. |
-| `host_import_added` | Host Import Added | Warning | Verify the target network has activated the required protocol before deploying. |
-| `host_import_removed` | Host Import Removed | Info | No action typically required. |
-| `host_import_signature_changed` | Host Import Signature Changed | Warning | Investigate why the same import now resolves to a different function type. |
-| `unknown_host_import` | Unknown Host Import | Warning | Verify the import's requirement manually; consider proposing it for the capability registry. |
-| `protocol_requirement_raised` | Protocol Requirement Raised | Warning | Confirm the target network has activated the reported protocol before deploying. |
-| `protocol_environment_mismatch` | Protocol Environment Mismatch | Critical | Rebuild with a matching SDK/toolchain version. |
+| rule_id                          | Label                          | Severity | Guidance                                                                                     |
+| :------------------------------- | :----------------------------- | :------- | :------------------------------------------------------------------------------------------- |
+| `environment`                    | Environment                    | Info     | Verify the target network supports the new protocol version and adjust tooling as needed.    |
+| `function_removed`               | Function Removed               | Critical | Restore the function or deprecate it in client integrations.                                 |
+| `function_documentation_changed` | Function Documentation Changed | Info     | Keep downstream consumers aware of the updated docs and behavior.                            |
+| `function_added`                 | Function Added                 | Info     | Inform integrations about the new function.                                                  |
+| `function_signature_changed`     | Function Signature Changed     | Critical | Update call sites and tests to match the new parameter structure.                            |
+| `parameter_renamed`              | Parameter Renamed              | Warning  | Update named-argument integrations to use the new parameter name.                            |
+| `parameter_reordered`            | Parameter Reordered            | Critical | Restore the original parameter order.                                                        |
+| `parameter_type_changed`         | Parameter Type Changed         | Critical | Update caller arguments and SDKs to use the new type.                                        |
+| `return_type_changed`            | Return Type Changed            | Critical | Update caller expectations and SDKs to the new return type.                                  |
+| `event_definition_removed`       | Event Definition Removed       | Critical | Update or remove downstream event consumers.                                                 |
+| `struct_removed`                 | Struct Removed                 | Critical | Restore the struct or migrate any stored data that depends on it.                            |
+| `struct_documentation_changed`   | Struct Documentation Changed   | Info     | Keep documentation aligned with the intended struct usage.                                   |
+| `struct_added`                   | Struct Added                   | Info     | Inform consumers about the new struct.                                                       |
+| `struct_field_removed`           | Struct Field Removed           | Critical | Restore the field or perform a storage migration.                                            |
+| `event_field_removed`            | Event Field Removed            | Critical | Update indexers and consumers that expect the removed field.                                 |
+| `struct_field_reordered`         | Struct Field Reordered         | Critical | Restore the original field order.                                                            |
+| `event_field_reordered`          | Event Field Reordered          | Critical | Update consumers to handle the new field ordering.                                           |
+| `struct_field_type_changed`      | Struct Field Type Changed      | Critical | Revert the type change or migrate existing data.                                             |
+| `event_field_type_changed`       | Event Field Type Changed       | Critical | Update event consumers to handle the new field type.                                         |
+| `struct_field_added`             | Struct Field Added             | Warning  | Ensure consumers and storage migrations handle the new field.                                |
+| `event_enum_removed`             | Event Enum Removed             | Critical | Restore the enum or update downstream event consumers.                                       |
+| `enum_removed`                   | Enum Removed                   | Critical | Restore the enum or migrate any stored data that uses it.                                    |
+| `enum_documentation_changed`     | Enum Documentation Changed     | Info     | Ensure the updated docs are clear for consumers.                                             |
+| `enum_added`                     | Enum Added                     | Info     | Inform consumers about the new enum type.                                                    |
+| `enum_case_removed`              | Enum Case Removed              | Critical | Restore the case or migrate data that depends on it.                                         |
+| `event_enum_case_removed`        | Event Enum Case Removed        | Critical | Restore the case or update event consumers.                                                  |
+| `enum_case_value_changed`        | Enum Case Value Changed        | Critical | Revert the value change to preserve serialization compatibility.                             |
+| `event_enum_case_value_changed`  | Event Enum Case Value Changed  | Critical | Revert the change or update event consumers.                                                 |
+| `enum_case_added`                | Enum Case Added                | Info     | Ensure consumers can handle the new case.                                                    |
+| `event_enum_case_added`          | Event Enum Case Added          | Info     | Update consumers to handle the new event enum case.                                          |
+| `union_removed`                  | Union Removed                  | Critical | Restore the union or migrate data that uses it.                                              |
+| `union_added`                    | Union Added                    | Info     | Inform consumers about the new union type.                                                   |
+| `union_case_removed`             | Union Case Removed             | Critical | Restore the case or migrate existing data.                                                   |
+| `union_case_reordered`           | Union Case Reordered           | Critical | Restore the original case order.                                                             |
+| `union_case_type_changed`        | Union Case Type Changed        | Critical | Revert the type change or migrate data.                                                      |
+| `union_case_added`               | Union Case Added               | Info     | Ensure consumers can handle the new union case.                                              |
+| `error_enum_removed`             | Error Enum Removed             | Critical | Restore the error enum or update clients.                                                    |
+| `error_enum_added`               | Error Enum Added               | Info     | Inform client integrations about the new error enum.                                         |
+| `error_enum_case_removed`        | Error Enum Case Removed        | Critical | Restore the case or update client error handling.                                            |
+| `error_enum_case_value_changed`  | Error Enum Case Value Changed  | Critical | Revert the value change to preserve error-code compatibility.                                |
+| `error_enum_case_added`          | Error Enum Case Added          | Info     | Ensure clients can handle the new error case.                                                |
+| `cascading_layout_break`         | Cascading Layout Break         | Critical | Resolve the underlying layout break in the referenced type.                                  |
+| `host_import_added`              | Host Import Added              | Warning  | Verify the target network has activated the required protocol before deploying.              |
+| `host_import_removed`            | Host Import Removed            | Info     | No action typically required.                                                                |
+| `host_import_signature_changed`  | Host Import Signature Changed  | Warning  | Investigate why the same import now resolves to a different function type.                   |
+| `unknown_host_import`            | Unknown Host Import            | Warning  | Verify the import's requirement manually; consider proposing it for the capability registry. |
+| `protocol_requirement_raised`    | Protocol Requirement Raised    | Warning  | Confirm the target network has activated the reported protocol before deploying.             |
+| `protocol_environment_mismatch`  | Protocol Environment Mismatch  | Critical | Rebuild with a matching SDK/toolchain version.                                               |
 
 ## Severity Levels
 
@@ -927,10 +1181,10 @@ The optional `--expected-wasm-hash <HEX>` flag lets callers pin the expected on-
 
 ### IntegrityError Types
 
-| Error | Cause |
-|-------|-------|
+| Error                          | Cause                                                                                      |
+| ------------------------------ | ------------------------------------------------------------------------------------------ |
 | `IntegrityError[HashMismatch]` | The SHA-256 of the fetched bytecode does not match the hash in the contract instance entry |
-| `IntegrityError[KeyMismatch]` | The ledger key in the RPC response does not match the requested key |
+| `IntegrityError[KeyMismatch]`  | The ledger key in the RPC response does not match the requested key                        |
 
 ### Report Metadata
 
@@ -995,6 +1249,47 @@ should ignore unknown fields so additive changes do not break them. A firmer
 "additive changes only within a major version" guarantee is intended once the
 crate reaches 1.0.
 
+For the full field-level compatibility contract — which fields are stable,
+additive, conditional, or deprecated, how to handle unknown fields, and how to
+handle unsupported future versions — see the
+[Report Schema Compatibility Policy](report_schema_compatibility.md).
+
+### Rendering a saved report
+
+`render` turns a previously saved JSON report back into a human-readable
+document, without needing the original WASM files. It accepts a report in
+either of two forms — a path to a saved JSON file, or `-` to read the JSON
+from stdin:
+
+```bash
+# From a saved file
+soroban-upgrade-safeguard render report.json --format markdown
+
+# From stdin, piped straight from a comparison run
+soroban-upgrade-safeguard ./old.wasm ./new.wasm --format json \
+  | soroban-upgrade-safeguard render - --format text
+```
+
+Any argument other than `-` is read as a file path. The only supported
+target formats are `text` (the default, colored human-readable output) and
+`markdown` (suitable for PR descriptions and comments) — `json` is not a
+valid `--format` for `render`, since re-rendering a saved JSON document as
+JSON would just be a no-op copy.
+
+### Upgrading an older saved report
+
+A saved JSON report is a durable artifact, and `render` only reads
+[`REPORT_SCHEMA_VERSION`](../src/render.rs) directly. When a schema change
+does need an older report migrated forward, use `upgrade-report`:
+
+```bash
+soroban-upgrade-safeguard upgrade-report old_report.json --output upgraded.json
+```
+
+See [Report Schema Migrations](report_migrations.md) for the full versioning
+scheme, what a migration preserves, and how the migration history embedded
+in the upgraded document is structured.
+
 ## Reading the Report
 
 A run prints a header for each loaded contract with a one line summary of how many functions, structs, enums, unions, and error enums it contains. It then prints the safety report.
@@ -1020,10 +1315,76 @@ can point at a different file with `--config <PATH>`:
 soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm --config .safeguard.toml
 ```
 
-If no `--config` is given and `.safeguard.toml` is absent, nothing is
-suppressed and the tool behaves exactly as it always has. If you pass
-`--config` explicitly and the file is missing or malformed, that is a hard
-error rather than a silent no-op, so a typo never quietly disables suppression.
+When `--config` is not given, the `SOROBAN_SAFEGUARD_CONFIG` environment
+variable is used instead if set — handy for CI systems that would rather
+configure a path once (e.g. in a workflow's `env:` block) than repeat
+`--config` on every invocation:
+
+```bash
+export SOROBAN_SAFEGUARD_CONFIG=/config/.safeguard.toml
+soroban-upgrade-safeguard ./on-chain.wasm ./candidate.wasm
+```
+
+An explicit `--config` flag always takes precedence over the environment
+variable. Whichever source resolved a path is echoed back as a diagnostic
+(`Suppression config: <path> (source: ...)`) so a run's logs make clear where
+the config came from; in `--manifest` mode the same information is available
+per pair via `--explain-manifest`, where the config setting's `origin` is
+`cli`, `env`, `built-in`, or the manifest file that set it.
+
+If neither `--config` nor `SOROBAN_SAFEGUARD_CONFIG` is given and
+`.safeguard.toml` is absent, nothing is suppressed and the tool behaves
+exactly as it always has. If you pass `--config` explicitly, or
+`SOROBAN_SAFEGUARD_CONFIG` names a path, and that file is missing or
+malformed, that is a hard error rather than a silent no-op, so a typo never
+quietly disables suppression — the same way it always has for `--config`.
+Only the auto-discovered `.safeguard.toml` default stays optional: if it
+simply isn't there, the tool proceeds with no suppressions.
+
+#### Searching parent directories
+
+Running the tool from a workspace subdirectory — a monorepo package, a
+service's own folder — means the current directory usually doesn't have a
+`.safeguard.toml` of its own even when the repository root does, so the
+plain current-directory check above misses it. `--search-parent-config` is
+an **opt-in** ancestor search for exactly that case: only when the flag is
+passed does the tool look above the current directory at all.
+
+```bash
+cd services/api  # no .safeguard.toml here; the repo root has one
+soroban-upgrade-safeguard old.wasm new.wasm --search-parent-config
+```
+
+The search walks upward from the current directory and stops at the first
+of two boundaries:
+
+- **The workspace root** — the first ancestor directory containing a `.git`
+  entry (a directory for a normal checkout, or a file for a worktree or
+  submodule). This directory is itself still searched before the walk
+  stops.
+- **The filesystem root**, if no `.git` is ever found.
+
+A `.safeguard.toml` above that boundary is never picked up, no matter how
+far up the search would otherwise be allowed to go — the point is to find
+"the repository's config," not every config anywhere above the current
+directory.
+
+**More than one candidate along the way is a hard error, not a guess.**
+If two ancestor directories each have their own `.safeguard.toml`, the tool
+cannot know which one you meant, and silently picking the nearest would make
+the effective config depend on exactly which subdirectory you happened to
+run from — the kind of ambiguity this option exists to resolve, not
+reproduce one level up. The error lists every candidate found; pass
+`--config` explicitly to choose one.
+
+`--search-parent-config` is the lowest-priority source: `--config`, then
+`SOROBAN_SAFEGUARD_CONFIG`, then the current directory, all still win over
+it, and it conflicts with `--no-config` at the flag-parsing level (searching
+for a config while also saying not to load one is contradictory). Whichever
+file it finds is echoed in the same `Suppression config: <path> (source:
+--search-parent-config)` diagnostic described above, and in `--manifest`
+mode's `--explain-manifest` output the same way the current-directory
+default is.
 
 Each `[[suppress]]` entry acknowledges exactly one finding. The stable key is
 `rule_id`, and the legacy `category` field is still accepted as a compatibility
@@ -1059,9 +1420,38 @@ mapped to the same rule id automatically, so existing suppressions keep working.
 - **Expiry**: evaluated against the current system date (`YYYY-MM-DD`). Expired rules trigger a hard failure during config loading.
 - **Targetless Wildcards**: omitting `target` matches only targetless findings (e.g., `Environment`). This requires explicit opt-in (`allow_targetless = true`) and is capped at a ceiling of 3 rules.
 
+### Requiring a reason for risky suppressions
+
+`reason` is optional by default. For findings risky enough that an
+unexplained suppression isn't reviewable, an optional `[require_reason]`
+table names the rule IDs and/or compatibility axes that must carry a
+non-blank `reason`:
+
+```toml
+[require_reason]
+rule_ids = ["struct_field_removed"]
+axes     = ["storage_layout"]
+
+[[suppress]]
+rule_id = "struct_field_removed"
+target  = "ConfigData.threshold"
+reason  = "Planned storage migration in v2 drops the unused threshold field."
+```
+
+A config that omits `[require_reason]` (or leaves both lists empty) behaves
+exactly as before. When present, a rule matching by rule ID or by classified
+axis whose `reason` is missing or whitespace-only is rejected as a hard load
+error, naming the offending rule's position in the config — enforced on every
+normal run, not only under `--validate-config`. Axis matching is evaluated
+statically (without a specific contract pair's diff context): exact for most
+categories, but struct/enum/union field- and case-level categories are only
+guaranteed to match the `storage_layout` axis this way; use `rule_ids` for
+precise per-category coverage.
+
 ### Legacy Format & Migration
 
 For backwards compatibility, old-format rules (lacking `author`, `expiry`, or `fingerprint`) will trigger a warning on `stderr` during execution for one release before becoming a hard error. To migrate an old rule:
+
 1. Run `soroban-upgrade-safeguard` with `--format json`.
 2. Copy the finding's `category` and `target`.
 3. Add `author`, `reason`, `expiry` (`YYYY-MM-DD`), and compute or copy the `fingerprint`.
@@ -1090,12 +1480,12 @@ be crashed on demand is a gate that can be bypassed.
 A single resource policy is threaded through every decode and every recursive type
 walk. Four limits, each independently configurable:
 
-| Limit | Default | Bounds |
-| :--- | :--- | :--- |
-| `max_xdr_depth` | 64 | XDR recursion depth per entry. Guards against stack overflow at decode time. |
-| `max_xdr_len` | 33554432 (32 MiB) | Bytes decoded per custom section — shared across every entry in the section, so it also caps the total decoded bytes. Guards against oversized-length allocations. |
-| `max_entries` | 100000 | Decoded spec entries, **summed across all `contractspecv0` sections** (a module may carry more than one). Env-metadata entries are budgeted separately. |
-| `max_walk_depth` | 128 | Recursion depth for the type walkers — structural equality, finding-message rendering, and cascade detection — which operate on already-decoded types. |
+| Limit            | Default           | Bounds                                                                                                                                                             |
+| :--------------- | :---------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max_xdr_depth`  | 64                | XDR recursion depth per entry. Guards against stack overflow at decode time.                                                                                       |
+| `max_xdr_len`    | 33554432 (32 MiB) | Bytes decoded per custom section — shared across every entry in the section, so it also caps the total decoded bytes. Guards against oversized-length allocations. |
+| `max_entries`    | 100000            | Decoded spec entries, **summed across all `contractspecv0` sections** (a module may carry more than one). Env-metadata entries are budgeted separately.            |
+| `max_walk_depth` | 128               | Recursion depth for the type walkers — structural equality, finding-message rendering, and cascade detection — which operate on already-decoded types.             |
 
 The distinction between `max_xdr_len` (a **per-section byte cap**) and `max_entries`
 (a **cross-section count cap**) matters: many individually valid sections cannot be
@@ -1124,6 +1514,24 @@ soroban-upgrade-safeguard old.wasm new.wasm --max-xdr-depth 128 --max-walk-depth
 
 The defaults accept every fixture and a representative corpus of real mainnet specs.
 Raise a limit only if a legitimate, unusually large contract is rejected.
+
+### Named policy profiles
+
+A single `.safeguard.toml` can also declare named policy variants -- gating,
+`strict`, `max_suppressions`, `[limits]`, and output formatting -- that share
+one file's suppressions and classification data:
+
+```toml
+[profiles.pr]
+strict = true
+```
+
+```bash
+soroban-upgrade-safeguard old.wasm new.wasm --profile pr
+```
+
+See [Named Policy Profiles](named_policy_profiles.md) for the schema,
+inheritance, precedence, and provenance.
 
 ### Behavior when a limit is exceeded
 
@@ -1172,9 +1580,9 @@ This release changes the wording of the verdict and adds a new optional input. N
 
 The status line is now explicit about the scope it covers.
 
-| Before | After |
-| :--- | :--- |
-| `✅ PASSED (No breaking changes detected)` | `✅ PASSED (No exported-interface breaking changes)` |
+| Before                                           | After                                                      |
+| :----------------------------------------------- | :--------------------------------------------------------- |
+| `✅ PASSED (No breaking changes detected)`       | `✅ PASSED (No exported-interface breaking changes)`       |
 | `❌ FAILED (Critical breaking changes detected)` | `❌ FAILED (Exported-interface breaking changes detected)` |
 
 When a storage schema is supplied, the passing wording widens to `✅ PASSED (No exported-interface or declared-storage breaks)`.
@@ -1211,6 +1619,7 @@ If your pipeline treats `is_safe: true` as "storage compatible", check `scope.st
 To ensure the analyzer's safety claims hold against real-world smart contracts rather than just hand-crafted toy fixtures, a validation corpus of real-world contract upgrade pairs is included in `tests/real_world_corpus/`.
 
 This corpus includes upgrade pairs drawn from real mainnet Soroban protocols:
+
 - **Blend Protocol**: Lending pool contract evolution (v1 -> v2).
 - **Soroswap DEX**: AMM Router contract interface cleanup.
 - **Reflector Price Oracle**: Price data struct representation upgrade.
@@ -1239,7 +1648,7 @@ It works on any WASM that embeds a standard `contractspecv0` custom section. If 
 Appending a field does not move existing fields, so old data still deserializes for the fields that were already there. The new field, however, has no stored value in old entries, so you need a migration or a default. The tool flags this so you remember to handle it. Note that appending to a declared storage **key** is Critical rather than a warning, because it changes the address of every entry.
 
 **What counts as a safe upgrade?**
-Any run that finishes with zero critical findings, *within the scope that was analyzed*. Warnings and info findings are worth reviewing but do not block deployment. Read [What a Passing Verdict Guarantees](#what-a-passing-verdict-guarantees) before treating a pass as storage compatibility.
+Any run that finishes with zero critical findings, _within the scope that was analyzed_. Warnings and info findings are worth reviewing but do not block deployment. Read [What a Passing Verdict Guarantees](#what-a-passing-verdict-guarantees) before treating a pass as storage compatibility.
 
 **Does a green run mean my upgrade is storage safe?**
 Not on its own. By default the tool analyzes only the exported interface, and it says so in the report. Storage layout is analyzed only when you supply a [storage schema](#storage-schema-analysis), and then only for the types you declared.

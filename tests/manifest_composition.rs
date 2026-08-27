@@ -120,6 +120,16 @@ fn origin_of(json: &Value, pair_name: &str, path: &[&str]) -> String {
         .to_string()
 }
 
+fn result<'a>(json: &'a Value, pair_name: &str) -> &'a Value {
+    json["results"]
+        .as_array()
+        .expect("results must be an ordered array")
+        .iter()
+        .find(|entry| entry["name"] == pair_name)
+        .and_then(|entry| entry.get("report"))
+        .unwrap_or_else(|| panic!("no result named '{pair_name}'"))
+}
+
 // ── Composition ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -207,10 +217,11 @@ fn nested_includes_compose_depth_first() {
         .collect();
     assert_eq!(sources, vec!["b.toml", "a.toml", "root.toml"]);
 
-    // Reports are still keyed by name and sorted, as before.
-    let results = json["results"].as_object().unwrap();
+    let results = json["results"].as_array().unwrap();
     assert_eq!(results.len(), 3);
-    assert!(results.contains_key("a") && results.contains_key("b") && results.contains_key("root"));
+    assert_eq!(results[0]["name"], "b");
+    assert_eq!(results[1]["name"], "a");
+    assert_eq!(results[2]["name"], "root");
 }
 
 #[test]
@@ -398,7 +409,7 @@ fn a_gate_can_be_turned_off_because_gates_are_valued_not_escalation() {
         false
     );
     // The findings are still reported — ungating changes the verdict, not visibility.
-    assert_eq!(json["results"]["token"]["counts"]["critical"], 3);
+    assert_eq!(result(&json, "token")["counts"]["critical"], 3);
 }
 
 #[test]
@@ -451,14 +462,14 @@ fn per_pair_config_applies_only_to_its_own_pair() {
 
     // The config applies to the pair that named it. Suppressed findings stay
     // counted and visible — suppression flips the verdict, not the tally.
-    assert_eq!(json["results"]["suppressed"]["counts"]["critical"], 3);
-    assert_eq!(json["results"]["suppressed"]["suppressed_count"], 3);
-    assert_eq!(json["results"]["suppressed"]["is_safe"], true);
+    assert_eq!(result(&json, "suppressed")["counts"]["critical"], 3);
+    assert_eq!(result(&json, "suppressed")["suppressed_count"], 3);
+    assert_eq!(result(&json, "suppressed")["is_safe"], true);
 
     // ...and not to its sibling, which sees the same three findings unsuppressed.
-    assert_eq!(json["results"]["unsuppressed"]["counts"]["critical"], 3);
-    assert_eq!(json["results"]["unsuppressed"]["suppressed_count"], 0);
-    assert_eq!(json["results"]["unsuppressed"]["is_safe"], false);
+    assert_eq!(result(&json, "unsuppressed")["counts"]["critical"], 3);
+    assert_eq!(result(&json, "unsuppressed")["suppressed_count"], 0);
+    assert_eq!(result(&json, "unsuppressed")["is_safe"], false);
 
     // One pair still failing keeps the batch verdict failing.
     assert_eq!(run.code, 1);
@@ -660,6 +671,306 @@ fn duplicate_pair_names_fail_before_anything_runs() {
     assert!(
         !wrote_reports,
         "no reports may be written before the run aborts"
+    );
+}
+
+// ── Pair IDs ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn explicit_pair_id_is_accepted_in_a_toml_manifest_and_appears_in_batch_json() {
+    let dir = temp_dir("mc-id-toml");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "Token (v1, safe)"
+        id   = "token-safe"
+        "#,
+    );
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0);
+    let json = run.json();
+
+    let entry = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "Token (v1, safe)")
+        .expect("result entry must be present");
+    assert_eq!(entry["id"], "token-safe");
+
+    let pair = json["manifest"]["pairs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "Token (v1, safe)")
+        .expect("manifest pair provenance must be present");
+    assert_eq!(pair["id"], "token-safe");
+}
+
+#[test]
+fn explicit_pair_id_is_accepted_in_a_json_manifest() {
+    let dir = temp_dir("mc-id-json");
+    stage_wasm(&dir.join("wasm"));
+    let manifest = serde_json::json!({
+        "defaults": { "base_dir": "wasm" },
+        "pairs": [
+            { "old": "v1.wasm", "new": "v1.wasm", "name": "token", "id": "token-1" }
+        ]
+    })
+    .to_string();
+    let root = write(&dir, "root.json", &manifest);
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0);
+    let json = run.json();
+    let entry = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "token")
+        .expect("result entry must be present");
+    assert_eq!(entry["id"], "token-1");
+}
+
+#[test]
+fn omitted_pair_id_falls_back_deterministically_to_the_resolved_name() {
+    let dir = temp_dir("mc-id-fallback");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "token"
+        "#,
+    );
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0);
+    let json = run.json();
+    let entry = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "token")
+        .expect("result entry must be present");
+    // No `id` set -> falls back to the resolved `name`.
+    assert_eq!(entry["id"], "token");
+}
+
+#[test]
+fn duplicate_pair_ids_fail_before_anything_runs() {
+    let dir = temp_dir("mc-id-duplicate");
+    stage_wasm(&dir.join("wasm"));
+    let reports = dir.join("reports");
+
+    write(
+        &dir,
+        "frag.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "token-a"
+        id   = "shared"
+        "#,
+    );
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        include = ["frag.toml"]
+
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v2.wasm"
+        name = "token-b"
+        id   = "shared"
+        "#,
+    );
+
+    let run = run_in(
+        None,
+        &[
+            "--manifest",
+            root.to_str().unwrap(),
+            "--per-contract-output-dir",
+            reports.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(run.code, 1);
+
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        combined.contains("Duplicate pair id 'shared'"),
+        "error must name the collision: {combined}"
+    );
+    assert!(
+        combined.contains("frag.toml"),
+        "missing first file: {combined}"
+    );
+    assert!(
+        combined.contains("root.toml"),
+        "missing second file: {combined}"
+    );
+
+    // Detection runs ahead of execution, so no partial reports hit disk.
+    let wrote_reports = reports
+        .read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    assert!(
+        !wrote_reports,
+        "no reports may be written before the run aborts"
+    );
+}
+
+#[test]
+fn duplicate_pair_ids_fail_in_a_json_manifest_too() {
+    let dir = temp_dir("mc-id-duplicate-json");
+    stage_wasm(&dir.join("wasm"));
+    let manifest = serde_json::json!({
+        "defaults": { "base_dir": "wasm" },
+        "pairs": [
+            { "old": "v1.wasm", "new": "v1.wasm", "name": "token-a", "id": "shared" },
+            { "old": "v1.wasm", "new": "v2.wasm", "name": "token-b", "id": "shared" }
+        ]
+    })
+    .to_string();
+    let root = write(&dir, "root.json", &manifest);
+
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        combined.contains("Duplicate pair id 'shared'"),
+        "error must name the collision: {combined}"
+    );
+}
+
+#[test]
+fn invalid_pair_id_is_rejected_before_anything_runs() {
+    let dir = temp_dir("mc-id-invalid");
+    stage_wasm(&dir.join("wasm"));
+    let reports = dir.join("reports");
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "token"
+        id   = "not a valid id!"
+        "#,
+    );
+
+    let run = run_in(
+        None,
+        &[
+            "--manifest",
+            root.to_str().unwrap(),
+            "--per-contract-output-dir",
+            reports.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        combined.contains("Invalid pair id 'not a valid id!'"),
+        "error must name the offending id: {combined}"
+    );
+    assert!(
+        combined.contains(root.file_name().unwrap().to_str().unwrap())
+            || combined.contains("root.toml"),
+        "error should name the source manifest: {combined}"
+    );
+
+    let wrote_reports = reports
+        .read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    assert!(
+        !wrote_reports,
+        "no reports may be written before the run aborts"
+    );
+}
+
+#[test]
+fn empty_pair_id_is_rejected() {
+    let dir = temp_dir("mc-id-empty");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old = "v1.wasm"
+        new = "v1.wasm"
+        id  = ""
+        "#,
+    );
+
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("Invalid pair id"), "got: {combined}");
+}
+
+#[test]
+fn explain_manifest_reports_pair_ids() {
+    let dir = temp_dir("mc-id-explain");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "token"
+        id   = "token-1"
+        "#,
+    );
+
+    let run = run_in(
+        None,
+        &["--manifest", root.to_str().unwrap(), "--explain-manifest"],
+    );
+    assert_eq!(run.code, 0);
+    assert!(
+        run.stdout.contains("token-1"),
+        "explain-manifest output should show the resolved id: {}",
+        run.stdout
     );
 }
 
@@ -915,11 +1226,8 @@ fn a_flat_toml_manifest_behaves_exactly_as_before() {
     let json = run.json();
     assert_eq!(json["total_pairs"], 2);
     assert_eq!(json["is_safe"], false);
-    assert_eq!(json["results"]["clean_contract"]["is_safe"], true);
-    assert_eq!(
-        json["results"]["breaking_contract"]["counts"]["critical"],
-        3
-    );
+    assert_eq!(result(&json, "clean_contract")["is_safe"], true);
+    assert_eq!(result(&json, "breaking_contract")["counts"]["critical"], 3);
 }
 
 #[test]
@@ -943,8 +1251,8 @@ fn a_flat_json_manifest_behaves_exactly_as_before() {
 
     let json = run.json();
     assert_eq!(json["total_pairs"], 2);
-    assert_eq!(json["results"]["clean"]["is_safe"], true);
-    assert_eq!(json["results"]["breaking"]["counts"]["critical"], 3);
+    assert_eq!(result(&json, "clean")["is_safe"], true);
+    assert_eq!(result(&json, "breaking")["counts"]["critical"], 3);
 }
 
 #[test]
@@ -1019,7 +1327,7 @@ fn directory_scan_mode_is_unaffected_and_emits_no_manifest_block() {
     assert_eq!(run.code, 1);
 
     let json = run.json();
-    assert_eq!(json["results"]["token"]["counts"]["critical"], 3);
+    assert_eq!(result(&json, "token")["counts"]["critical"], 3);
     // There is no composition to describe, so the key is absent rather than empty.
     assert!(
         json.get("manifest").is_none(),
@@ -1154,15 +1462,15 @@ fn the_same_manifest_yields_byte_identical_json() {
     assert_eq!(first.json()["is_safe"], second.json()["is_safe"]);
     assert_eq!(first.json()["total_pairs"], second.json()["total_pairs"]);
 
-    // Report order stays name-sorted regardless of composition order.
+    // Report order follows manifest composition order.
     let json = first.json();
     let names: Vec<&str> = json["results"]
-        .as_object()
+        .as_array()
         .unwrap()
-        .keys()
-        .map(|k| k.as_str())
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["a", "b"]);
+    assert_eq!(names, vec!["b", "a"]);
 
     // Provenance keeps composition order, which is the useful order there.
     let pair_names: Vec<&str> = json["manifest"]["pairs"]
@@ -1172,4 +1480,721 @@ fn the_same_manifest_yields_byte_identical_json() {
         .map(|p| p["name"].as_str().unwrap())
         .collect();
     assert_eq!(pair_names, vec!["b", "a"]);
+}
+
+// ── Verdict summary ──────────────────────────────────────────────────────────
+
+/// A manifest with one pair in each of the four verdict categories:
+///
+/// - `safe-pair`: v1 -> v1, schema-backed, no breaking changes.
+/// - `unsafe-pair`: v1 -> v2, breaking changes (3 criticals).
+/// - `incomplete-pair`: v1 -> v1, no storage schema (interface-only), no
+///   breaking changes.
+/// - `errored-pair`: only one of `old_storage_schema`/`new_storage_schema`
+///   set, a partial declaration that fails per-pair without a compatibility
+///   verdict ever being reached.
+fn write_mixed_verdict_manifest(dir: &Path) -> PathBuf {
+    stage_wasm(&dir.join("wasm"));
+    write(dir, "schemas/empty.json", r#"{"declarations": []}"#);
+
+    write(
+        dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "safe-pair"
+        old_storage_schema = "schemas/empty.json"
+        new_storage_schema = "schemas/empty.json"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v2.wasm"
+        name = "unsafe-pair"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "incomplete-pair"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "errored-pair"
+        old_storage_schema = "schemas/empty.json"
+        "#,
+    )
+}
+
+#[test]
+fn batch_summary_counts_every_verdict_category_in_json() {
+    let dir = temp_dir("mc-verdict-json");
+    let root = write_mixed_verdict_manifest(&dir);
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 1, "an unsafe/errored pair in the batch must fail the run");
+    let json = run.json();
+
+    assert_eq!(json["summary"]["safe"], 1, "summary: {}", json["summary"]);
+    assert_eq!(json["summary"]["unsafe"], 1, "summary: {}", json["summary"]);
+    assert_eq!(json["summary"]["errored"], 1, "summary: {}", json["summary"]);
+    assert_eq!(
+        json["summary"]["incomplete"], 1,
+        "summary: {}",
+        json["summary"]
+    );
+    assert_eq!(json["summary"]["total"], 4, "summary: {}", json["summary"]);
+
+    // The summary is a tally, not a replacement: every per-pair result and
+    // its findings must still be present and untouched.
+    assert_eq!(json["results"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        result(&json, "unsafe-pair")["counts"]["critical"],
+        3,
+        "per-pair findings must survive alongside the summary"
+    );
+    assert_eq!(result(&json, "safe-pair")["is_safe"], true);
+    assert_eq!(result(&json, "incomplete-pair")["is_safe"], true);
+
+    let errored_entry = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "errored-pair")
+        .expect("errored-pair result must be present");
+    assert!(
+        errored_entry.get("error").is_some(),
+        "errored-pair must carry a pair error: {errored_entry}"
+    );
+}
+
+#[test]
+fn batch_summary_appears_before_detailed_results_in_text_output() {
+    let dir = temp_dir("mc-verdict-text");
+    let root = write_mixed_verdict_manifest(&dir);
+
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+
+    let summary_pos = run
+        .stdout
+        .find("Verdict Summary:")
+        .expect("text output must include a Verdict Summary line");
+    assert!(
+        run.stdout.contains("1 safe, 1 unsafe, 1 errored, 1 incomplete (4 total)"),
+        "counts must match the mixed batch, got:\n{}",
+        run.stdout
+    );
+
+    let details_pos = run
+        .stdout
+        .find("=== Contract:")
+        .expect("detailed per-contract sections must still be present");
+    assert!(
+        summary_pos < details_pos,
+        "the verdict summary must appear before detailed results"
+    );
+}
+
+#[test]
+fn batch_summary_appears_before_detailed_results_in_markdown_output() {
+    let dir = temp_dir("mc-verdict-markdown");
+    let root = write_mixed_verdict_manifest(&dir);
+
+    let run = run_in(
+        None,
+        &[
+            "--manifest",
+            root.to_str().unwrap(),
+            "--format",
+            "markdown",
+        ],
+    );
+    assert_eq!(run.code, 1);
+
+    let summary_pos = run
+        .stdout
+        .find("### Verdict Summary")
+        .expect("markdown output must include a Verdict Summary section");
+    assert!(
+        run.stdout.contains("| 1 | 1 | 1 | 1 | 4 |"),
+        "the verdict table row must match the mixed batch, got:\n{}",
+        run.stdout
+    );
+
+    let details_pos = run
+        .stdout
+        .find("## Details:")
+        .expect("detailed per-contract sections must still be present");
+    assert!(
+        summary_pos < details_pos,
+        "the verdict summary must appear before detailed results"
+    );
+}
+
+#[test]
+fn batch_summary_is_all_safe_when_every_pair_is_schema_backed_and_clean() {
+    let dir = temp_dir("mc-verdict-all-safe");
+    stage_wasm(&dir.join("wasm"));
+    write(&dir, "schemas/empty.json", r#"{"declarations": []}"#);
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "a"
+        old_storage_schema = "schemas/empty.json"
+        new_storage_schema = "schemas/empty.json"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "b"
+        old_storage_schema = "schemas/empty.json"
+        new_storage_schema = "schemas/empty.json"
+        "#,
+    );
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0);
+    let json = run.json();
+    assert_eq!(json["summary"]["safe"], 2);
+    assert_eq!(json["summary"]["unsafe"], 0);
+    assert_eq!(json["summary"]["errored"], 0);
+    assert_eq!(json["summary"]["incomplete"], 0);
+    assert_eq!(json["summary"]["total"], 2);
+}
+
+// ── --max-pairs ──────────────────────────────────────────────────────────────
+
+/// A manifest with `n` pairs, all comparing the checked-in `v1.wasm` fixture
+/// against itself, none needing a storage schema. Cheap and fast to run even
+/// at boundary sizes, since a safe v1 -> v1 comparison does no real work.
+fn write_n_pair_manifest(dir: &Path, n: usize) -> PathBuf {
+    stage_wasm(&dir.join("wasm"));
+    let mut body = String::from("[defaults]\nbase_dir = \"wasm\"\n\n");
+    for i in 0..n {
+        body.push_str(&format!(
+            "[[pairs]]\nold = \"v1.wasm\"\nnew = \"v1.wasm\"\nname = \"pair-{i}\"\n\n"
+        ));
+    }
+    write(dir, "root.toml", &body)
+}
+
+#[test]
+fn default_max_pairs_does_not_affect_an_ordinary_sized_manifest() {
+    let dir = temp_dir("max-pairs-default-ok");
+    let root = write_n_pair_manifest(&dir, 3);
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0);
+    assert_eq!(run.json()["total_pairs"], 3);
+}
+
+#[test]
+fn custom_max_pairs_rejects_an_oversized_manifest_before_loading_any_wasm() {
+    let dir = temp_dir("max-pairs-custom-reject");
+    let root = write_n_pair_manifest(&dir, 3);
+    let reports = dir.join("reports");
+
+    let run = run_in(
+        None,
+        &[
+            "--manifest",
+            root.to_str().unwrap(),
+            "--max-pairs",
+            "2",
+            "--per-contract-output-dir",
+            reports.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(run.code, 1);
+
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("3 pairs"), "got: {combined}");
+    assert!(combined.contains("maximum of 2"), "got: {combined}");
+    assert!(combined.contains("--max-pairs"), "got: {combined}");
+
+    // Rejected ahead of any WASM loading: no per-contract report exists.
+    let wrote_reports = reports
+        .read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    assert!(
+        !wrote_reports,
+        "no reports may be written before the run aborts"
+    );
+}
+
+#[test]
+fn max_pairs_exactly_at_the_custom_limit_runs_normally() {
+    let dir = temp_dir("max-pairs-boundary-ok");
+    let root = write_n_pair_manifest(&dir, 2);
+
+    let run = run_in(
+        None,
+        &["--manifest", root.to_str().unwrap(), "--max-pairs", "2"],
+    );
+    assert_eq!(run.code, 0, "a manifest exactly at the limit must run: {}{}", run.stdout, run.stderr);
+}
+
+#[test]
+fn max_pairs_one_over_the_custom_limit_is_rejected() {
+    let dir = temp_dir("max-pairs-boundary-reject");
+    let root = write_n_pair_manifest(&dir, 3);
+
+    let run = run_in(
+        None,
+        &["--manifest", root.to_str().unwrap(), "--max-pairs", "2"],
+    );
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("3 pairs"), "got: {combined}");
+    assert!(combined.contains("maximum of 2"), "got: {combined}");
+}
+
+#[test]
+fn max_pairs_zero_rejects_any_manifest_with_pairs() {
+    let dir = temp_dir("max-pairs-zero");
+    let root = write_n_pair_manifest(&dir, 1);
+
+    let run = run_in(
+        None,
+        &["--manifest", root.to_str().unwrap(), "--max-pairs", "0"],
+    );
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("1 pairs"), "got: {combined}");
+    assert!(combined.contains("maximum of 0"), "got: {combined}");
+}
+
+// ── Labels ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn labels_appear_in_batch_json_results_and_manifest_provenance() {
+    let dir = temp_dir("labels-json");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old    = "v1.wasm"
+        new    = "v1.wasm"
+        name   = "labeled"
+        labels = ["stage:prod", "service:payments"]
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "unlabeled"
+        "#,
+    );
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0);
+    let json = run.json();
+
+    let labeled_result = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "labeled")
+        .expect("labeled result must be present");
+    assert_eq!(
+        labeled_result["labels"],
+        serde_json::json!(["stage:prod", "service:payments"])
+    );
+
+    let unlabeled_result = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "unlabeled")
+        .expect("unlabeled result must be present");
+    assert_eq!(unlabeled_result["labels"], serde_json::json!([]));
+
+    // Per-contract provenance (the manifest.pairs[] block) carries labels too.
+    let labeled_pair = json["manifest"]["pairs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "labeled")
+        .expect("labeled pair provenance must be present");
+    assert_eq!(
+        labeled_pair["labels"],
+        serde_json::json!(["stage:prod", "service:payments"])
+    );
+}
+
+#[test]
+fn labels_appear_in_text_output() {
+    let dir = temp_dir("labels-text");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old    = "v1.wasm"
+        new    = "v1.wasm"
+        name   = "labeled"
+        labels = ["prod", "payments"]
+        "#,
+    );
+
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 0);
+    assert!(
+        run.stdout.contains("prod") && run.stdout.contains("payments"),
+        "text output must surface labels: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn labels_appear_in_markdown_output() {
+    let dir = temp_dir("labels-markdown");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old    = "v1.wasm"
+        new    = "v1.wasm"
+        name   = "labeled"
+        labels = ["prod", "payments"]
+        "#,
+    );
+
+    let run = run_in(
+        None,
+        &[
+            "--manifest",
+            root.to_str().unwrap(),
+            "--format",
+            "markdown",
+        ],
+    );
+    assert_eq!(run.code, 0);
+    assert!(run.stdout.contains("Labels"), "got:\n{}", run.stdout);
+    assert!(
+        run.stdout.contains("prod") && run.stdout.contains("payments"),
+        "markdown output must surface labels: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn repeated_labels_across_many_pairs_are_accepted() {
+    let dir = temp_dir("labels-repeated");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old    = "v1.wasm"
+        new    = "v1.wasm"
+        name   = "a"
+        labels = ["prod"]
+
+        [[pairs]]
+        old    = "v1.wasm"
+        new    = "v1.wasm"
+        name   = "b"
+        labels = ["prod"]
+
+        [[pairs]]
+        old    = "v1.wasm"
+        new    = "v1.wasm"
+        name   = "c"
+        labels = ["prod"]
+        "#,
+    );
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(
+        run.code, 0,
+        "the same label repeating across pairs must not be rejected: {}",
+        run.stderr
+    );
+    let json = run.json();
+    for name in ["a", "b", "c"] {
+        let entry = json["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("no result named '{name}'"));
+        assert_eq!(entry["labels"], serde_json::json!(["prod"]));
+    }
+}
+
+#[test]
+fn invalid_label_is_rejected_before_anything_runs() {
+    let dir = temp_dir("labels-invalid");
+    stage_wasm(&dir.join("wasm"));
+    let reports = dir.join("reports");
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old    = "v1.wasm"
+        new    = "v1.wasm"
+        name   = "token"
+        labels = ["not a valid label!"]
+        "#,
+    );
+
+    let run = run_in(
+        None,
+        &[
+            "--manifest",
+            root.to_str().unwrap(),
+            "--per-contract-output-dir",
+            reports.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        combined.contains("Invalid label 'not a valid label!'"),
+        "error must name the offending label: {combined}"
+    );
+
+    let wrote_reports = reports
+        .read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    assert!(
+        !wrote_reports,
+        "no reports may be written before the run aborts"
+    );
+}
+
+#[test]
+fn unlabeled_pairs_are_unaffected_in_a_mixed_batch() {
+    let dir = temp_dir("labels-mixed");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old    = "v1.wasm"
+        new    = "v1.wasm"
+        name   = "labeled"
+        labels = ["prod"]
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "unlabeled"
+        "#,
+    );
+
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0);
+    let json = run.json();
+    assert_eq!(result(&json, "unlabeled")["is_safe"], true);
+    let unlabeled_entry = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "unlabeled")
+        .unwrap();
+    assert_eq!(unlabeled_entry["labels"], serde_json::json!([]));
+}
+
+// ── Manifest Format Versioning ───────────────────────────────────────────────
+
+#[test]
+fn manifest_version_defaults_to_one_integration() {
+    let dir = temp_dir("mc-version-default");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "default-version"
+        "#,
+    );
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0, "legacy default version 1 must resolve successfully");
+}
+
+#[test]
+fn manifest_version_one_toml_integration() {
+    let dir = temp_dir("mc-version-one-toml");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        version = 1
+
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "version-one"
+        "#,
+    );
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0, "explicit version 1 TOML must resolve successfully");
+}
+
+#[test]
+fn manifest_version_one_json_integration() {
+    let dir = temp_dir("mc-version-one-json");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.json",
+        r#"{
+            "version": 1,
+            "defaults": { "base_dir": "wasm" },
+            "pairs": [
+                { "old": "v1.wasm", "new": "v1.wasm", "name": "version-one" }
+            ]
+        }"#,
+    );
+    let run = run_manifest(&root, &[]);
+    assert_eq!(run.code, 0, "explicit version 1 JSON must resolve successfully");
+}
+
+#[test]
+fn manifest_version_mismatch_toml_integration() {
+    let dir = temp_dir("mc-version-mismatch-toml");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        version = 2
+
+        [defaults]
+        base_dir = "wasm"
+
+        [[pairs]]
+        old  = "v1.wasm"
+        new  = "v1.wasm"
+        name = "version-two"
+        "#,
+    );
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("Unsupported manifest version"), "got: {combined}");
+    assert!(combined.contains("Supported version: 1"), "got: {combined}");
+    assert!(combined.contains("encountered: 2"), "got: {combined}");
+}
+
+#[test]
+fn manifest_version_mismatch_json_integration() {
+    let dir = temp_dir("mc-version-mismatch-json");
+    stage_wasm(&dir.join("wasm"));
+    let root = write(
+        &dir,
+        "root.json",
+        r#"{
+            "version": 2,
+            "defaults": { "base_dir": "wasm" },
+            "pairs": [
+                { "old": "v1.wasm", "new": "v1.wasm", "name": "version-two" }
+            ]
+        }"#,
+    );
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("Unsupported manifest version"), "got: {combined}");
+    assert!(combined.contains("Supported version: 1"), "got: {combined}");
+    assert!(combined.contains("encountered: 2"), "got: {combined}");
+}
+
+// ── Empty/Invalid Manifest Validation ────────────────────────────────────────
+
+#[test]
+fn manifest_whitespace_only_rejected_integration() {
+    let dir = temp_dir("mc-whitespace-only");
+    let root = write(&dir, "root.toml", "   \n\t  ");
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("is empty"), "got: {combined}");
+    assert!(combined.contains("[[pairs]]"), "got: {combined}");
+    assert!(combined.contains("\"pairs\":"), "got: {combined}");
+}
+
+#[test]
+fn manifest_empty_pairs_toml_rejected_integration() {
+    let dir = temp_dir("mc-empty-pairs-toml");
+    let root = write(
+        &dir,
+        "root.toml",
+        r#"
+        version = 1
+        "#,
+    );
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("contains no comparison pairs"), "got: {combined}");
+    assert!(combined.contains("[[pairs]]"), "got: {combined}");
+    assert!(combined.contains("\"pairs\":"), "got: {combined}");
+}
+
+#[test]
+fn manifest_empty_pairs_json_rejected_integration() {
+    let dir = temp_dir("mc-empty-pairs-json");
+    let root = write(
+        &dir,
+        "root.json",
+        r#"{"version": 1}"#,
+    );
+    let run = run_in(None, &["--manifest", root.to_str().unwrap()]);
+    assert_eq!(run.code, 1);
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    assert!(combined.contains("contains no comparison pairs"), "got: {combined}");
+    assert!(combined.contains("[[pairs]]"), "got: {combined}");
+    assert!(combined.contains("\"pairs\":"), "got: {combined}");
 }

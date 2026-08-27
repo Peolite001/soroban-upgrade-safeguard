@@ -40,6 +40,28 @@ pub struct Provenance {
     /// Input identifiers: paths, contract IDs, or content hashes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<String>,
+    /// Resolved ledger sequence number (if fetched via RPC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_sequence: Option<u64>,
+    /// Stellar network passphrase / identifier (if fetched via RPC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Sanitized RPC endpoint URL (if fetched via RPC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_endpoint: Option<String>,
+    /// On-chain code hash (if fetched via RPC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_hash: Option<String>,
+    /// Ledger sequence until which the sampled ledger entry is live
+    /// (`liveUntilLedgerSeq`), if the RPC reported one. Absent when the
+    /// entry has no TTL or the endpoint did not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_until_ledger_seq: Option<u64>,
+    /// Symlink resolution for the old and/or new input, when either was a
+    /// local path that was (or passed through) a symlink. Empty when
+    /// neither input was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symlinks: Vec<crate::loader::SymlinkResolution>,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -123,6 +145,11 @@ pub struct RenderableReport {
     /// Interface hash of the new build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_interface_hash: Option<String>,
+    /// Analysis scope and storage coverage for this report.
+    #[serde(default)]
+    pub scope: crate::report::AnalysisScope,
+    #[serde(default)]
+    pub storage_coverage: String,
     /// Categories in a [`BTreeMap`] so the JSON key order is stable and
     /// diffable across runs.
     pub findings_by_category: BTreeMap<String, Vec<ReportedFinding>>,
@@ -141,10 +168,82 @@ pub struct RenderableReport {
     pub empirical: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub empirical_findings: Vec<crate::empirical::EmpiricalFinding>,
+    /// Migration history, present only once this document has been through
+    /// `upgrade-report` (or [`crate::migration::upgrade_to_latest`]) at least
+    /// once. Absent on a report written directly by a live run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<crate::migration::MigrationRecord>,
 }
 
 fn default_schema_version() -> u32 {
     REPORT_SCHEMA_VERSION
+}
+
+/// The conventional terminal width, used when width-aware text wrapping is
+/// requested (a terminal, or an explicit `--width`) but no more specific
+/// number could be determined.
+pub const DEFAULT_TEXT_WIDTH: usize = 80;
+
+/// Floor on `--width`/detected width: below this, word-wrapping a typical
+/// finding message would produce more line breaks than content, which is
+/// unreadable rather than merely narrow. A degenerate value is clamped up to
+/// this rather than rejected, so a scripting mistake narrows output instead
+/// of failing the run.
+pub const MIN_TEXT_WIDTH: usize = 20;
+
+/// Word-wrap `message` to fit within `width` columns when printed after
+/// `prefix` (typically a short severity marker plus a trailing space) on the
+/// first line. Continuation lines are indented to align under where the
+/// message text starts, not under `prefix` itself, and the wrap never
+/// breaks between `prefix` and the first word of `message` — a marker is
+/// never left alone on its own line, even if that pushes the first line
+/// past `width`. Never splits a single word across lines either, for the
+/// same reason: a word is the smallest unit a reader can use to keep their
+/// place in a broken-up sentence.
+///
+/// Column counts are approximate — each `char` counts as one column, which
+/// slightly undercounts a handful of "wide" display characters (some CJK,
+/// some emoji). That's a deliberate simplification: getting it exactly right
+/// needs a Unicode East-Asian-width table, which is more machinery than a
+/// line-wrapping nicety for finding messages (overwhelmingly ASCII) justifies.
+fn wrap_with_prefix(prefix: &str, message: &str, width: usize) -> String {
+    let indent_width = prefix.chars().count();
+    let indent = " ".repeat(indent_width);
+    // When the prefix alone doesn't leave room to wrap meaningfully, don't
+    // try — one long line beats a "line" per word.
+    let available = width.saturating_sub(indent_width);
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in message.split_whitespace() {
+        let candidate_len = if current.is_empty() {
+            word.chars().count()
+        } else {
+            current.chars().count() + 1 + word.chars().count()
+        };
+        if !current.is_empty() && available > 0 && candidate_len > available {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+
+    let mut out = String::with_capacity(prefix.len() + message.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i == 0 {
+            out.push_str(prefix);
+        } else {
+            out.push('\n');
+            out.push_str(&indent);
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 impl RenderableReport {
@@ -207,6 +306,26 @@ impl RenderableReport {
         for input in &self.provenance.inputs {
             block.push_str(&format!("Input:    {input}\n").dimmed());
         }
+        if let Some(seq) = self.provenance.ledger_sequence {
+            block.push_str(&format!("Ledger:   {seq}\n").dimmed());
+        }
+        if let Some(ref net) = self.provenance.network {
+            block.push_str(&format!("Network:  {net}\n").dimmed());
+        }
+        if let Some(ref rpc) = self.provenance.rpc_endpoint {
+            block.push_str(&format!("RPC:      {rpc}\n").dimmed());
+        }
+        if let Some(ref hash) = self.provenance.code_hash {
+            block.push_str(&format!("CodeHash: {hash}\n").dimmed());
+        }
+        if let Some(seq) = self.provenance.live_until_ledger_seq {
+            block.push_str(&format!("LiveUntil: ledger {seq}\n").dimmed());
+        }
+        for symlink in &self.provenance.symlinks {
+            block.push_str(
+                &format!("Symlink:  {} -> {}\n", symlink.requested, symlink.resolved).dimmed(),
+            );
+        }
         block.push_str(
             &"────────────────────────────────────────\n"
                 .dimmed()
@@ -220,24 +339,66 @@ impl RenderableReport {
         let mut block = String::new();
         block.push_str("###### Provenance\n\n");
         block.push_str(&format!(
-            "- **Tool**: `soroban-upgrade-safeguard v{}`\n",
-            self.provenance.tool_version
+            "- **Tool**: {}\n",
+            markdown_code_span(&format!(
+                "soroban-upgrade-safeguard v{}",
+                self.provenance.tool_version
+            ))
         ));
         if !self.provenance.timestamp.is_empty() {
             block.push_str(&format!(
-                "- **Timestamp**: `{}`\n",
-                self.provenance.timestamp
+                "- **Timestamp**: {}\n",
+                markdown_code_span(&self.provenance.timestamp)
             ));
         }
         for input in &self.provenance.inputs {
-            block.push_str(&format!("- **Input**: `{input}`\n"));
+            block.push_str(&format!("- **Input**: {}\n", markdown_code_span(input)));
+        }
+        if let Some(seq) = self.provenance.ledger_sequence {
+            block.push_str(&format!("- **Ledger Sequence**: `{seq}`\n"));
+        }
+        if let Some(ref net) = self.provenance.network {
+            block.push_str(&format!("- **Network**: `{net}`\n"));
+        }
+        if let Some(ref rpc) = self.provenance.rpc_endpoint {
+            block.push_str(&format!("- **RPC Endpoint**: `{rpc}`\n"));
+        }
+        if let Some(ref hash) = self.provenance.code_hash {
+            block.push_str(&format!("- **Code Hash**: `{hash}`\n"));
+        }
+        if let Some(seq) = self.provenance.live_until_ledger_seq {
+            block.push_str(&format!("- **Live Until Ledger**: `{seq}`\n"));
+        }
+        for symlink in &self.provenance.symlinks {
+            block.push_str(&format!(
+                "- **Symlink**: {} -> {}\n",
+                markdown_code_span(&symlink.requested),
+                markdown_code_span(&symlink.resolved)
+            ));
         }
         block.push('\n');
         block
     }
 
     /// Render the structured, human-readable text output for the CLI.
+    /// Render as plain text (no width-aware wrapping). Equivalent to
+    /// `to_text_with_width(explain, None)`; kept as the default entry point
+    /// so every existing caller (and every fixture built against this
+    /// method's output) is unaffected by the addition of width-aware
+    /// wrapping.
     pub fn to_text(&self, explain: bool) -> String {
+        self.to_text_with_width(explain, None)
+    }
+
+    /// Render as plain text, word-wrapping each finding message to fit
+    /// `width` columns when given. `None` renders exactly like [`Self::to_text`]
+    /// — unwrapped, matching current behavior. The wrap is applied only to
+    /// finding/suppressed-finding message lines (see [`wrap_with_prefix`]);
+    /// banners, counts, and headings are never wrapped, since breaking those
+    /// up would hurt readability rather than help it. Never used by
+    /// [`Self::to_json`]/[`Self::to_markdown`] — width-aware formatting is a
+    /// text-only concern.
+    pub fn to_text_with_width(&self, explain: bool, width: Option<usize>) -> String {
         let mut output = String::new();
         output.push_str(
             &"\n========================================\n"
@@ -269,6 +430,8 @@ impl RenderableReport {
                 .bold()
         };
         output.push_str(&format!("Status: {}\n", status));
+        output.push_str(&format!("Analysis scope: {}\n", self.scope.summary_line()));
+        output.push_str(&format!("Storage coverage: {}\n", self.storage_coverage));
 
         output.push_str("\nCompatibility Verdicts:\n");
         let axes_in_order = vec![
@@ -376,10 +539,11 @@ impl RenderableReport {
                 let finding = &reported.finding;
 
                 if reported.suppressed {
-                    let label = format!("🔕 [SUPPRESSED] {}", finding.message)
-                        .dimmed()
-                        .to_string();
-                    output.push_str(&format!("{}\n", label));
+                    let body = match width {
+                        Some(w) => wrap_with_prefix("🔕 [SUPPRESSED] ", &finding.message, w),
+                        None => format!("🔕 [SUPPRESSED] {}", finding.message),
+                    };
+                    output.push_str(&format!("{}\n", body.dimmed()));
                     if let Some(reason) = &reported.suppression_reason {
                         output
                             .push_str(&format!("    ↳ reason: {}\n", reason).dimmed().to_string());
@@ -387,10 +551,19 @@ impl RenderableReport {
                     continue;
                 }
 
+                let (prefix, body) = match finding.severity {
+                    Severity::Critical => ("🔴 ", finding.message.as_str()),
+                    Severity::Warning => ("🟡 ", finding.message.as_str()),
+                    Severity::Info => ("🔵 ", finding.message.as_str()),
+                };
+                let line = match width {
+                    Some(w) => wrap_with_prefix(prefix, body, w),
+                    None => format!("{prefix}{body}"),
+                };
                 let formatted = match finding.severity {
-                    Severity::Critical => format!("🔴 {}", finding.message).red(),
-                    Severity::Warning => format!("🟡 {}", finding.message).yellow(),
-                    Severity::Info => format!("🔵 {}", finding.message).cyan(),
+                    Severity::Critical => line.red(),
+                    Severity::Warning => line.yellow(),
+                    Severity::Info => line.cyan(),
                 };
                 output.push_str(&format!("{}\n", formatted));
                 if self.empirical {
@@ -505,6 +678,14 @@ impl RenderableReport {
             "❌ FAILED (Critical breaking changes detected)"
         };
         output.push_str(&format!("## Status: {}\n\n", status));
+        output.push_str(&format!(
+            "**Analysis scope**: {}  \n",
+            markdown_code_span(&self.scope.summary_line())
+        ));
+        output.push_str(&format!(
+            "**Storage coverage**: {}\n\n",
+            markdown_code_span(&self.storage_coverage)
+        ));
 
         output.push_str("### Compatibility Verdicts\n\n");
         output.push_str("| Compatibility Axis | Status | Gated |\n");
@@ -555,12 +736,16 @@ impl RenderableReport {
             output.push_str(&format!("| **Suppressed** | {} |\n", self.suppressed_count));
         }
         output.push_str(&format!(
-            "\n**Recommended SemVer Bump**: `{}`\n\n",
-            self.recommended_bump
+            "\n**Recommended SemVer Bump**: {}\n\n",
+            markdown_code_span(&self.recommended_bump)
         ));
         output.push_str(&self.directional_call_abi_markdown());
         for (label, value) in self.interface_hash_lines() {
-            output.push_str(&format!("**{}**: `{}`\n\n", label, value));
+            output.push_str(&format!(
+                "**{}**: {}\n\n",
+                markdown_escape_text(label),
+                markdown_code_span(&value)
+            ));
         }
         output.push_str("---\n\n");
 
@@ -592,19 +777,26 @@ impl RenderableReport {
                 crate::diff::CompatibilityAxis::RuntimeSurface => "Runtime Surface Compatibility",
             };
 
-            output.push_str(&format!("### {}\n\n", label));
+            output.push_str(&format!("### {}\n\n", markdown_escape_text(label)));
             let mut current_category: Option<&str> = None;
             for reported in group {
                 let finding = &reported.finding;
                 if current_category != Some(finding.category.as_str()) {
                     current_category = Some(&finding.category);
-                    output.push_str(&format!("### {}\n\n", finding.category));
+                    output.push_str(&format!(
+                        "### {}\n\n",
+                        markdown_escape_text(&finding.category)
+                    ));
                 }
 
                 if reported.suppressed {
-                    output.push_str(&format!("- 🔕 **[SUPPRESSED]** {}\n", finding.message));
+                    output.push_str(&format!(
+                        "- 🔕 **[SUPPRESSED]** {}\n",
+                        markdown_escape_text(&finding.message)
+                    ));
                     if let Some(reason) = &reported.suppression_reason {
-                        output.push_str(&format!("  - ↳ reason: {}\n", reason));
+                        output
+                            .push_str(&format!("  - ↳ reason: {}\n", markdown_escape_text(reason)));
                     }
                     continue;
                 }
@@ -614,7 +806,11 @@ impl RenderableReport {
                     Severity::Warning => "🟡",
                     Severity::Info => "🔵",
                 };
-                output.push_str(&format!("- {} {}\n", emoji, finding.message));
+                output.push_str(&format!(
+                    "- {} {}\n",
+                    emoji,
+                    markdown_escape_text(&finding.message)
+                ));
                 if self.empirical {
                     if let Some(ref udt_name) = finding.type_name {
                         let matching_emp: Vec<&crate::empirical::EmpiricalFinding> = self
@@ -627,7 +823,10 @@ impl RenderableReport {
                             if has_failures {
                                 for ef in matching_emp.iter().filter(|ef| !ef.is_success) {
                                     if let Some(ref err) = ef.error {
-                                        output.push_str(&format!("  - ↳ 🔴 **[CONFIRMED]** Stored data failed to decode: `{}`\n", err));
+                                        output.push_str(&format!(
+                                            "  - ↳ 🔴 **[CONFIRMED]** Stored data failed to decode: {}\n",
+                                            markdown_code_span(err)
+                                        ));
                                     }
                                 }
                             } else {
@@ -717,17 +916,22 @@ impl RenderableReport {
                     "New client → old contract"
                 }
             };
+            let compatibility = if verdict.compatible {
+                "passed"
+            } else {
+                "failed"
+            };
             out.push_str(&format!(
-                "- **{}**: `{}`\n",
+                "- **{}**: {}\n",
                 label,
-                if verdict.compatible {
-                    "passed"
-                } else {
-                    "failed"
-                }
+                markdown_code_span(compatibility)
             ));
             for br in verdict.breaks.iter().take(8) {
-                out.push_str(&format!("  - `{}` — {}\n", br.path, br.reason));
+                out.push_str(&format!(
+                    "  - {} — {}\n",
+                    markdown_code_span(&br.path),
+                    markdown_escape_text(&br.reason)
+                ));
             }
         }
         out.push('\n');
@@ -746,6 +950,38 @@ struct SchemaProbe {
 
 fn unknown_tool_version() -> String {
     "unknown".to_string()
+}
+
+fn markdown_escape_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.replace("\r\n", "\n").replace('\r', "\n").chars() {
+        match ch {
+            '\n' => escaped.push_str("\\n"),
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '#' | '+' | '-' | '!' | '|' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn markdown_code_span(value: &str) -> String {
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.replace('\n', "\\n");
+    let mut longest_backtick_run = 0;
+    let mut current_run = 0;
+    for ch in normalized.chars() {
+        if ch == '`' {
+            current_run += 1;
+            longest_backtick_run = longest_backtick_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    let fence = "`".repeat(longest_backtick_run + 1);
+    format!("{fence}{normalized}{fence}")
 }
 
 #[cfg(test)]
@@ -919,6 +1155,7 @@ mod tests {
             tool_version: "0.1.0".to_string(),
             timestamp: "2024-01-15T10:30:00Z".to_string(),
             inputs: vec!["v1.wasm".to_string(), "v2.wasm".to_string()],
+            ..Default::default()
         };
 
         let json = serde_json::to_string_pretty(&renderable).unwrap();
@@ -937,6 +1174,7 @@ mod tests {
             tool_version: "0.1.0".to_string(),
             timestamp: "2024-01-15T10:30:00Z".to_string(),
             inputs: vec!["v1.wasm".to_string(), "v2.wasm".to_string()],
+            ..Default::default()
         };
 
         let text = renderable.to_text(false);
@@ -955,12 +1193,47 @@ mod tests {
             tool_version: "0.1.0".to_string(),
             timestamp: "2024-01-15T10:30:00Z".to_string(),
             inputs: vec!["v1.wasm".to_string(), "v2.wasm".to_string()],
+            ..Default::default()
         };
 
         let markdown = renderable.to_markdown();
         assert!(markdown.contains("###### Provenance"));
         assert!(markdown.contains("soroban-upgrade-safeguard v0.1.0"));
         assert!(markdown.contains("2024-01-15T10:30:00Z"));
+    }
+
+    #[test]
+    fn markdown_escapes_sensitive_punctuation_in_findings() {
+        let diff = DiffReport {
+            findings: vec![Finding {
+                severity: Severity::Critical,
+                axes: Vec::new(),
+                category: "Function [Removed]|Changed".to_string(),
+                message: "target `name` has [brackets] | and a newline\nnext line".to_string(),
+                type_name: Some("Type|Name`With`Punctuation".to_string()),
+                target: Some("thing".to_string()),
+                root_target: None,
+            }],
+        };
+        let empty_spec = ContractSpec::default();
+        let report = SafetyReport::new_with_specs(&diff, &empty_spec, &empty_spec);
+
+        let markdown = report.generate_summary_markdown();
+
+        assert!(markdown.contains("### Function \\[Removed\\]\\|Changed"));
+        assert!(
+            markdown.contains("target \\`name\\` has \\[brackets\\] \\| and a newline\\nnext line")
+        );
+        assert!(!markdown.contains("target `name` has [brackets] | and a newline\nnext line"));
+    }
+
+    #[test]
+    fn markdown_code_spans_handle_backticks_without_breaking() {
+        let rendered = markdown_code_span("value `with` backticks");
+
+        assert!(rendered.starts_with("``"));
+        assert!(rendered.ends_with("``"));
+        assert!(rendered.contains("value `with` backticks"));
     }
 
     #[test]
@@ -971,6 +1244,7 @@ mod tests {
             tool_version: "0.1.0".to_string(),
             timestamp: String::new(),
             inputs: vec![],
+            ..Default::default()
         };
 
         let text = renderable.to_text(false);
@@ -990,6 +1264,7 @@ mod tests {
             tool_version: "0.2.0".to_string(),
             timestamp: "2024-06-01T00:00:00Z".to_string(),
             inputs: vec!["old.wasm".to_string(), "new.wasm".to_string()],
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&renderable).unwrap();
@@ -999,5 +1274,113 @@ mod tests {
         assert_eq!(restored.provenance.timestamp, "2024-06-01T00:00:00Z");
         assert_eq!(restored.provenance.inputs.len(), 2);
         assert!(restored.provenance.inputs.contains(&"old.wasm".to_string()));
+    }
+
+    // -----------------------------------------------------------------
+    // Width-aware text wrapping
+    // -----------------------------------------------------------------
+
+    fn wrapping_report(message: &str) -> SafetyReport {
+        let diff = DiffReport {
+            findings: vec![finding(Severity::Critical, "Wrap Test", message)],
+        };
+        let empty_spec = ContractSpec::default();
+        SafetyReport::new_with_specs(&diff, &empty_spec, &empty_spec)
+    }
+
+    /// Twenty fixed-width (8 char) words. At MIN_TEXT_WIDTH (20) exactly two
+    /// words fit per line, at DEFAULT_TEXT_WIDTH (80) exactly eight fit, and
+    /// at 200 the whole message fits on one line — three genuinely different
+    /// wrap outcomes from the same input, one per width tier this suite
+    /// covers.
+    fn wrap_test_message() -> String {
+        vec!["abcdefgh"; 20].join(" ")
+    }
+
+    /// Lines belonging to the single wrapped finding, in order. Filtering by
+    /// content (rather than position) is robust to unrelated header/summary
+    /// lines around it.
+    fn wrapped_finding_lines(text: &str) -> Vec<&str> {
+        text.lines().filter(|l| l.contains("abcdefgh")).collect()
+    }
+
+    #[test]
+    fn narrow_width_wraps_two_words_per_line_without_orphaning_the_marker() {
+        let report = wrapping_report(&wrap_test_message());
+        let text = report.generate_summary_text_with_width(false, Some(MIN_TEXT_WIDTH));
+        let lines = wrapped_finding_lines(&text);
+
+        let mut expected = vec!["🔴 abcdefgh abcdefgh".to_string()];
+        expected.extend(std::iter::repeat("  abcdefgh abcdefgh".to_string()).take(9));
+        assert_eq!(lines, expected, "full text was:\n{text}");
+    }
+
+    #[test]
+    fn standard_width_wraps_eight_words_per_line() {
+        let report = wrapping_report(&wrap_test_message());
+        let text = report.generate_summary_text_with_width(false, Some(DEFAULT_TEXT_WIDTH));
+        let lines = wrapped_finding_lines(&text);
+
+        let eight_words = vec!["abcdefgh"; 8].join(" ");
+        let four_words = vec!["abcdefgh"; 4].join(" ");
+        let expected = vec![
+            format!("🔴 {eight_words}"),
+            format!("  {eight_words}"),
+            format!("  {four_words}"),
+        ];
+        assert_eq!(lines, expected, "full text was:\n{text}");
+    }
+
+    #[test]
+    fn wide_width_keeps_the_whole_message_on_one_line() {
+        let message = wrap_test_message();
+        let report = wrapping_report(&message);
+        let text = report.generate_summary_text_with_width(false, Some(200));
+        let lines = wrapped_finding_lines(&text);
+
+        assert_eq!(lines, vec![format!("🔴 {message}")], "full text was:\n{text}");
+    }
+
+    #[test]
+    fn no_width_leaves_the_message_unwrapped_on_one_line() {
+        // `None` (the default `to_text`/`generate_summary_text` path) must
+        // keep matching pre-width-awareness behavior exactly.
+        let message = wrap_test_message();
+        let report = wrapping_report(&message);
+        let text = report.generate_summary_text(false);
+        let lines = wrapped_finding_lines(&text);
+
+        assert_eq!(lines, vec![format!("🔴 {message}")], "full text was:\n{text}");
+    }
+
+    #[test]
+    fn markdown_output_is_never_affected_by_width() {
+        // generate_summary_markdown takes no width parameter at all, so this
+        // documents *why* markdown can't wrap: the same long message must
+        // still appear as a single unbroken line.
+        let message = wrap_test_message();
+        let report = wrapping_report(&message);
+        let markdown = report.generate_summary_markdown();
+
+        assert!(
+            markdown.contains(&message),
+            "markdown must contain the full, unwrapped message; got:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn json_output_is_never_affected_by_width() {
+        // to_json takes no width parameter either: the serializable struct
+        // carries the finding message verbatim, unbroken by any line width.
+        let message = wrap_test_message();
+        let report = wrapping_report(&message);
+        let renderable = report.to_json();
+
+        let findings = renderable
+            .findings_by_category
+            .get("Wrap Test")
+            .expect("category must be present");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].finding.message, message);
     }
 }

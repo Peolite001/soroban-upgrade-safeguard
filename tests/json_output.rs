@@ -118,6 +118,8 @@ fn json_identical_upgrade_is_safe_and_exits_zero() {
     assert_eq!(json["is_safe"], Value::Bool(true));
     assert_eq!(json["recommended_bump"], "patch");
     assert_eq!(json["counts"]["critical"].as_u64().unwrap(), 0);
+    assert_eq!(json["storage_coverage"], "interface-only");
+    assert!(json["scope"].is_object());
     assert!(
         !stdout.contains('\u{1b}'),
         "JSON output must not contain ANSI codes"

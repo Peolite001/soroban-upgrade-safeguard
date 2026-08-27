@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::limits::{LimitsConfig, ResourcePolicy};
-use crate::suppression::{SuppressionConfig, SuppressionRule};
+use crate::manifest::PolicyOverrides;
+use crate::profile::{self, RawProfile};
+use crate::suppression::{PolicyConfig, SuppressionConfig, SuppressionRule};
 
 /// Output format for the safety report.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -116,6 +119,28 @@ pub struct Args {
     /// detection). Overrides `[limits]` and the default.
     #[arg(long, value_name = "N")]
     pub max_walk_depth: Option<usize>,
+
+    /// Path to a persistent lineage store (JSON/TOML) tracking historical versions.
+    #[arg(long, value_name = "PATH")]
+    pub lineage_store: Option<PathBuf>,
+
+    /// Record candidate build as a new version in the lineage store with this tag.
+    #[arg(long, value_name = "VERSION_ID")]
+    pub record_version: Option<String>,
+
+    /// Mark an existing historical version as retired in the lineage store.
+    #[arg(long, value_name = "VERSION_ID")]
+    pub retire_version: Option<String>,
+
+    /// Maximum live historical versions to validate candidate against.
+    #[arg(long, value_name = "N")]
+    pub max_live_versions: Option<usize>,
+
+    /// Select a named policy profile from `[profiles.<name>]` in the config
+    /// file. Overrides `default_profile`. See [`crate::profile`] for the
+    /// schema, precedence, and inheritance rules.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -134,8 +159,24 @@ pub struct FileConfig {
     pub new_dir: Option<PathBuf>,
     pub wasm_paths: Option<Vec<PathBuf>>,
     pub limits: Option<LimitsConfig>,
+    pub lineage_store: Option<PathBuf>,
+    pub record_version: Option<String>,
+    pub retire_version: Option<String>,
+    pub max_live_versions: Option<usize>,
     #[serde(default, rename = "suppress")]
     pub suppress: Vec<SuppressionRule>,
+
+    /// Axis gating at the base (root) config level, before any profile fold.
+    /// Field-for-field with [`PolicyConfig`]; see [`crate::profile`].
+    #[serde(default)]
+    pub gating: PolicyOverrides,
+    /// Profile selected when `--profile` and `SAFEGUARD_PROFILE` are both
+    /// absent.
+    #[serde(default)]
+    pub default_profile: Option<String>,
+    /// Named policy profiles, keyed by name. See [`crate::profile`].
+    #[serde(default)]
+    pub profiles: BTreeMap<String, RawProfile>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -154,6 +195,16 @@ pub struct ResolvedConfig {
     pub policy: ResourcePolicy,
     pub suppressions: SuppressionConfig,
     pub expected_wasm_hash: Option<String>,
+    pub lineage_store: Option<PathBuf>,
+    pub record_version: Option<String>,
+    pub retire_version: Option<String>,
+    pub max_live_versions: Option<usize>,
+    /// Axis gating after the profile fold. Not to be confused with
+    /// [`Self::policy`], which is the *resource-limit* policy.
+    pub gating: PolicyConfig,
+    /// The selected profile (if any), its inheritance chain, and the origin
+    /// of every profile-controlled setting. See [`crate::profile`].
+    pub profile: profile::ResolvedProfile,
 }
 
 impl ResolvedConfig {
@@ -173,13 +224,17 @@ impl ResolvedConfig {
 
         // 2. Load file if present
         let file_config = if let Some(path) = &config_file_path {
-            let content = std::fs::read_to_string(path).with_context(|| {
+            let raw = std::fs::read_to_string(path).with_context(|| {
                 format!(
                     "Failed to read suppression config file '{}'",
                     path.display()
                 )
             })?;
-            let parsed: FileConfig = toml::from_str(&content)
+            // Windows tooling commonly saves UTF-8 files with a leading BOM,
+            // which TOML has no syntax for; strip it before parsing so it
+            // doesn't surface as a confusing "unexpected character" error.
+            let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+            let parsed: FileConfig = toml::from_str(content)
                 .with_context(|| format!("Invalid suppression config file '{}'", path.display()))?;
             Some(parsed)
         } else {
@@ -252,80 +307,101 @@ impl ResolvedConfig {
             Vec::new()
         };
 
-        let format = if args.format != OutputFormat::default() {
-            args.format
-        } else if let Some(fmt) = env_format("SAFEGUARD_FORMAT") {
-            fmt
-        } else if let Some(fc) = &file_config {
-            fc.format.unwrap_or_default()
-        } else {
-            OutputFormat::default()
+        // Profile selection: `--profile` > `SAFEGUARD_PROFILE` > `default_profile`
+        // in the file. Selecting a name that isn't declared, an inheritance
+        // cycle, or a chain deeper than `profile::MAX_PROFILE_DEPTH` is a
+        // hard error (see `crate::profile`).
+        let selected_profile = args
+            .profile
+            .clone()
+            .or_else(|| env_string("SAFEGUARD_PROFILE"))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|fc| fc.default_profile.clone())
+            });
+
+        let base_values = profile::BaseValues {
+            format: file_config.as_ref().and_then(|fc| fc.format),
+            explain: file_config.as_ref().and_then(|fc| fc.explain),
+            strict: file_config.as_ref().and_then(|fc| fc.strict),
+            no_color: file_config.as_ref().and_then(|fc| fc.no_color),
+            max_suppressions: file_config.as_ref().and_then(|fc| fc.max_suppressions),
+            gating: file_config.as_ref().map(|fc| fc.gating).unwrap_or_default(),
+            limits: file_config
+                .as_ref()
+                .and_then(|fc| fc.limits.clone())
+                .unwrap_or_default(),
         };
 
-        let explain = args.explain
-            || env_bool("SAFEGUARD_EXPLAIN").unwrap_or(false)
-            || file_config
-                .as_ref()
-                .and_then(|fc| fc.explain)
-                .unwrap_or(false);
+        // `args.format` always carries a value (clap gives it a default), so
+        // the CLI is treated as having set it only when it differs from the
+        // compiled-in default — matching the pre-profile behavior.
+        let cli_format = (args.format != OutputFormat::default()).then_some(args.format);
 
-        let strict = args.strict
-            || env_bool("SAFEGUARD_STRICT").unwrap_or(false)
-            || file_config
-                .as_ref()
-                .and_then(|fc| fc.strict)
-                .unwrap_or(false);
+        let cli_overrides = profile::CliOverrides {
+            format: cli_format.or_else(|| env_format("SAFEGUARD_FORMAT")),
+            explain: args.explain || env_bool("SAFEGUARD_EXPLAIN").unwrap_or(false),
+            strict: args.strict || env_bool("SAFEGUARD_STRICT").unwrap_or(false),
+            no_color: args.no_color
+                || env_bool("SAFEGUARD_NO_COLOR").unwrap_or(false)
+                || env_bool("NO_COLOR").unwrap_or(false),
+            max_suppressions: env_usize("SAFEGUARD_MAX_SUPPRESSIONS"),
+            max_xdr_depth: args
+                .max_xdr_depth
+                .or_else(|| env_u32("SAFEGUARD_MAX_XDR_DEPTH")),
+            max_xdr_len: args
+                .max_xdr_len
+                .or_else(|| env_usize("SAFEGUARD_MAX_XDR_LEN")),
+            max_entries: args
+                .max_entries
+                .or_else(|| env_usize("SAFEGUARD_MAX_ENTRIES")),
+            max_walk_depth: args
+                .max_walk_depth
+                .or_else(|| env_usize("SAFEGUARD_MAX_WALK_DEPTH")),
+        };
 
-        let no_color = args.no_color
-            || env_bool("SAFEGUARD_NO_COLOR").unwrap_or(false)
-            || env_bool("NO_COLOR").unwrap_or(false)
-            || file_config
-                .as_ref()
-                .and_then(|fc| fc.no_color)
-                .unwrap_or(false);
+        let empty_profiles = BTreeMap::new();
+        let profiles_map = file_config
+            .as_ref()
+            .map(|fc| &fc.profiles)
+            .unwrap_or(&empty_profiles);
+        let resolved_profile = profile::resolve(
+            profiles_map,
+            selected_profile.as_deref(),
+            base_values,
+            cli_overrides,
+        )?;
 
-        // Policy limits resolution
-        let mut policy = ResourcePolicy::default();
-        if let Some(fc) = &file_config {
-            if let Some(limits) = &fc.limits {
-                policy = limits.apply_to(policy);
-            }
-        }
-        if let Some(v) = env_u32("SAFEGUARD_MAX_XDR_DEPTH") {
-            policy.max_xdr_depth = v;
-        }
-        if let Some(v) = env_usize("SAFEGUARD_MAX_XDR_LEN") {
-            policy.max_xdr_len = v;
-        }
-        if let Some(v) = env_usize("SAFEGUARD_MAX_ENTRIES") {
-            policy.max_entries = v;
-        }
-        if let Some(v) = env_usize("SAFEGUARD_MAX_WALK_DEPTH") {
-            policy.max_walk_depth = v;
-        }
-        if let Some(v) = args.max_xdr_depth {
-            policy.max_xdr_depth = v;
-        }
-        if let Some(v) = args.max_xdr_len {
-            policy.max_xdr_len = v;
-        }
-        if let Some(v) = args.max_entries {
-            policy.max_entries = v;
-        }
-        if let Some(v) = args.max_walk_depth {
-            policy.max_walk_depth = v;
-        }
+        let format = resolved_profile.format.value;
+        let explain = resolved_profile.explain.value;
+        let strict = resolved_profile.strict.value;
+        let no_color = resolved_profile.no_color.value;
 
-        // Suppressions config resolution
+        let gating = PolicyConfig {
+            gate_storage_layout: resolved_profile.gating.gate_storage_layout.value,
+            gate_call_abi: resolved_profile.gating.gate_call_abi.value,
+            gate_event_indexer: resolved_profile.gating.gate_event_indexer.value,
+            gate_source_level: resolved_profile.gating.gate_source_level.value,
+            gate_runtime_surface: resolved_profile.gating.gate_runtime_surface.value,
+        };
+
+        let policy = ResourcePolicy {
+            max_xdr_depth: resolved_profile.limits.max_xdr_depth.value,
+            max_xdr_len: resolved_profile.limits.max_xdr_len.value,
+            max_entries: resolved_profile.limits.max_entries.value,
+            max_walk_depth: resolved_profile.limits.max_walk_depth.value,
+        };
+
+        // Suppressions config resolution. `max_suppressions` is profile-controlled
+        // (a "budget" setting), so it comes from the fold above rather than the
+        // base file directly — see `crate::profile`.
         let mut suppressions = SuppressionConfig::default();
         if let Some(fc) = &file_config {
-            suppressions.max_suppressions = fc.max_suppressions;
             suppressions.allow_targetless = fc.allow_targetless;
             suppressions.rules = fc.suppress.clone();
         }
-        if let Some(v) = env_usize("SAFEGUARD_MAX_SUPPRESSIONS") {
-            suppressions.max_suppressions = Some(v);
-        }
+        suppressions.max_suppressions = resolved_profile.max_suppressions.value;
         if let Some(v) = env_bool("SAFEGUARD_ALLOW_TARGETLESS") {
             suppressions.allow_targetless = Some(v);
         }
@@ -338,6 +414,42 @@ impl ResolvedConfig {
                 validation.errors
             );
         }
+
+        let lineage_store = args
+            .lineage_store
+            .clone()
+            .or_else(|| env_path("SAFEGUARD_LINEAGE_STORE"))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|fc| fc.lineage_store.clone())
+                    .map(|p| resolve_path(base_dir, p))
+            });
+
+        let record_version = args
+            .record_version
+            .clone()
+            .or_else(|| env_string("SAFEGUARD_RECORD_VERSION"))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|fc| fc.record_version.clone())
+            });
+
+        let retire_version = args
+            .retire_version
+            .clone()
+            .or_else(|| env_string("SAFEGUARD_RETIRE_VERSION"))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|fc| fc.retire_version.clone())
+            });
+
+        let max_live_versions = args
+            .max_live_versions
+            .or_else(|| env_usize("SAFEGUARD_MAX_LIVE_VERSIONS"))
+            .or_else(|| file_config.as_ref().and_then(|fc| fc.max_live_versions));
 
         Ok(Self {
             wasm_paths,
@@ -354,6 +466,12 @@ impl ResolvedConfig {
             policy,
             suppressions,
             expected_wasm_hash: args.expected_wasm_hash.clone(),
+            lineage_store,
+            record_version,
+            retire_version,
+            max_live_versions,
+            gating,
+            profile: resolved_profile,
         })
     }
 

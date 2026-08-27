@@ -180,6 +180,26 @@ pub struct SafetyReport {
     pub(crate) scope: AnalysisScope,
 
     #[cfg(feature = "unstable")]
+    pub rpc_provenance: Option<crate::rpc::RpcProvenance>,
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) rpc_provenance: Option<crate::rpc::RpcProvenance>,
+
+    /// Symlink resolution for the old build, if its input path was one. See
+    /// [`crate::loader::SymlinkResolution`].
+    #[cfg(feature = "unstable")]
+    pub old_symlink: Option<crate::loader::SymlinkResolution>,
+    /// Symlink resolution for the old build, if its input path was one.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) old_symlink: Option<crate::loader::SymlinkResolution>,
+
+    /// Symlink resolution for the new build, if its input path was one.
+    #[cfg(feature = "unstable")]
+    pub new_symlink: Option<crate::loader::SymlinkResolution>,
+    /// Symlink resolution for the new build, if its input path was one.
+    #[cfg(not(feature = "unstable"))]
+    pub(crate) new_symlink: Option<crate::loader::SymlinkResolution>,
+
+    #[cfg(feature = "unstable")]
     pub metrics: Option<BuildMetrics>,
     #[cfg(not(feature = "unstable"))]
     pub(crate) metrics: Option<BuildMetrics>,
@@ -230,6 +250,156 @@ pub struct ReportSettings {
 }
 
 impl SafetyReport {
+    pub fn apply_storage_schema_comparison(
+        &mut self,
+        comparison: &crate::storage_schema::StorageSchemaComparison,
+        suppressions: &SuppressionConfig,
+        explain: bool,
+        strict: bool,
+    ) {
+        let key_types = comparison
+            .old
+            .observations
+            .iter()
+            .chain(comparison.new.observations.iter())
+            .filter(|observation| observation.key_type.is_some())
+            .count();
+        let value_types = comparison
+            .old
+            .observations
+            .iter()
+            .chain(comparison.new.observations.iter())
+            .filter(|observation| observation.value_type.is_some())
+            .count();
+        self.scope.storage_schema = StorageScopeState::Analyzed {
+            key_types,
+            value_types,
+        };
+
+        for (side, findings) in [
+            ("old", &comparison.old.findings),
+            ("new", &comparison.new.findings),
+        ] {
+            for mismatch in findings {
+                let category = "Storage Schema Mismatch".to_string();
+                let message = format!(
+                    "{} storage schema mismatch: {}",
+                    side,
+                    serde_json::to_string(mismatch)
+                        .unwrap_or_else(|_| "unserializable mismatch".to_string())
+                );
+                let finding = crate::diff::Finding {
+                    severity: crate::diff::Severity::Critical,
+                    axes: vec![crate::diff::CompatibilityAxis::StorageLayout],
+                    category: category.clone(),
+                    message,
+                    type_name: None,
+                    target: None,
+                    root_target: None,
+                };
+                let rule = suppressions.matching_rule(&finding);
+                let suppressed = rule.is_some();
+                self.critical_count += 1;
+                self.total_findings += 1;
+                if suppressed {
+                    self.suppressed_count += 1;
+                    self.suppressed_critical_count += 1;
+                }
+                if !suppressed {
+                    let storage_gated = suppressions.policy.gate_storage_layout || strict;
+                    if storage_gated {
+                        self.is_safe = false;
+                        self.axis_verdicts.insert(
+                            crate::diff::CompatibilityAxis::StorageLayout,
+                            AxisStatus::Failed,
+                        );
+                    }
+                }
+                self.findings_by_category
+                    .entry(category)
+                    .or_default()
+                    .push(ReportedFinding {
+                        rule_id: "storage_schema_mismatch".to_string(),
+                        axes: finding.axes.clone(),
+                        finding,
+                        suppressed,
+                        suppression_reason: rule.and_then(|rule| rule.reason.clone()),
+                        remediation: explain.then(|| {
+                            "Reconcile the declared schema with the compiled storage behavior."
+                                .to_string()
+                        }),
+                    });
+            }
+        }
+    }
+
+    pub fn apply_lineage_report(
+        &mut self,
+        lineage_report: &crate::lineage::LineageValidationReport,
+        suppressions: &SuppressionConfig,
+        explain: bool,
+        strict: bool,
+    ) {
+        if !lineage_report.is_safe {
+            self.is_safe = false;
+        }
+
+        for hist in &lineage_report.historical_findings {
+            let category = format!("Historical Lineage Break ({})", hist.historical_version_id);
+            let finding = hist.finding.clone();
+            let rule = suppressions.matching_rule(&finding);
+            let suppressed = rule.is_some();
+
+            match finding.severity {
+                crate::diff::Severity::Critical => {
+                    self.critical_count += 1;
+                    if suppressed {
+                        self.suppressed_critical_count += 1;
+                    }
+                }
+                crate::diff::Severity::Warning => {
+                    self.warning_count += 1;
+                    if suppressed {
+                        self.suppressed_warning_count += 1;
+                    }
+                }
+                crate::diff::Severity::Info => {
+                    self.info_count += 1;
+                    if suppressed {
+                        self.suppressed_info_count += 1;
+                    }
+                }
+            }
+
+            self.total_findings += 1;
+            if suppressed {
+                self.suppressed_count += 1;
+            } else {
+                for axis in &finding.axes {
+                    if self.gated_axes.contains(axis) || strict {
+                        self.is_safe = false;
+                        self.axis_verdicts.insert(*axis, AxisStatus::Failed);
+                    }
+                }
+            }
+
+            self.findings_by_category
+                .entry(category)
+                .or_default()
+                .push(ReportedFinding {
+                    rule_id: "historical_lineage_break".to_string(),
+                    axes: finding.axes.clone(),
+                    finding,
+                    suppressed,
+                    suppression_reason: rule.and_then(|r| r.reason.clone()),
+                    remediation: explain.then(|| {
+                        "Update candidate build to maintain backward compatibility with this historical version."
+                            .to_string()
+                    }),
+                });
+        }
+    }
+
     pub fn critical_count(&self) -> usize {
         self.critical_count
     }
@@ -336,7 +506,7 @@ impl SafetyReport {
 }
 
 /// Track what was analyzed in the report.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalysisScope {
     pub exported_interface: bool,
     pub env_metadata: bool,
@@ -389,7 +559,7 @@ impl AnalysisScope {
 }
 
 /// Whether storage schema analysis was performed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum StorageScopeState {
     #[default]
     NotAnalyzed,
@@ -478,6 +648,15 @@ pub fn asciify_markers(text: &str) -> String {
         .replace('❌', "[FAIL]")
         .replace("⚠️", "[WARNING]")
         .replace('⚠', "[WARNING]")
+}
+
+/// Strip the decorative Unicode `asciify_markers` intentionally leaves alone
+/// (the `↳` guidance/reason arrow, and the `─` box-drawing separator around
+/// the provenance block), for output that must be fully plain: no color, no
+/// Unicode markers, no decorative separators. Callers combine this with
+/// disabling color (see `--plain`); it does not touch color itself.
+pub fn plainify(text: &str) -> String {
+    asciify_markers(text).replace('↳', "->").replace('─', "-")
 }
 
 impl SafetyReport {
@@ -570,6 +749,9 @@ impl SafetyReport {
             gated_axes,
             empirical: false,
             empirical_findings: Vec::new(),
+            rpc_provenance: None,
+            old_symlink: None,
+            new_symlink: None,
             settings: ReportSettings::default(),
         }
     }
@@ -856,6 +1038,9 @@ impl SafetyReport {
             gated_axes,
             empirical: false,
             empirical_findings: Vec::new(),
+            rpc_provenance: None,
+            old_symlink: None,
+            new_symlink: None,
             settings: ReportSettings {
                 strict,
                 explain,
@@ -867,6 +1052,19 @@ impl SafetyReport {
     pub fn with_interface_hashes(mut self, old: InterfaceHash, new: InterfaceHash) -> Self {
         self.old_interface_hash = Some(old);
         self.new_interface_hash = Some(new);
+        self
+    }
+
+    /// Attach symlink resolution recorded while loading the old/new inputs.
+    /// Either or both may be `None` when that input was a direct file (or a
+    /// non-local source).
+    pub fn with_symlinks(
+        mut self,
+        old: Option<crate::loader::SymlinkResolution>,
+        new: Option<crate::loader::SymlinkResolution>,
+    ) -> Self {
+        self.old_symlink = old;
+        self.new_symlink = new;
         self
     }
 
@@ -955,6 +1153,18 @@ impl SafetyReport {
                     .flatten()
                     .map(|hash| hash.to_hex())
                     .collect(),
+                ledger_sequence: self.rpc_provenance.as_ref().map(|p| p.ledger_sequence),
+                network: self.rpc_provenance.as_ref().map(|p| p.network.clone()),
+                rpc_endpoint: self.rpc_provenance.as_ref().map(|p| p.rpc_endpoint.clone()),
+                code_hash: self.rpc_provenance.as_ref().map(|p| p.code_hash.clone()),
+                live_until_ledger_seq: self
+                    .rpc_provenance
+                    .as_ref()
+                    .and_then(|p| p.live_until_ledger_seq),
+                symlinks: [self.old_symlink.clone(), self.new_symlink.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
             },
             is_safe: self.is_safe,
             strict: self.strict,
@@ -968,6 +1178,12 @@ impl SafetyReport {
             recommended_bump: self.recommended_bump().to_string(),
             old_interface_hash: self.old_interface_hash.map(|h| h.to_hex()),
             new_interface_hash: self.new_interface_hash.map(|h| h.to_hex()),
+            scope: self.scope.clone(),
+            storage_coverage: if self.scope.storage_analyzed() {
+                "schema-backed".to_string()
+            } else {
+                "interface-only".to_string()
+            },
             findings_by_category: self
                 .findings_by_category
                 .iter()
@@ -979,6 +1195,7 @@ impl SafetyReport {
             call_abi: self.call_abi.clone(),
             empirical: self.empirical,
             empirical_findings: self.empirical_findings.clone(),
+            migration: None,
         }
     }
 
@@ -988,6 +1205,13 @@ impl SafetyReport {
 
     pub fn generate_summary_text(&self, explain: bool) -> String {
         self.to_renderable().to_text(explain)
+    }
+
+    /// Like [`Self::generate_summary_text`], with finding messages
+    /// word-wrapped to `width` columns when given. See
+    /// [`crate::render::RenderableReport::to_text_with_width`].
+    pub fn generate_summary_text_with_width(&self, explain: bool, width: Option<usize>) -> String {
+        self.to_renderable().to_text_with_width(explain, width)
     }
 
     pub fn generate_summary_markdown(&self) -> String {
@@ -1133,6 +1357,9 @@ mod tests {
             no_timestamp: false,
             old_spec_summary: None,
             new_spec_summary: None,
+            rpc_provenance: None,
+            old_symlink: None,
+            new_symlink: None,
             scope: AnalysisScope::default(),
             metrics: None,
             axis_verdicts: HashMap::new(),
