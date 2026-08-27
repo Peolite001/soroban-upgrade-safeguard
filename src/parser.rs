@@ -249,7 +249,7 @@ pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata, Error> {
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use stellar_xdr::curr::{ScEnvMetaEntry, WriteXdr};
+    use stellar_xdr::curr::{ScEnvMetaEntry, ScSpecFunctionV0, WriteXdr};
 
     fn encode_interface_version(protocol: u32, pre_release: u32) -> Vec<u8> {
         let version = ((protocol as u64) << 32) | (pre_release as u64);
@@ -291,6 +291,73 @@ mod tests {
         wasm.extend_from_slice(name.as_bytes());
         wasm.extend_from_slice(data);
         wasm
+    }
+
+    /// Encodes a wasm module with two separate custom sections sharing the
+    /// same `name`, as some toolchains emit for `contractspecv0`.
+    fn wasm_with_two_custom_sections(name: &str, data_a: &[u8], data_b: &[u8]) -> Vec<u8> {
+        let mut wasm = wasm_with_custom_section(name, data_a);
+        let mut second_body = wasm_string(name);
+        second_body.extend_from_slice(data_b);
+        wasm.extend(wasm_section(0, second_body));
+        wasm
+    }
+
+    fn encode_spec_entries(entries: &[ScSpecEntry]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut limited = Limited::new(cursor, Limits::none());
+        for entry in entries {
+            entry.write_xdr(&mut limited).unwrap();
+        }
+        limited.inner.into_inner()
+    }
+
+    fn spec_function(name: &str, doc: &str) -> ScSpecEntry {
+        ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+            doc: doc.try_into().unwrap(),
+            name: name.try_into().unwrap(),
+            inputs: Default::default(),
+            outputs: Default::default(),
+        })
+    }
+
+    #[test]
+    fn extract_metadata_merges_identical_split_contractspec_sections() {
+        // Some toolchains emit `contractspecv0` split across more than one
+        // custom section. When both sections carry the same entry, the
+        // parser must accept it (not error) and downstream dedup must
+        // collapse the duplicate to a single function.
+        let section = encode_spec_entries(&[spec_function("hello", "doc")]);
+        let wasm = wasm_with_two_custom_sections("contractspecv0", &section, &section);
+
+        let metadata = extract_metadata(&wasm).expect("split identical sections must not fail");
+        assert_eq!(metadata.spec.len(), 2, "both sections' entries are concatenated");
+
+        let spec = crate::spec::ContractSpec::from_entries(&metadata.spec);
+        assert_eq!(
+            spec.functions().len(),
+            1,
+            "identical duplicate entries must collapse to one function"
+        );
+    }
+
+    #[test]
+    fn extract_metadata_resolves_conflicting_split_contractspec_sections_first_wins() {
+        // When split sections disagree (same function name, different doc),
+        // the parser must still not error; the existing first-wins dedup
+        // policy in `ContractSpec::from_entries` decides the outcome
+        // deterministically, using whichever section wasmparser visits first.
+        let first = encode_spec_entries(&[spec_function("hello", "from section 0")]);
+        let second = encode_spec_entries(&[spec_function("hello", "from section 1")]);
+        let wasm = wasm_with_two_custom_sections("contractspecv0", &first, &second);
+
+        let metadata =
+            extract_metadata(&wasm).expect("conflicting split sections must not fail parsing");
+        assert_eq!(metadata.spec.len(), 2);
+
+        let spec = crate::spec::ContractSpec::from_entries(&metadata.spec);
+        let resolved = spec.functions().get("hello").expect("function must resolve");
+        assert_eq!(resolved.doc.to_string(), "from section 0");
     }
 
     fn uleb(mut value: u32) -> Vec<u8> {
