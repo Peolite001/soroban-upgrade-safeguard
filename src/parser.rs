@@ -115,9 +115,10 @@ fn decode_env_meta_entries(data: &[u8]) -> Result<Vec<ScEnvMetaEntry>, Error> {
     let mut entries = Vec::new();
 
     while (limited.inner.position() as usize) < data.len() {
+        let byte_offset = limited.inner.position();
         let entry = ScEnvMetaEntry::read_xdr(&mut limited).map_err(|e| Error::XdrDecoding {
             entry_index: None,
-            byte_offset: None,
+            byte_offset: Some(byte_offset),
             details: "Failed to decode ScEnvMetaEntry XDR".to_string(),
             source: Some(Box::new(e)),
         })?;
@@ -150,7 +151,7 @@ pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata, Error> {
         let payload = payload.map_err(|e| Error::WasmValidation {
             path: None,
             details: "Failed to parse WASM payload".to_string(),
-            byte_offset: None,
+            byte_offset: Some(e.offset() as u64),
             source: Some(Box::new(e)),
         })?;
 
@@ -160,7 +161,7 @@ pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata, Error> {
                     let rec_group = rec_group.map_err(|e| Error::WasmValidation {
                         path: None,
                         details: "Failed to parse WASM type section".to_string(),
-                        byte_offset: None,
+                        byte_offset: Some(e.offset() as u64),
                         source: Some(Box::new(e)),
                     })?;
                     for sub_type in rec_group.into_types() {
@@ -177,7 +178,7 @@ pub fn extract_metadata(bytes: &[u8]) -> Result<SorobanMetadata, Error> {
                     let import = import.map_err(|e| Error::WasmValidation {
                         path: None,
                         details: "Failed to parse WASM import section".to_string(),
-                        byte_offset: None,
+                        byte_offset: Some(e.offset() as u64),
                         source: Some(Box::new(e)),
                     })?;
 

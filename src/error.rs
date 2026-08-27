@@ -226,6 +226,25 @@ impl Error {
             _ => None,
         }
     }
+
+    /// If this error carries a byte offset into a WASM binary where the
+    /// underlying parser reported the problem, return it. Available on
+    /// [`WasmValidation`](Error::WasmValidation) (a structural parse
+    /// failure), [`SectionExtraction`](Error::SectionExtraction) (a custom
+    /// section that failed to decode), and [`XdrDecoding`](Error::XdrDecoding)
+    /// (a malformed XDR entry within a section) — the three variants that
+    /// wrap a parser error with a known position. `None` for every other
+    /// variant, and for the variants above too when the offset genuinely
+    /// wasn't known (e.g. a bad-magic-bytes check that never reaches the
+    /// parser).
+    pub fn byte_offset(&self) -> Option<u64> {
+        match self {
+            Error::WasmValidation { byte_offset, .. } => *byte_offset,
+            Error::SectionExtraction { byte_offset, .. } => Some(*byte_offset),
+            Error::XdrDecoding { byte_offset, .. } => *byte_offset,
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Error {
