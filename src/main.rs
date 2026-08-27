@@ -2638,6 +2638,50 @@ fn emit_output(spec: &OutputSpec, content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Set from the SIGTERM handler; polled by the watch loop at safe points
+/// (between cycles, never mid-write) so shutdown never truncates a report or
+/// the status file. `AtomicBool::store`/`load` are async-signal-safe, which
+/// is why the handler does nothing else.
+#[cfg(all(feature = "watch", unix))]
+static WATCH_SIGTERM_RECEIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(feature = "watch", unix))]
+extern "C" fn handle_watch_sigterm(_signum: libc::c_int) {
+    WATCH_SIGTERM_RECEIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install a SIGTERM handler that only records that a signal arrived,
+/// overriding the default disposition (immediate termination, which could
+/// otherwise cut off a report or status-file write that was in progress).
+/// The watch loop itself decides when it is safe to actually stop.
+#[cfg(all(feature = "watch", unix))]
+fn install_watch_sigterm_handler() {
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            handle_watch_sigterm as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+#[cfg(all(feature = "watch", not(unix)))]
+fn install_watch_sigterm_handler() {
+    // SIGTERM is a POSIX signal; there is no equivalent to intercept here.
+    // On these platforms watch mode still exits via Ctrl+C, or is stopped by
+    // the OS/service manager's default kill behavior for the process.
+}
+
+#[cfg(all(feature = "watch", unix))]
+fn watch_shutdown_requested() -> bool {
+    WATCH_SIGTERM_RECEIVED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(all(feature = "watch", not(unix)))]
+fn watch_shutdown_requested() -> bool {
+    false
+}
+
 /// Watch mode: monitor input files and re-run on changes.
 #[cfg(feature = "watch")]
 fn run_watch_mode(
@@ -2652,6 +2696,8 @@ fn run_watch_mode(
     use notify::Watcher;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    install_watch_sigterm_handler();
 
     let (tx, rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res| {
@@ -2670,11 +2716,16 @@ fn run_watch_mode(
     }
 
     eprintln!(
-        "\n👀 Watch mode active (debounce: {debounce_ms}ms). Waiting for file changes... (Ctrl+C to stop)\n"
+        "\n👀 Watch mode active (debounce: {debounce_ms}ms). Waiting for file changes... (Ctrl+C or SIGTERM to stop)\n"
     );
 
     let loop_result = (|| -> Result<()> {
     loop {
+        if watch_shutdown_requested() {
+            eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+            return Ok(());
+        }
+
         match rx.recv_timeout(Duration::from_millis(debounce_ms)) {
             Ok(_event) => {
                 // Brief debounce window: wait for more events
@@ -2686,6 +2737,14 @@ fn run_watch_mode(
                             return Err(anyhow::anyhow!("File watcher channel disconnected"));
                         }
                     }
+                    if watch_shutdown_requested() {
+                        break;
+                    }
+                }
+
+                if watch_shutdown_requested() {
+                    eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+                    return Ok(());
                 }
 
                 // Check that watched files exist before re-running
@@ -2698,6 +2757,10 @@ fn run_watch_mode(
                     loop {
                         if watch_paths.iter().all(|p| p.exists()) {
                             break;
+                        }
+                        if watch_shutdown_requested() {
+                            eprintln!("\n🛑 SIGTERM received, shutting down watch mode...\n");
+                            return Ok(());
                         }
                         if start.elapsed() > timeout {
                             eprintln!("⚠️  Timed out waiting for files to reappear");
@@ -2730,7 +2793,7 @@ fn run_watch_mode(
                 }
 
                 eprintln!(
-                    "\n👀 Watch mode active (debounce: {debounce_ms}ms). Waiting for file changes... (Ctrl+C to stop)\n"
+                    "\n👀 Watch mode active (debounce: {debounce_ms}ms). Waiting for file changes... (Ctrl+C or SIGTERM to stop)\n"
                 );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
