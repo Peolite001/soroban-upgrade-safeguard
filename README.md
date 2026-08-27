@@ -88,9 +88,19 @@ empirical validation.
 
 ### Re-rendering a saved report
 
+`render` accepts either a saved JSON report path or `-` to read the JSON from
+stdin, and prints it as `text` (the default) or `markdown` — `json` is not a
+render target, since re-rendering a saved JSON document as JSON would just be
+a copy.
+
 ```bash
+# From a saved file
 soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format json > report.json
 soroban-upgrade-safeguard render report.json --format markdown
+
+# From stdin, piped straight from a comparison run
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --format json \
+  | soroban-upgrade-safeguard render - --format text
 ```
 
 ### Signing and verifying reports

@@ -1157,6 +1157,28 @@ additive, conditional, or deprecated, how to handle unknown fields, and how to
 handle unsupported future versions — see the
 [Report Schema Compatibility Policy](report_schema_compatibility.md).
 
+### Rendering a saved report
+
+`render` turns a previously saved JSON report back into a human-readable
+document, without needing the original WASM files. It accepts a report in
+either of two forms — a path to a saved JSON file, or `-` to read the JSON
+from stdin:
+
+```bash
+# From a saved file
+soroban-upgrade-safeguard render report.json --format markdown
+
+# From stdin, piped straight from a comparison run
+soroban-upgrade-safeguard ./old.wasm ./new.wasm --format json \
+  | soroban-upgrade-safeguard render - --format text
+```
+
+Any argument other than `-` is read as a file path. The only supported
+target formats are `text` (the default, colored human-readable output) and
+`markdown` (suitable for PR descriptions and comments) — `json` is not a
+valid `--format` for `render`, since re-rendering a saved JSON document as
+JSON would just be a no-op copy.
+
 ### Upgrading an older saved report
 
 A saved JSON report is a durable artifact, and `render` only reads
