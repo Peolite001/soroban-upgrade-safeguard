@@ -185,6 +185,20 @@ pub fn load_wasm_from_stdin(stdin: &mut impl Read) -> Result<WasmModule, Error> 
             details: "Failed to read stdin".to_string(),
             source: Some(Box::new(e)),
         })?;
+
+    // An empty stream (stdin closed or redirected from an empty source)
+    // would otherwise fall through to the generic "bad magic bytes" check
+    // in `wasm_module_from_bytes`, which reads as a WASM parsing problem
+    // rather than what actually happened: no input arrived at all. Name
+    // that distinctly, before any WASM-specific validation runs.
+    if bytes.is_empty() {
+        return Err(Error::InvalidInput {
+            details: "No bytes were read from stdin ('-'). Expected a WASM binary on stdin; \
+                      pipe one in, e.g. `cat contract.wasm | soroban-upgrade-safeguard - other.wasm`."
+                .to_string(),
+        });
+    }
+
     wasm_module_from_bytes(bytes, PathBuf::from("-"), "-".to_string(), None)
 }
 
