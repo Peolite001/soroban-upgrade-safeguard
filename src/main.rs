@@ -252,6 +252,11 @@ impl std::str::FromStr for OutputSpec {
             });
         }
         if let Some((fmt, path)) = s.split_once(':') {
+            if path.contains(':') && !is_windows_absolute_path(path) {
+                return Err(format!(
+                    "Invalid output specification '{s}': contains multiple format separators. Expected FORMAT:PATH (e.g. json:report.json)"
+                ));
+            }
             let format: OutputFormat = fmt
                 .parse()
                 .map_err(|_| format!("Invalid format '{fmt}'. Supported: text, json, markdown"))?;
