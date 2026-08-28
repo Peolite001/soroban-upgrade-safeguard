@@ -302,6 +302,33 @@ Watch mode:
 - Keeps the process running regardless of comparison verdict (non-zero exit codes do NOT exit the watcher).
 - Exit with `Ctrl+C`.
 
+### Comparing two directories of builds
+
+When the old and new builds of several contracts sit in two directories, compare
+them all in one run:
+
+```bash
+soroban-upgrade-safeguard --old-dir ./artifacts/v1 --new-dir ./artifacts/v2
+```
+
+Pairs are formed by file name: every `.wasm` file in the old directory is
+matched with the file of the same name in the new directory, and the file stem
+becomes the contract's name in the report.
+
+```text
+artifacts/
+├── v1/                 ├── v2/
+│   ├── token.wasm      │   ├── token.wasm     → pair "token"
+│   └── vault.wasm      │   └── vault.wasm     → pair "vault"
+```
+
+An old artifact with no file of that name in the new directory is not skipped:
+it is reported as a Critical finding under its own name — a contract that
+disappeared from a release is exactly the kind of accident this gate exists to
+catch — so the run fails. The reverse case, a new artifact with no old
+counterpart, has nothing to compare against; it is listed as a warning on stderr
+and does not affect the verdict.
+
 ### Comparing many contracts at once
 
 A manifest lists the pairs one run compares:
