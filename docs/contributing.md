@@ -47,7 +47,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    
 2. **Clone Your Fork**: Clone your personal fork locally to your machine:
    ```bash
-   git clone [https://github.com/](https://github.com/)<your-username>/soroban-upgrade-safeguard.git
+   git clone https://github.com/<your-username>/soroban-upgrade-safeguard.git
    cd soroban-upgrade-safeguard
    cargo build
    ```
