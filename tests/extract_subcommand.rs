@@ -325,6 +325,34 @@ fn extract_rejects_a_non_wasm_file() {
     );
 }
 
+#[test]
+fn extract_accepts_wasm_path_with_spaces() {
+    let dir = std::env::temp_dir().join(format!(
+        "safeguard test path with spaces {}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).expect("failed to create temp directory with spaces");
+    let target_wasm = dir.join("v1 with space.wasm");
+    fs::copy(wasm("v1.wasm"), &target_wasm).expect("failed to copy WASM fixture");
+
+    let (stdout, code) = extract(&[target_wasm.to_str().unwrap()]);
+    assert_eq!(
+        code, 0,
+        "extract must succeed on a valid WASM path containing spaces"
+    );
+
+    let json: Value = serde_json::from_str(&stdout).expect("stdout was not valid JSON");
+    assert_eq!(
+        json["source"].as_str().unwrap(),
+        target_wasm.to_str().unwrap(),
+        "source field must contain the complete unsplit path"
+    );
+
+    // Clean up temporary fixture after completion
+    let _ = fs::remove_file(&target_wasm);
+    let _ = fs::remove_dir(&dir);
+}
+
 // --- The four pre-existing usage modes must be untouched ---------------------
 
 #[test]
