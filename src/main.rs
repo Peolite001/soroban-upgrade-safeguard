@@ -201,6 +201,11 @@ const SUPPORTED_OUTPUT_FORMATS: &str = "text, json, markdown, github-actions";
 /// Explanation appended to every duplicate-destination diagnostic.
 const UNIQUE_DESTINATIONS_HINT: &str = "every --output must write to a unique file path.";
 
+/// Guidance for an output specification that names a format but no file, such
+/// as `json:`.
+const EMPTY_DESTINATION_HINT: &str =
+    "Use FORMAT:PATH, for example 'json:report.json', or 'json' on its own for stdout.";
+
 impl std::fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -263,6 +268,11 @@ impl std::str::FromStr for OutputSpec {
             let format: OutputFormat = fmt.parse().map_err(|_| {
                 format!("Invalid format '{fmt}'. Supported: {SUPPORTED_OUTPUT_FORMATS}")
             })?;
+            if path.trim().is_empty() {
+                return Err(format!(
+                    "Output specification '{s}' has no destination path. {EMPTY_DESTINATION_HINT}"
+                ));
+            }
             Ok(OutputSpec {
                 format,
                 path: Some(PathBuf::from(path)),
@@ -4736,6 +4746,24 @@ mod tests {
     fn test_validate_output_destinations_ignores_redundant_current_dir() {
         let outputs = vec![file_spec("./report.json"), file_spec("report.json")];
         assert!(validate_output_destinations(&outputs).is_err());
+    }
+
+    #[test]
+    fn test_output_spec_from_str_rejects_empty_destination() {
+        for value in ["json:", "markdown:", "text:", "json:   "] {
+            let err = value.parse::<OutputSpec>().unwrap_err();
+            assert!(err.contains(value), "{err}");
+            assert!(err.contains("no destination path"), "{err}");
+            assert!(err.contains("json:report.json"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_output_spec_from_str_stdout_specs_still_work() {
+        for value in ["json", "markdown", "text"] {
+            let spec: OutputSpec = value.parse().unwrap();
+            assert!(spec.path.is_none());
+        }
     }
 
     #[test]
