@@ -428,6 +428,7 @@ More detailed guides live in the [docs](docs/) folder:
 - [Contributing](docs/contributing.md): development setup, project structure, testing, and how to add new detection rules.
 - [Signed Attestations](docs/attestations.md): DSSE signing, the in-toto predicate, offline verification, and security guidance.
 - [RPC Security Checklist](docs/rpc-security-checklist.md): operational checklist for endpoint trust, HTTPS, expected-hash pinning, credentials, and report retention when fetching a baseline over RPC.
+- [Storage Schema Cookbook](docs/storage-schema-cookbook.md): worked examples for declaring storage schemas — common key enums, nested values, optional fields, and partial coverage.
 
 ## License
 
