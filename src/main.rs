@@ -256,9 +256,9 @@ impl std::str::FromStr for OutputSpec {
             });
         }
         if let Some((fmt, path)) = s.split_once(':') {
-            let format: OutputFormat = fmt
-                .parse()
-                .map_err(|_| format!("Invalid format '{fmt}'. Supported: {SUPPORTED_OUTPUT_FORMATS}"))?;
+            let format: OutputFormat = fmt.parse().map_err(|_| {
+                format!("Invalid format '{fmt}'. Supported: {SUPPORTED_OUTPUT_FORMATS}")
+            })?;
             Ok(OutputSpec {
                 format,
                 path: Some(PathBuf::from(path)),
@@ -3419,6 +3419,20 @@ fn render_github_actions(report: &report::SafetyReport) -> String {
     output
 }
 
+/// Reject an output destination that already exists as a directory. Without
+/// this the write fails deep inside the rename with a generic filesystem
+/// error that never mentions what the user actually needs to change.
+fn ensure_not_a_directory(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        anyhow::bail!(
+            "Output path '{}' is a directory. Provide a file path instead, for example '{}'.",
+            path.display(),
+            path.join("report.json").display()
+        );
+    }
+    Ok(())
+}
+
 struct AtomicWriteCleanup<'a> {
     active: bool,
     temp_path: &'a Path,
@@ -3433,6 +3447,7 @@ impl<'a> Drop for AtomicWriteCleanup<'a> {
 }
 
 fn write_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    ensure_not_a_directory(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -4768,6 +4783,19 @@ mod tests {
         let content = b"{\"safe\": true}";
         write_atomically(&path, content).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn test_write_atomically_rejects_directory_destination() {
+        let dir = scratch("atomic-directory");
+        let path = dir.join("reports");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let err = write_atomically(&path, b"content").unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("is a directory"), "{err}");
+        assert!(err.contains("file path"), "{err}");
+        assert!(path.is_dir());
     }
 
     #[test]
