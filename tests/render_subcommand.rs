@@ -5,6 +5,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use soroban_upgrade_safeguard::render::RenderableReport;
+
 fn wasm(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -268,5 +270,79 @@ fn a_missing_report_file_fails_with_a_clear_error() {
     assert!(
         stderr.contains("Failed to read report file"),
         "got: {stderr}"
+    );
+}
+
+#[test]
+fn unicode_finding_content_survives_text_and_markdown_rendering() {
+    let unicode_message = "Storage field '✨_token_balance' modified unexpectedly 🚀";
+    let unicode_target = "ContractState::🔑_auth_key";
+    let unicode_remediation = "Update schema mapping to handle 🌟 unicode keys properly.";
+
+    let mut report_val: serde_json::Value = serde_json::from_str(&live("json")).unwrap();
+
+    let unicode_finding = serde_json::json!({
+        "finding": {
+            "axis": "storage_layout",
+            "category": unicode_target,
+            "severity": "critical",
+            "message": unicode_message,
+            "type_name": null,
+            "location": null
+        },
+        "suppressed": false,
+        "suppression_reason": null,
+        "remediation": unicode_remediation
+    });
+
+    if let Some(findings) = report_val.get_mut("findings_by_category") {
+        if let Some(cat) = findings.as_object_mut() {
+            cat.insert(
+                unicode_target.to_string(),
+                serde_json::json!([unicode_finding]),
+            );
+        }
+    }
+
+    if let Some(axis_findings) = report_val.get_mut("findings_by_axis") {
+        if let Some(axes) = axis_findings.as_object_mut() {
+            axes.insert(
+                "storage_layout".to_string(),
+                serde_json::json!([unicode_finding]),
+            );
+        }
+    }
+
+    let saved_json = serde_json::to_string_pretty(&report_val).unwrap();
+
+    // 1. Verify saved JSON input remains valid UTF-8 and round-trips successfully
+    let round_tripped = RenderableReport::from_json_str(&saved_json);
+    assert!(
+        round_tripped.is_ok(),
+        "Saved JSON report with Unicode content must parse successfully"
+    );
+
+    // 2. Unicode finding content survives text rendering
+    let (rendered_text, text_code) = render(&saved_json, &["--format", "text", "--explain"]);
+    assert_ne!(text_code, 0);
+    assert!(
+        rendered_text.contains(unicode_message),
+        "Unicode finding message must survive text rendering"
+    );
+    assert!(
+        rendered_text.contains(unicode_remediation),
+        "Unicode remediation text must survive text rendering"
+    );
+
+    // 3. The same content survives Markdown rendering
+    let (rendered_md, md_code) = render(&saved_json, &["--format", "markdown"]);
+    assert_ne!(md_code, 0);
+    assert!(
+        rendered_md.contains(unicode_message),
+        "Unicode finding message must survive Markdown rendering"
+    );
+    assert!(
+        rendered_md.contains(unicode_target),
+        "Unicode finding target/category must survive Markdown rendering"
     );
 }
