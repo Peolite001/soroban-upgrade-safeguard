@@ -1700,6 +1700,11 @@ fn run_init(args: &InitArgs) -> Result<()> {
         }
     }
 
+    // Sort findings by stable category and target fields for deterministic output
+    findings.sort_by(|(cat1, target1), (cat2, target2)| {
+        cat1.cmp(cat2).then_with(|| target1.cmp(target2))
+    });
+
     // Generate config content
     let mut content = String::new();
     content.push_str("# Auto-generated suppression config\n");
