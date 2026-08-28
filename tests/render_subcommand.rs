@@ -116,6 +116,44 @@ fn a_safe_report_round_trips_and_exits_zero() {
 }
 
 #[test]
+fn render_no_color_produces_no_ansi_escape_sequences() {
+    let report = live("json");
+    let mut child = bin()
+        .arg("render")
+        .arg("-")
+        .arg("--no-color")
+        .env("CLICOLOR_FORCE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn binary");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(report.as_bytes())
+        .expect("failed to write report to stdin");
+
+    let output = child.wait_with_output().expect("failed to wait for binary");
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "render --no-color output must not contain ANSI escape sequences. Got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("SOROBAN UPGRADE SAFETY REPORT"),
+        "rendered report must contain report header"
+    );
+    assert!(
+        stdout.contains("FAILED") || stdout.contains("PASSED"),
+        "rendered report must contain its verdict"
+    );
+}
+
+#[test]
 fn rendering_from_a_file_works() {
     let report = live("json");
     let dir = std::env::temp_dir().join("sus-render-test");
