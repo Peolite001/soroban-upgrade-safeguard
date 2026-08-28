@@ -193,6 +193,10 @@ enum OutputFormat {
     GithubActions,
 }
 
+/// Format names accepted wherever an output format is selected, in the order
+/// they are listed back to the user on an argument error.
+const SUPPORTED_OUTPUT_FORMATS: &str = "text, json, markdown, github-actions";
+
 impl std::fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -214,7 +218,7 @@ impl std::str::FromStr for OutputFormat {
             "markdown" | "md" => Ok(OutputFormat::Markdown),
             "github-actions" | "gha" => Ok(OutputFormat::GithubActions),
             _ => Err(format!(
-                "Unknown format '{s}'. Supported: text, json, markdown, github-actions"
+                "Unknown format '{s}'. Supported: {SUPPORTED_OUTPUT_FORMATS}"
             )),
         }
     }
@@ -254,7 +258,7 @@ impl std::str::FromStr for OutputSpec {
         if let Some((fmt, path)) = s.split_once(':') {
             let format: OutputFormat = fmt
                 .parse()
-                .map_err(|_| format!("Invalid format '{fmt}'. Supported: text, json, markdown"))?;
+                .map_err(|_| format!("Invalid format '{fmt}'. Supported: {SUPPORTED_OUTPUT_FORMATS}"))?;
             Ok(OutputSpec {
                 format,
                 path: Some(PathBuf::from(path)),
@@ -333,7 +337,7 @@ struct Args {
     wasm_paths: Vec<PathBuf>,
 
     /// Output format for stdout. Omit or use --output for file output.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     format: Option<OutputFormat>,
 
     /// Output specification(s) in FORMAT:PATH format (e.g. json:report.json),
@@ -682,7 +686,7 @@ struct LintArgs {
     storage_schema: Option<PathBuf>,
 
     /// Output format.
-    #[arg(long, value_enum, default_value_t = LintOutputFormat::Text)]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = LintOutputFormat::Text)]
     format: LintOutputFormat,
 
     /// Include remediation guidance for each finding.
@@ -831,7 +835,7 @@ struct RenderArgs {
     report: PathBuf,
 
     /// Output format
-    #[arg(long, value_enum, default_value_t = RenderFormat::Text)]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = RenderFormat::Text)]
     format: RenderFormat,
 
     /// Print the remediation guidance stored in the report, if it has any.
@@ -911,7 +915,7 @@ struct PreflightArgs {
     timeout_secs: u64,
 
     /// Output format
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 
     /// Do not color output
@@ -4583,6 +4587,39 @@ mod tests {
         let spec: OutputSpec = "markdown:docs/report.md".parse().unwrap();
         assert_eq!(spec.format, OutputFormat::Markdown);
         assert_eq!(spec.path.unwrap(), PathBuf::from("docs/report.md"));
+    }
+
+    #[test]
+    fn test_output_spec_from_str_is_case_insensitive() {
+        for value in ["JSON", "Json", "jSoN"] {
+            let spec: OutputSpec = value.parse().unwrap();
+            assert_eq!(spec.format, OutputFormat::Json);
+            assert!(spec.path.is_none());
+        }
+
+        let spec: OutputSpec = "MarkDown:docs/report.md".parse().unwrap();
+        assert_eq!(spec.format, OutputFormat::Markdown);
+        assert_eq!(spec.path.unwrap(), PathBuf::from("docs/report.md"));
+    }
+
+    #[test]
+    fn test_output_format_from_str_is_case_insensitive() {
+        assert_eq!("TEXT".parse::<OutputFormat>().unwrap(), OutputFormat::Text);
+        assert_eq!("Json".parse::<OutputFormat>().unwrap(), OutputFormat::Json);
+        assert_eq!(
+            "MARKDOWN".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Markdown
+        );
+        assert_eq!("MD".parse::<OutputFormat>().unwrap(), OutputFormat::Markdown);
+    }
+
+    #[test]
+    fn test_unknown_format_lists_supported_values() {
+        let err = "yaml".parse::<OutputFormat>().unwrap_err();
+        assert!(err.contains(SUPPORTED_OUTPUT_FORMATS), "{err}");
+
+        let err = "yaml:report.yaml".parse::<OutputSpec>().unwrap_err();
+        assert!(err.contains(SUPPORTED_OUTPUT_FORMATS), "{err}");
     }
 
     #[test]
