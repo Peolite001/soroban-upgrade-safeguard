@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 #[allow(unused_imports)]
 use std::time::Duration;
 
@@ -197,6 +198,9 @@ enum OutputFormat {
 /// they are listed back to the user on an argument error.
 const SUPPORTED_OUTPUT_FORMATS: &str = "text, json, markdown, github-actions";
 
+/// Explanation appended to every duplicate-destination diagnostic.
+const UNIQUE_DESTINATIONS_HINT: &str = "every --output must write to a unique file path.";
+
 impl std::fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -282,6 +286,47 @@ impl std::str::FromStr for OutputSpec {
             ))
         }
     }
+}
+
+/// Reject two output specifications that resolve to the same file. Both would
+/// be written in turn and the last one silently replaces the earlier content,
+/// so a CI job asking for a JSON and a Markdown report at one path would keep
+/// only one of them. Stdout specifications are exempt: several formats can
+/// legitimately share stdout.
+fn validate_output_destinations(outputs: &[OutputSpec]) -> Result<()> {
+    let mut seen: HashMap<Vec<String>, &Path> = HashMap::new();
+    for output in outputs {
+        let Some(path) = output.path.as_deref() else {
+            continue;
+        };
+        if let Some(previous) = seen.insert(destination_key(path), path) {
+            anyhow::bail!(
+                "Duplicate output destination '{}' (already requested as '{}'): {}",
+                path.display(),
+                previous.display(),
+                UNIQUE_DESTINATIONS_HINT
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Comparison key for an output destination: the path's components with any
+/// redundant `.` dropped, so `report.json` and `./report.json` are recognized
+/// as the same file. Windows paths compare case-insensitively, matching how
+/// the filesystem itself treats them.
+fn destination_key(path: &Path) -> Vec<String> {
+    path.components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .map(|component| {
+            let text = component.as_os_str().to_string_lossy().into_owned();
+            if cfg!(windows) {
+                text.to_lowercase()
+            } else {
+                text
+            }
+        })
+        .collect()
 }
 
 fn is_windows_absolute_path(value: &str) -> bool {
@@ -1877,6 +1922,10 @@ fn main() -> Result<()> {
             inherit_format: false,
         }]
     };
+
+    // Fail before any WASM or config is loaded: a CI job that would silently
+    // lose one of its reports should not first spend time on the comparison.
+    validate_output_destinations(&outputs)?;
 
     let has_non_stdout = outputs.iter().any(|o| o.path.is_some());
     // Decorative progress goes to stderr when stdout is clean (JSON/Markdown to file
@@ -4635,6 +4684,58 @@ mod tests {
 
         let err = "yaml:report.yaml".parse::<OutputSpec>().unwrap_err();
         assert!(err.contains(SUPPORTED_OUTPUT_FORMATS), "{err}");
+    }
+
+    fn file_spec(path: &str) -> OutputSpec {
+        OutputSpec {
+            format: OutputFormat::Json,
+            path: Some(PathBuf::from(path)),
+            inherit_format: false,
+        }
+    }
+
+    fn stdout_spec(format: OutputFormat) -> OutputSpec {
+        OutputSpec {
+            format,
+            path: None,
+            inherit_format: false,
+        }
+    }
+
+    #[test]
+    fn test_validate_output_destinations_accepts_distinct_paths() {
+        let outputs = vec![
+            file_spec("report.json"),
+            file_spec("docs/report.md"),
+            file_spec("out/report.json"),
+        ];
+        assert!(validate_output_destinations(&outputs).is_ok());
+    }
+
+    #[test]
+    fn test_validate_output_destinations_allows_multiple_stdout_formats() {
+        let outputs = vec![
+            stdout_spec(OutputFormat::Text),
+            stdout_spec(OutputFormat::Json),
+            stdout_spec(OutputFormat::Markdown),
+        ];
+        assert!(validate_output_destinations(&outputs).is_ok());
+    }
+
+    #[test]
+    fn test_validate_output_destinations_rejects_duplicates() {
+        let outputs = vec![file_spec("report.json"), file_spec("report.json")];
+        let err = validate_output_destinations(&outputs)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("report.json"), "{err}");
+        assert!(err.contains("unique"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_output_destinations_ignores_redundant_current_dir() {
+        let outputs = vec![file_spec("./report.json"), file_spec("report.json")];
+        assert!(validate_output_destinations(&outputs).is_err());
     }
 
     #[test]
