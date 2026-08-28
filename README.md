@@ -68,6 +68,30 @@ See [Zero-Trust RPC Baseline Retrieval](docs/documentation.md#zero-trust-rpc-bas
 for the hash-verification pipeline, transport security rules, and
 authenticated-endpoint guidance to use before pointing this at production.
 
+### Validating against captured storage entries
+
+Structural comparison answers whether the *shapes* the new build declares are
+compatible with the old ones. Empirical validation answers a narrower, more
+concrete question: does the data that actually exists still decode under the new
+spec? Point `--empirical-file` at a JSON file of captured ledger/storage entries
+to run that check offline, alongside the normal structural analysis:
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --empirical-file ./ledger_snapshot.json
+```
+
+The structural findings are still produced in full; the empirical results are
+layered onto them. A flagged layout change whose sampled data still decodes is
+marked `[CONTRADICTED]` rather than failing the run, while an entry that really
+does fail to decode under the new spec fails the run outright, regardless of
+`--strict`.
+
+See [Input JSON Format](docs/empirical_validation.md#input-json-format) for the
+accepted file shapes, and the
+[empirical validation guide](docs/empirical_validation.md) for RPC-based
+sampling and the limits of the check.
+
 ### Inspecting a single build
 
 ```bash
