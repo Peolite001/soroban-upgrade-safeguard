@@ -331,11 +331,33 @@ and does not affect the verdict.
 
 ### Comparing many contracts at once
 
-A manifest lists the pairs one run compares:
+A manifest lists the pairs one run compares. The minimal form is one
+`[[pairs]]` entry per contract, each naming an old build, a new build, and the
+name the pair reports under:
+
+```toml
+# release.toml
+[[pairs]]
+name = "token"
+old  = "artifacts/v1/token.wasm"
+new  = "artifacts/v2/token.wasm"
+
+[[pairs]]
+name = "vault"
+old  = "artifacts/v1/vault.wasm"
+new  = "artifacts/v2/vault.wasm"
+```
 
 ```bash
 soroban-upgrade-safeguard --manifest release.toml
 ```
+
+Relative paths resolve against the directory of the manifest that wrote them, not
+the working directory, so the file above works from anywhere in the repository.
+
+Beyond that, a manifest can share settings across pairs, pull in other manifests,
+and hold a single contract to a stricter bar — see
+[Batch Manifests](docs/batch_manifests.md) for the full schema:
 
 ```toml
 include = ["common/policy.toml"]   # share a policy across manifests
