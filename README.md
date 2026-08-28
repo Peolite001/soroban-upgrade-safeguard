@@ -66,7 +66,10 @@ soroban-upgrade-safeguard \
 
 See [Zero-Trust RPC Baseline Retrieval](docs/documentation.md#zero-trust-rpc-baseline-retrieval)
 for the hash-verification pipeline, transport security rules, and
-authenticated-endpoint guidance to use before pointing this at production.
+authenticated-endpoint guidance to use before pointing this at production,
+and the [RPC Security Checklist](docs/rpc-security-checklist.md) for an
+operational checklist covering endpoint trust, credentials, and report
+retention.
 
 ### Inspecting a single build
 
@@ -424,6 +427,7 @@ More detailed guides live in the [docs](docs/) folder:
 - [Batch Manifests](docs/batch_manifests.md): the manifest schema, composing manifests with `include`, shared `[defaults]`, per-pair overrides, precedence, and resolution provenance.
 - [Contributing](docs/contributing.md): development setup, project structure, testing, and how to add new detection rules.
 - [Signed Attestations](docs/attestations.md): DSSE signing, the in-toto predicate, offline verification, and security guidance.
+- [RPC Security Checklist](docs/rpc-security-checklist.md): operational checklist for endpoint trust, HTTPS, expected-hash pinning, credentials, and report retention when fetching a baseline over RPC.
 
 ## License
 
