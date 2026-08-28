@@ -353,6 +353,63 @@ fn extract_accepts_wasm_path_with_spaces() {
     let _ = fs::remove_dir(&dir);
 }
 
+#[test]
+fn interface_hash_is_64_lowercase_hex_and_matches_hash_only_across_multiple_fixtures() {
+    let fixtures = ["v1.wasm", "v2.wasm", "v3.wasm"];
+    let mut hashes = Vec::new();
+
+    for fixture in fixtures {
+        let full_json = extract_json(fixture);
+        let full_hash = full_json["interface_hash"]
+            .as_str()
+            .expect("interface_hash string in JSON");
+
+        // The extracted interface hash contains exactly 64 lowercase hexadecimal characters
+        assert_eq!(
+            full_hash.len(),
+            64,
+            "hash for {fixture} must be 64 characters long"
+        );
+        assert!(
+            full_hash
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "hash for {fixture} must contain only lowercase hex characters, got: {full_hash}"
+        );
+
+        // --hash-only matches the hash in full extraction output
+        let wasm_path = wasm(fixture);
+        let (stdout, code) = extract(&[wasm_path.to_str().unwrap(), "--hash-only"]);
+        assert_eq!(code, 0, "--hash-only must succeed for {fixture}");
+        let hash_only = stdout.trim();
+        assert_eq!(
+            hash_only, full_hash,
+            "--hash-only output must match the hash in full extraction output for {fixture}"
+        );
+        assert_eq!(
+            hash_only.len(),
+            64,
+            "--hash-only for {fixture} must be 64 characters long"
+        );
+        assert!(
+            hash_only
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "--hash-only output for {fixture} must be lowercase hex"
+        );
+
+        hashes.push(full_hash.to_string());
+    }
+
+    // Covers more than one fixture to avoid a constant-value test
+    assert!(hashes.len() > 1, "test must cover more than one fixture");
+    assert_ne!(
+        hashes[0], hashes[1],
+        "v1.wasm and v2.wasm must produce different interface hashes"
+    );
+}
+
+
 // --- The four pre-existing usage modes must be untouched ---------------------
 
 #[test]
