@@ -232,3 +232,71 @@ fn a_missing_report_file_fails_with_a_clear_error() {
         "got: {stderr}"
     );
 }
+
+#[test]
+fn empty_report_rendering_regression_test() {
+    // Produce an empty report (identical upgrade with zero findings)
+    let output = bin()
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v1.wasm"))
+        .args(["--format", "json"])
+        .output()
+        .expect("failed to run binary");
+    assert_eq!(output.status.code(), Some(0));
+
+    let empty_report_json = String::from_utf8(output.stdout).unwrap();
+    assert!(empty_report_json.contains("\"total_findings\": 0"));
+
+    // 1. Text format path
+    let (text_out, text_code) = render(&empty_report_json, &["--format", "text"]);
+    assert_eq!(text_code, 0, "text render must exit 0");
+    assert!(
+        text_out.contains("✅ PASSED"),
+        "text output communicates passing verdict"
+    );
+    assert!(
+        text_out.contains("Critical: 0"),
+        "text output shows zero critical findings"
+    );
+    assert!(
+        text_out.contains("No relevant changes detected."),
+        "text output communicates successful outcome"
+    );
+    assert!(
+        !text_out.contains("--- ["),
+        "no empty category headings in text output"
+    );
+    assert!(
+        !text_out.contains("🔴") && !text_out.contains("🟡"),
+        "no placeholder finding rows in text output"
+    );
+
+    // 2. Markdown format path
+    let (md_out, md_code) = render(&empty_report_json, &["--format", "markdown"]);
+    assert_eq!(md_code, 0, "markdown render must exit 0");
+    assert!(
+        md_out.contains("## Status: ✅ PASSED"),
+        "markdown output communicates passing verdict"
+    );
+    assert!(
+        md_out.contains("| **Critical** | 0 |"),
+        "markdown output shows zero critical findings"
+    );
+    assert!(
+        md_out.contains("No relevant changes detected."),
+        "markdown output communicates successful outcome"
+    );
+    assert!(
+        !md_out.contains("### Storage Layout Compatibility"),
+        "no empty category headings in markdown output"
+    );
+    assert!(
+        !md_out.contains("### Call ABI Compatibility"),
+        "no empty category headings in markdown output"
+    );
+    assert!(
+        !md_out.contains("- 🔴") && !md_out.contains("- 🟡"),
+        "no placeholder finding rows in markdown output"
+    );
+}
+
