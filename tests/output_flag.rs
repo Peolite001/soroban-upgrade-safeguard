@@ -244,3 +244,49 @@ fn output_flag_atomic_replacement_and_permissions() {
     let final_perms = std::fs::metadata(&json_out).unwrap().permissions();
     assert_eq!(final_perms.mode() & 0o777, 0o400);
 }
+
+// ──────────────────────────────────────────────────────────────────
+// Report paths containing spaces (#451)
+// ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn output_flag_supports_path_with_spaces() {
+    let dir = std::env::temp_dir().join(format!(
+        "safeguard report path with spaces {}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("failed to create directory with spaces");
+    let out = dir.join("report file with spaces.json");
+
+    let (stdout, _stderr, _code, file) = run_with_output("v1.wasm", "v2.wasm", "json", Some(&out));
+
+    let contents = file.expect("output file beneath path with spaces should exist");
+
+    // The file must contain valid JSON report format and can be parsed or inspected
+    let json: serde_json::Value = serde_json::from_str(&contents)
+        .unwrap_or_else(|e| panic!("output file not valid JSON: {e}\n{contents}"));
+    assert!(json.get("is_safe").is_some(), "JSON report must contain 'is_safe'");
+    assert!(json.get("counts").is_some(), "JSON report must contain 'counts'");
+
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty when --output is used"
+    );
+
+    // Verify no extra files were created from split path components
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read_dir failed")
+        .filter_map(|res| res.ok())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "only the expected report file should exist in destination directory, found: {:?}",
+        entries.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+
+    // Clean up temporary test directory
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_dir(&dir);
+}
+
