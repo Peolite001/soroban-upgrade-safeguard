@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 #[allow(unused_imports)]
 use std::time::Duration;
 
@@ -193,6 +194,18 @@ enum OutputFormat {
     GithubActions,
 }
 
+/// Format names accepted wherever an output format is selected, in the order
+/// they are listed back to the user on an argument error.
+const SUPPORTED_OUTPUT_FORMATS: &str = "text, json, markdown, github-actions";
+
+/// Explanation appended to every duplicate-destination diagnostic.
+const UNIQUE_DESTINATIONS_HINT: &str = "every --output must write to a unique file path.";
+
+/// Guidance for an output specification that names a format but no file, such
+/// as `json:`.
+const EMPTY_DESTINATION_HINT: &str =
+    "Use FORMAT:PATH, for example 'json:report.json', or 'json' on its own for stdout.";
+
 impl std::fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -214,7 +227,7 @@ impl std::str::FromStr for OutputFormat {
             "markdown" | "md" => Ok(OutputFormat::Markdown),
             "github-actions" | "gha" => Ok(OutputFormat::GithubActions),
             _ => Err(format!(
-                "Unknown format '{s}'. Supported: text, json, markdown, github-actions"
+                "Unknown format '{s}'. Supported: {SUPPORTED_OUTPUT_FORMATS}"
             )),
         }
     }
@@ -252,6 +265,14 @@ impl std::str::FromStr for OutputSpec {
             });
         }
         if let Some((fmt, path)) = s.split_once(':') {
+            let format: OutputFormat = fmt.parse().map_err(|_| {
+                format!("Invalid format '{fmt}'. Supported: {SUPPORTED_OUTPUT_FORMATS}")
+            })?;
+            if path.trim().is_empty() {
+                return Err(format!(
+                    "Output specification '{s}' has no destination path. {EMPTY_DESTINATION_HINT}"
+                ));
+            }
             if path.contains(':') && !is_windows_absolute_path(path) {
                 return Err(format!(
                     "Invalid output specification '{s}': contains multiple format separators. Expected FORMAT:PATH (e.g. json:report.json)"
@@ -283,6 +304,47 @@ impl std::str::FromStr for OutputSpec {
             ))
         }
     }
+}
+
+/// Reject two output specifications that resolve to the same file. Both would
+/// be written in turn and the last one silently replaces the earlier content,
+/// so a CI job asking for a JSON and a Markdown report at one path would keep
+/// only one of them. Stdout specifications are exempt: several formats can
+/// legitimately share stdout.
+fn validate_output_destinations(outputs: &[OutputSpec]) -> Result<()> {
+    let mut seen: HashMap<Vec<String>, &Path> = HashMap::new();
+    for output in outputs {
+        let Some(path) = output.path.as_deref() else {
+            continue;
+        };
+        if let Some(previous) = seen.insert(destination_key(path), path) {
+            anyhow::bail!(
+                "Duplicate output destination '{}' (already requested as '{}'): {}",
+                path.display(),
+                previous.display(),
+                UNIQUE_DESTINATIONS_HINT
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Comparison key for an output destination: the path's components with any
+/// redundant `.` dropped, so `report.json` and `./report.json` are recognized
+/// as the same file. Windows paths compare case-insensitively, matching how
+/// the filesystem itself treats them.
+fn destination_key(path: &Path) -> Vec<String> {
+    path.components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .map(|component| {
+            let text = component.as_os_str().to_string_lossy().into_owned();
+            if cfg!(windows) {
+                text.to_lowercase()
+            } else {
+                text
+            }
+        })
+        .collect()
 }
 
 fn is_windows_absolute_path(value: &str) -> bool {
@@ -338,7 +400,7 @@ struct Args {
     wasm_paths: Vec<PathBuf>,
 
     /// Output format for stdout. Omit or use --output for file output.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     format: Option<OutputFormat>,
 
     /// Output specification(s) in FORMAT:PATH format (e.g. json:report.json),
@@ -696,7 +758,7 @@ struct LintArgs {
     storage_schema: Option<PathBuf>,
 
     /// Output format.
-    #[arg(long, value_enum, default_value_t = LintOutputFormat::Text)]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = LintOutputFormat::Text)]
     format: LintOutputFormat,
 
     /// Include remediation guidance for each finding.
@@ -845,7 +907,7 @@ struct RenderArgs {
     report: PathBuf,
 
     /// Output format
-    #[arg(long, value_enum, default_value_t = RenderFormat::Text)]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = RenderFormat::Text)]
     format: RenderFormat,
 
     /// Print the remediation guidance stored in the report, if it has any.
@@ -925,7 +987,7 @@ struct PreflightArgs {
     timeout_secs: u64,
 
     /// Output format
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 
     /// Do not color output
@@ -1899,6 +1961,10 @@ fn main() -> Result<()> {
             inherit_format: false,
         }]
     };
+
+    // Fail before any WASM or config is loaded: a CI job that would silently
+    // lose one of its reports should not first spend time on the comparison.
+    validate_output_destinations(&outputs)?;
 
     let has_non_stdout = outputs.iter().any(|o| o.path.is_some());
     // Decorative progress goes to stderr when stdout is clean (JSON/Markdown to file
@@ -3474,6 +3540,20 @@ fn render_github_actions(report: &report::SafetyReport) -> String {
     output
 }
 
+/// Reject an output destination that already exists as a directory. Without
+/// this the write fails deep inside the rename with a generic filesystem
+/// error that never mentions what the user actually needs to change.
+fn ensure_not_a_directory(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        anyhow::bail!(
+            "Output path '{}' is a directory. Provide a file path instead, for example '{}'.",
+            path.display(),
+            path.join("report.json").display()
+        );
+    }
+    Ok(())
+}
+
 struct AtomicWriteCleanup<'a> {
     active: bool,
     temp_path: &'a Path,
@@ -3488,6 +3568,7 @@ impl<'a> Drop for AtomicWriteCleanup<'a> {
 }
 
 fn write_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    ensure_not_a_directory(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -5099,6 +5180,109 @@ mod tests {
     }
 
     #[test]
+    fn test_output_spec_from_str_is_case_insensitive() {
+        for value in ["JSON", "Json", "jSoN"] {
+            let spec: OutputSpec = value.parse().unwrap();
+            assert_eq!(spec.format, OutputFormat::Json);
+            assert!(spec.path.is_none());
+        }
+
+        let spec: OutputSpec = "MarkDown:docs/report.md".parse().unwrap();
+        assert_eq!(spec.format, OutputFormat::Markdown);
+        assert_eq!(spec.path.unwrap(), PathBuf::from("docs/report.md"));
+    }
+
+    #[test]
+    fn test_output_format_from_str_is_case_insensitive() {
+        assert_eq!("TEXT".parse::<OutputFormat>().unwrap(), OutputFormat::Text);
+        assert_eq!("Json".parse::<OutputFormat>().unwrap(), OutputFormat::Json);
+        assert_eq!(
+            "MARKDOWN".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Markdown
+        );
+        assert_eq!("MD".parse::<OutputFormat>().unwrap(), OutputFormat::Markdown);
+    }
+
+    #[test]
+    fn test_unknown_format_lists_supported_values() {
+        let err = "yaml".parse::<OutputFormat>().unwrap_err();
+        assert!(err.contains(SUPPORTED_OUTPUT_FORMATS), "{err}");
+
+        let err = "yaml:report.yaml".parse::<OutputSpec>().unwrap_err();
+        assert!(err.contains(SUPPORTED_OUTPUT_FORMATS), "{err}");
+    }
+
+    fn file_spec(path: &str) -> OutputSpec {
+        OutputSpec {
+            format: OutputFormat::Json,
+            path: Some(PathBuf::from(path)),
+            inherit_format: false,
+        }
+    }
+
+    fn stdout_spec(format: OutputFormat) -> OutputSpec {
+        OutputSpec {
+            format,
+            path: None,
+            inherit_format: false,
+        }
+    }
+
+    #[test]
+    fn test_validate_output_destinations_accepts_distinct_paths() {
+        let outputs = vec![
+            file_spec("report.json"),
+            file_spec("docs/report.md"),
+            file_spec("out/report.json"),
+        ];
+        assert!(validate_output_destinations(&outputs).is_ok());
+    }
+
+    #[test]
+    fn test_validate_output_destinations_allows_multiple_stdout_formats() {
+        let outputs = vec![
+            stdout_spec(OutputFormat::Text),
+            stdout_spec(OutputFormat::Json),
+            stdout_spec(OutputFormat::Markdown),
+        ];
+        assert!(validate_output_destinations(&outputs).is_ok());
+    }
+
+    #[test]
+    fn test_validate_output_destinations_rejects_duplicates() {
+        let outputs = vec![file_spec("report.json"), file_spec("report.json")];
+        let err = validate_output_destinations(&outputs)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("report.json"), "{err}");
+        assert!(err.contains("unique"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_output_destinations_ignores_redundant_current_dir() {
+        let outputs = vec![file_spec("./report.json"), file_spec("report.json")];
+        assert!(validate_output_destinations(&outputs).is_err());
+    }
+
+    #[test]
+    fn test_output_spec_from_str_rejects_empty_destination() {
+        for value in ["json:", "markdown:", "text:", "json:   "] {
+            let err = value.parse::<OutputSpec>().unwrap_err();
+            assert!(err.contains(value), "{err}");
+            assert!(err.contains("no destination path"), "{err}");
+            assert!(err.contains("json:report.json"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_output_spec_from_str_stdout_specs_still_work() {
+        for value in ["json", "markdown", "text"] {
+            let spec: OutputSpec = value.parse().unwrap();
+            assert!(spec.path.is_none());
+        }
+    }
+
+    #[test]
     fn test_output_spec_from_str_invalid_format() {
         let result: Result<OutputSpec, String> = "invalid".parse();
         assert!(result.is_err());
@@ -5244,6 +5428,19 @@ mod tests {
         let content = b"{\"safe\": true}";
         write_atomically(&path, content).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn test_write_atomically_rejects_directory_destination() {
+        let dir = scratch("atomic-directory");
+        let path = dir.join("reports");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let err = write_atomically(&path, b"content").unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("is a directory"), "{err}");
+        assert!(err.contains("file path"), "{err}");
+        assert!(path.is_dir());
     }
 
     #[test]
