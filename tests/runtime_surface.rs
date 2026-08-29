@@ -379,6 +379,7 @@ fn test_suppression_of_runtime_surface_findings() {
         strict: true,
         storage_schemas: None,
         lineage_store: None,
+        contract: None,
     };
 
     let report =
@@ -435,6 +436,7 @@ fn test_gating_policy_allows_disabling_runtime_surface_axis() {
         strict: false,
         storage_schemas: None,
         lineage_store: None,
+        contract: None,
     };
 
     let report =

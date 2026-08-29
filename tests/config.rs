@@ -736,6 +736,7 @@ fn test_suppressions_fingerprint_mismatch_validation() {
         message: "Field threshold removed".to_string(),
         severity: soroban_upgrade_safeguard::diff::Severity::Critical,
         axes: Vec::new(),
+        change: None,
         root_target: None,
     };
 

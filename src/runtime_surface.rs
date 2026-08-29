@@ -489,6 +489,7 @@ fn compare_memories(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Dif
                     ),
                     type_name: None,
                     target: Some(format!("memory[{}]", mem.index)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -506,6 +507,7 @@ fn compare_memories(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Dif
                     ),
                     type_name: None,
                     target: Some(format!("memory[{}]", mem.index)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -523,6 +525,7 @@ fn compare_memories(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Dif
                         ),
                         type_name: None,
                         target: Some(format!("memory[{}]", old_m.index)),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -538,6 +541,7 @@ fn compare_memories(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Dif
                         ),
                         type_name: None,
                         target: Some(format!("memory[{}].type", old_m.index)),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -562,6 +566,7 @@ fn compare_memories(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Dif
                         ),
                         type_name: None,
                         target: Some(format!("memory[{}].min", old_m.index)),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -585,6 +590,7 @@ fn compare_memories(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Dif
                         ),
                         type_name: None,
                         target: Some(format!("memory[{}].max", old_m.index)),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -621,6 +627,7 @@ fn compare_tables(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut DiffR
                     ),
                     type_name: None,
                     target: Some(format!("table[{}]", tab.index)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -638,6 +645,7 @@ fn compare_tables(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut DiffR
                     ),
                     type_name: None,
                     target: Some(format!("table[{}]", tab.index)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -655,6 +663,7 @@ fn compare_tables(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut DiffR
                         ),
                         type_name: None,
                         target: Some(format!("table[{}].element_type", old_t.index)),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -675,6 +684,7 @@ fn compare_tables(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut DiffR
                         ),
                         type_name: None,
                         target: Some(format!("table[{}].min", old_t.index)),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -692,6 +702,7 @@ fn compare_tables(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut DiffR
                         ),
                         type_name: None,
                         target: Some(format!("table[{}].max", old_t.index)),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -728,6 +739,7 @@ fn compare_globals(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Diff
                     ),
                     type_name: None,
                     target: Some(format!("global[{}]", glob.index)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -750,6 +762,7 @@ fn compare_globals(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Diff
                     ),
                     type_name: None,
                     target: Some(format!("global[{}]", glob.index)),
+                    change: None,
                     root_target: None,
                 });
             }
@@ -765,6 +778,7 @@ fn compare_globals(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Diff
                         ),
                         type_name: None,
                         target: Some(format!("global[{}].type", old_g.index)),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -784,6 +798,7 @@ fn compare_globals(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Diff
                         ),
                         type_name: None,
                         target: Some(format!("global[{}].mutability", old_g.index)),
+                        change: None,
                         root_target: None,
                     });
                 }
@@ -805,6 +820,7 @@ fn compare_start_function(old: &RuntimeSurface, new: &RuntimeSurface, report: &m
                 ),
                 type_name: None,
                 target: Some("start_function".to_string()),
+                change: None,
                 root_target: None,
             });
         }
@@ -818,6 +834,7 @@ fn compare_start_function(old: &RuntimeSurface, new: &RuntimeSurface, report: &m
                 ),
                 type_name: None,
                 target: Some("start_function".to_string()),
+                change: None,
                 root_target: None,
             });
         }
@@ -829,6 +846,7 @@ fn compare_start_function(old: &RuntimeSurface, new: &RuntimeSurface, report: &m
                 message: format!("Start function changed from index {old_func} to {new_func}."),
                 type_name: None,
                 target: Some("start_function".to_string()),
+                change: None,
                 root_target: None,
             });
         }
@@ -860,6 +878,7 @@ fn compare_element_segments(old: &RuntimeSurface, new: &RuntimeSurface, report: 
             ),
             type_name: None,
             target: Some("element_segments".to_string()),
+            change: None,
             root_target: None,
         });
     }
@@ -887,6 +906,7 @@ fn compare_data_segments(old: &RuntimeSurface, new: &RuntimeSurface, report: &mu
             ),
             type_name: None,
             target: Some("data_segments".to_string()),
+            change: None,
             root_target: None,
         });
     }
@@ -903,6 +923,7 @@ fn compare_proposals(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Di
             ),
             type_name: None,
             target: Some(format!("proposal.{prop}")),
+            change: None,
             root_target: None,
         });
     }
@@ -917,6 +938,7 @@ fn compare_proposals(old: &RuntimeSurface, new: &RuntimeSurface, report: &mut Di
             ),
             type_name: None,
             target: Some(format!("proposal.{prop}")),
+            change: None,
             root_target: None,
         });
     }

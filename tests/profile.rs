@@ -549,6 +549,7 @@ fn dev_profile_runs_against_documented_v1_v2_fixture_clean_checkout_smoke() {
         strict: resolved.strict,
         storage_schemas: None,
         lineage_store: None,
+        contract: None,
     };
     let report = compare_wasm_files_with_options(&old_wasm, &new_wasm, &opts)
         .expect("comparing v1 vs v2 with the dev profile must not error");

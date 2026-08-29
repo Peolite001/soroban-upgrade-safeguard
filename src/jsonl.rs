@@ -606,6 +606,7 @@ fn process_job(
             strict,
             storage_schemas: None,
             lineage_store: None,
+            contract: None,
         },
     ) {
         Ok(report) => {

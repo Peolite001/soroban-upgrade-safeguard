@@ -140,6 +140,7 @@ fn test_lineage_store_option_in_compare_options() {
         strict: false,
         storage_schemas: None,
         lineage_store: Some(&store),
+        contract: None,
     };
 
     let report = compare_wasm_bytes_with_options(&wasm_empty, &wasm_empty, &options).unwrap();

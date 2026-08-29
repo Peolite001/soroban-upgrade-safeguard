@@ -1680,6 +1680,7 @@ fn run_init(args: &InitArgs) -> Result<()> {
         false,
         &old_spec,
         &new_spec,
+        None,
     );
 
     // Extract findings from the report
@@ -2117,6 +2118,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                             type_name: None,
                             target: Some(gap.name.clone()),
                             root_target: None,
+                            change: None,
                         },
                         axes: vec![diff::CompatibilityAxis::CallAbi],
                         suppressed: false,
@@ -2126,10 +2128,15 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                              the --suppressions file if removal is intentional.",
                             gap.name
                         )),
+                        migrated_by: None,
                     }],
                 );
                 map
             },
+            migrated_count: 0,
+            migration_status:
+                soroban_upgrade_safeguard::contract_migration::MigrationStatus::NotApplicable,
+            migration_diagnostics: Vec::new(),
             empirical: false,
             empirical_findings: Vec::new(),
             budget_violations: Vec::new(),
@@ -2243,6 +2250,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                                         &storage_schemas.new,
                                     )),
                                     lineage_store: None,
+                                    contract: Some(contract_name.as_str()),
                                 },
                             )?;
                         report.set_no_timestamp(settings.no_timestamp.value);
@@ -2265,6 +2273,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                                 rpc_headers: &args.rpc_headers,
                                 rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
                                 lineage_store: None,
+                                contract: Some(contract_name.as_str()),
                             },
                             progress,
                         )
@@ -2468,6 +2477,7 @@ fn synthesize_error_report(
                         type_name: None,
                         target: Some(name.to_string()),
                         root_target: None,
+                        change: None,
                     },
                     axes: vec![diff::CompatibilityAxis::CallAbi],
                     suppressed: false,
@@ -2475,10 +2485,15 @@ fn synthesize_error_report(
                     remediation: Some(
                         "Check the contract paths and ensure both WASM files exist and are valid Soroban contracts.".to_string()
                     ),
+                    migrated_by: None,
                 }],
             );
             map
         },
+        migrated_count: 0,
+        migration_status:
+            soroban_upgrade_safeguard::contract_migration::MigrationStatus::NotApplicable,
+        migration_diagnostics: Vec::new(),
         empirical: false,
         empirical_findings: Vec::new(),
         budget_violations: Vec::new(),
@@ -2804,10 +2819,11 @@ fn render_batch_summary(
 
                 markdown.push_str("### Summary\n\n");
                 markdown.push_str(
-                    "| Contract | Status | Scope | Coverage | Critical | Warning | Info | Suppressed | Labels |\n",
+                    "| Contract | Status | Scope | Coverage | Critical | Warning | Info | Migrated | Suppressed | Labels |\n",
                 );
-                markdown
-                    .push_str("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
+                markdown.push_str(
+                    "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n",
+                );
 
                 for result in results {
                     let report = result.report();
@@ -2817,7 +2833,7 @@ fn render_batch_summary(
                         "❌ FAILED"
                     };
                     markdown.push_str(&format!(
-                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                         result.name(),
                         status_str,
                         report.scope().summary_line(),
@@ -2825,6 +2841,7 @@ fn render_batch_summary(
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
+                        report.migrated_count(),
                         report.suppressed_count(),
                         format_labels(result.labels(), "-")
                     ));
@@ -2887,7 +2904,7 @@ fn render_batch_summary(
                         format!(" {{{}}}", format_labels(result.labels(), ""))
                     };
                     text.push_str(&format!(
-                        "  - {}: {} [{}; {}] ({} critical, {} warnings, {} info, {} suppressed){}\n",
+                        "  - {}: {} [{}; {}] ({} critical, {} warnings, {} info, {} migrated, {} suppressed){}\n",
                         result.name().bold(),
                         status_str,
                         report.scope().summary_line(),
@@ -2895,6 +2912,7 @@ fn render_batch_summary(
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
+                        report.migrated_count(),
                         report.suppressed_count(),
                         labels_suffix
                     ));
@@ -3026,9 +3044,23 @@ fn run_single(
         Vec::new()
     };
 
+    // Name the contract by the new build's file stem so a config shared across
+    // contracts can scope a migration with `contracts = [..]`.
+    let contract_name = Path::new(new_wasm_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(String::from);
+
     let run_comparison = |progress: &dyn Fn(String)| -> Result<bool> {
         progress("🔍 Soroban Upgrade Safeguard".to_string());
         progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+
+        if !suppressions.migrations.is_empty() {
+            progress(format!(
+                "🔧 {} declared migration(s) loaded",
+                suppressions.migrations.len()
+            ));
+        }
 
         progress(format!(
             "\n{}",
@@ -3086,6 +3118,7 @@ fn run_single(
                     strict: args.strict,
                     storage_schemas: None,
                     lineage_store: store_opt.as_ref(),
+                    contract: contract_name.as_deref(),
                 },
             )?
             .with_symlinks(None, new.symlink.clone())
@@ -3123,6 +3156,7 @@ fn run_single(
                     rpc_headers: &args.rpc_headers,
                     rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
                     lineage_store: store_opt.as_ref(),
+                    contract: contract_name.as_deref(),
                 },
                 progress,
             )?
@@ -3787,6 +3821,9 @@ struct ContractComparison<'a> {
     rpc_headers: &'a [String],
     rpc_allow_id_mismatch: bool,
     lineage_store: Option<&'a soroban_upgrade_safeguard::lineage::LineageStore>,
+    /// The contract's name, used to scope migrations declared with
+    /// `contracts = [..]` in a config shared across several contracts.
+    contract: Option<&'a str>,
 }
 
 struct PairStorageSchemas {
@@ -3844,6 +3881,7 @@ fn compare_contracts(
         rpc_headers,
         rpc_allow_id_mismatch,
         lineage_store,
+        contract,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -3903,6 +3941,7 @@ fn compare_contracts(
         *strict,
         &old_spec,
         &new_spec,
+        *contract,
     )
     .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
 
