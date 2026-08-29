@@ -68,6 +68,30 @@ See [Zero-Trust RPC Baseline Retrieval](docs/documentation.md#zero-trust-rpc-bas
 for the hash-verification pipeline, transport security rules, and
 authenticated-endpoint guidance to use before pointing this at production.
 
+### Validating against captured storage entries
+
+Structural comparison answers whether the *shapes* the new build declares are
+compatible with the old ones. Empirical validation answers a narrower, more
+concrete question: does the data that actually exists still decode under the new
+spec? Point `--empirical-file` at a JSON file of captured ledger/storage entries
+to run that check offline, alongside the normal structural analysis:
+
+```bash
+soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm \
+  --empirical-file ./ledger_snapshot.json
+```
+
+The structural findings are still produced in full; the empirical results are
+layered onto them. A flagged layout change whose sampled data still decodes is
+marked `[CONTRADICTED]` rather than failing the run, while an entry that really
+does fail to decode under the new spec fails the run outright, regardless of
+`--strict`.
+
+See [Input JSON Format](docs/empirical_validation.md#input-json-format) for the
+accepted file shapes, and the
+[empirical validation guide](docs/empirical_validation.md) for RPC-based
+sampling and the limits of the check.
+
 ### Inspecting a single build
 
 ```bash
@@ -278,13 +302,62 @@ Watch mode:
 - Keeps the process running regardless of comparison verdict (non-zero exit codes do NOT exit the watcher).
 - Exit with `Ctrl+C`.
 
+### Comparing two directories of builds
+
+When the old and new builds of several contracts sit in two directories, compare
+them all in one run:
+
+```bash
+soroban-upgrade-safeguard --old-dir ./artifacts/v1 --new-dir ./artifacts/v2
+```
+
+Pairs are formed by file name: every `.wasm` file in the old directory is
+matched with the file of the same name in the new directory, and the file stem
+becomes the contract's name in the report.
+
+```text
+artifacts/
+├── v1/                 ├── v2/
+│   ├── token.wasm      │   ├── token.wasm     → pair "token"
+│   └── vault.wasm      │   └── vault.wasm     → pair "vault"
+```
+
+An old artifact with no file of that name in the new directory is not skipped:
+it is reported as a Critical finding under its own name — a contract that
+disappeared from a release is exactly the kind of accident this gate exists to
+catch — so the run fails. The reverse case, a new artifact with no old
+counterpart, has nothing to compare against; it is listed as a warning on stderr
+and does not affect the verdict.
+
 ### Comparing many contracts at once
 
-A manifest lists the pairs one run compares:
+A manifest lists the pairs one run compares. The minimal form is one
+`[[pairs]]` entry per contract, each naming an old build, a new build, and the
+name the pair reports under:
+
+```toml
+# release.toml
+[[pairs]]
+name = "token"
+old  = "artifacts/v1/token.wasm"
+new  = "artifacts/v2/token.wasm"
+
+[[pairs]]
+name = "vault"
+old  = "artifacts/v1/vault.wasm"
+new  = "artifacts/v2/vault.wasm"
+```
 
 ```bash
 soroban-upgrade-safeguard --manifest release.toml
 ```
+
+Relative paths resolve against the directory of the manifest that wrote them, not
+the working directory, so the file above works from anywhere in the repository.
+
+Beyond that, a manifest can share settings across pairs, pull in other manifests,
+and hold a single contract to a stricter bar — see
+[Batch Manifests](docs/batch_manifests.md) for the full schema:
 
 ```toml
 include = ["common/policy.toml"]   # share a policy across manifests
