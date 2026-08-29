@@ -147,3 +147,28 @@ fn default_format_is_text_to_stdout() {
     assert!(stdout.contains("Critical:"));
     assert!(stdout.contains("Warnings:"));
 }
+
+#[test]
+fn output_spec_multiple_separators_rejected() {
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v2.wasm"))
+        .args(["--output", "json:report:extra.json"])
+        .output()
+        .expect("failed to run binary");
+
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("contains multiple format separators"),
+        "stderr should explain that multiple format separators are rejected: {stderr}"
+    );
+    assert!(
+        stderr.contains("json:report:extra.json"),
+        "stderr should identify the malformed value: {stderr}"
+    );
+    assert!(
+        stderr.contains("FORMAT:PATH"),
+        "stderr should show valid format example: {stderr}"
+    );
+}

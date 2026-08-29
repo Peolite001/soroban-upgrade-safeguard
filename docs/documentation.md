@@ -183,6 +183,8 @@ secret values are never serialized into reports or debug output. RPC redirects
 are refused for authenticated requests so provider credentials cannot reach a
 different origin. In CI, store the secret in the runner's secret store and
 export it for the step rather than putting it in a workflow argument or file.
+See the [RPC Security Checklist](rpc-security-checklist.md) for the full
+operational rundown.
 
 ### Suppression config
 
@@ -1148,6 +1150,11 @@ Duplicate detection covers all five spec entry kinds: functions, structs, enums,
 ## Zero-Trust RPC Baseline Retrieval
 
 When using `--contract-id` and `--rpc-url` to fetch the on-chain baseline, the tool implements a **zero-trust pipeline** that protects against malicious or compromised RPC endpoints:
+
+For an operational checklist covering endpoint trust, HTTPS, expected-hash
+pinning, credential handling, and report retention — with guarantees
+distinguished from operator assumptions — see the
+[RPC Security Checklist](rpc-security-checklist.md).
 
 ### Cryptographic Hash Verification
 

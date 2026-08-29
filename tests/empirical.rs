@@ -175,6 +175,7 @@ fn test_json_loading_and_empirical_check() {
         message: "Struct field changed type".to_string(),
         type_name: Some("Balance".to_string()),
         target: Some("Balance.amount".to_string()),
+        change: None,
         root_target: None,
     }];
 
