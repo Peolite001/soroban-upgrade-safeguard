@@ -14,3 +14,7 @@ Schemas can be supplied as JSON or TOML declarations. Use
 `StorageSchema::reconcile` for one build or `compare_storage_schemas` for an
 old/new pair. Results include confidence, mismatches, and coverage gaps and can
 be rendered as structured JSON, text, or Markdown.
+
+For worked examples — common key enums, nested values, optional fields, and
+partial coverage, each with the resulting scope and finding behavior — see
+the [Storage Schema Cookbook](storage-schema-cookbook.md).

@@ -343,6 +343,12 @@ For a complete walkthrough of every coordinated change required -- stable identi
 
 ## Reporting Bugs
 
+If the failure happens while a WASM file is loading or decoding — a
+validation error, an interface that comes back unexpectedly empty, an
+"unsupported contract" error, or a resource-limit rejection — check the
+[Troubleshooting Loader Failures](loader-troubleshooting.md) guide first;
+it covers the common causes and next actions for each of those cases.
+
 A good bug report includes:
 
 - What you ran, including the exact command
