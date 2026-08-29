@@ -101,16 +101,36 @@ pub struct DependencyGraph {
 
 impl DependencyGraph {
     /// Build the graph from a list of [`ContractDependency`] declarations.
+    ///
+    /// Repeated declarations of the same `caller` → `callee` pair are merged
+    /// into a single edge rather than stored as separate entries, so cycle
+    /// detection and propagation each see exactly one edge per pair. Watched
+    /// function lists are unioned; if either declaration watches all
+    /// functions (an empty list), the merged edge does too.
     pub fn from_declarations(deps: &[ContractDependency]) -> Self {
         let mut graph = Self::default();
         for dep in deps {
-            graph
-                .edges
-                .entry(dep.caller.clone())
-                .or_default()
-                .push((dep.callee.clone(), dep.functions.clone()));
             graph.all_referenced.insert(dep.caller.clone());
             graph.all_referenced.insert(dep.callee.clone());
+
+            let caller_edges = graph.edges.entry(dep.caller.clone()).or_default();
+            match caller_edges
+                .iter_mut()
+                .find(|(callee, _)| *callee == dep.callee)
+            {
+                Some((_, functions)) => {
+                    if functions.is_empty() || dep.functions.is_empty() {
+                        functions.clear();
+                    } else {
+                        for f in &dep.functions {
+                            if !functions.contains(f) {
+                                functions.push(f.clone());
+                            }
+                        }
+                    }
+                }
+                None => caller_edges.push((dep.callee.clone(), dep.functions.clone())),
+            }
         }
         graph
     }
@@ -380,6 +400,7 @@ pub fn cycle_findings(cycles: &[Vec<String>]) -> Vec<Finding> {
                 ),
                 type_name: None,
                 target: Some(cycle[0].clone()),
+                change: None,
                 root_target: None,
             }
         })
@@ -405,6 +426,7 @@ pub fn missing_contract_findings(missing: &[&str]) -> Vec<Finding> {
             ),
             type_name: None,
             target: Some(name.to_string()),
+            change: None,
             root_target: None,
         })
         .collect()
@@ -441,6 +463,7 @@ mod tests {
             message: format!("Breaking change in {}", target),
             type_name: None,
             target: Some(target.to_string()),
+            change: None,
             root_target: None,
         }
     }
@@ -453,6 +476,7 @@ mod tests {
             message: format!("Warning change in {}", target),
             type_name: None,
             target: Some(target.to_string()),
+            change: None,
             root_target: None,
         }
     }
@@ -465,6 +489,7 @@ mod tests {
             message: format!("Info change in {}", target),
             type_name: None,
             target: Some(target.to_string()),
+            change: None,
             root_target: None,
         }
     }
@@ -689,6 +714,118 @@ mod tests {
             DependencyGraph::from_declarations(&[dep("pool", "token"), dep("router", "pool")]);
         let cycles = graph.detect_cycles();
         assert!(cycles.is_empty(), "acyclic graph must have no cycles");
+    }
+
+    // ── Duplicate edge declarations ──────────────────────────────────────────
+
+    #[test]
+    fn repeated_declaration_produces_one_edge_not_two() {
+        let graph =
+            DependencyGraph::from_declarations(&[dep("pool", "token"), dep("pool", "token")]);
+
+        let mut findings: HashMap<String, Vec<Finding>> = HashMap::new();
+        findings.insert(
+            "token".to_string(),
+            vec![critical_finding("Function Removed", "transfer")],
+        );
+
+        let cross = graph.propagate(&findings);
+        assert_eq!(
+            cross.len(),
+            1,
+            "a callee declared twice by the same caller must still produce one finding"
+        );
+    }
+
+    #[test]
+    fn repeated_edge_in_a_cycle_is_not_reported_twice() {
+        // "B" declares its dependency on "A" twice; the cycle it forms with
+        // "A" → "B" must still be reported once, not once per duplicate edge.
+        let graph =
+            DependencyGraph::from_declarations(&[dep("A", "B"), dep("B", "A"), dep("B", "A")]);
+        let cycles = graph.detect_cycles();
+        assert_eq!(
+            cycles.len(),
+            1,
+            "a duplicated back-edge must not multiply the reported cycle, got {:?}",
+            cycles
+        );
+    }
+
+    #[test]
+    fn distinct_callees_from_the_same_caller_remain_independent() {
+        let graph =
+            DependencyGraph::from_declarations(&[dep("router", "pool"), dep("router", "token")]);
+
+        let mut findings: HashMap<String, Vec<Finding>> = HashMap::new();
+        findings.insert(
+            "pool".to_string(),
+            vec![critical_finding("Function Removed", "swap")],
+        );
+        findings.insert(
+            "token".to_string(),
+            vec![critical_finding("Function Removed", "transfer")],
+        );
+
+        let cross = graph.propagate(&findings);
+        assert_eq!(
+            cross.len(),
+            2,
+            "distinct caller-callee edges must not be collapsed into one"
+        );
+    }
+
+    #[test]
+    fn merging_a_filtered_and_unfiltered_declaration_watches_all_functions() {
+        // One declaration watches only "transfer"; a second, redundant
+        // declaration for the same pair watches everything. The merged edge
+        // must watch everything — the narrower filter must not win.
+        let graph = DependencyGraph::from_declarations(&[
+            dep_filtered("pool", "token", &["transfer"]),
+            dep("pool", "token"),
+        ]);
+
+        let mut findings: HashMap<String, Vec<Finding>> = HashMap::new();
+        findings.insert(
+            "token".to_string(),
+            vec![critical_finding("Function Removed", "burn")],
+        );
+
+        let cross = graph.propagate(&findings);
+        assert_eq!(
+            cross.len(),
+            1,
+            "merged edge must watch all functions once any declaration has no filter"
+        );
+    }
+
+    #[test]
+    fn merging_two_filtered_declarations_unions_watched_functions() {
+        let graph = DependencyGraph::from_declarations(&[
+            dep_filtered("pool", "token", &["transfer"]),
+            dep_filtered("pool", "token", &["balance"]),
+        ]);
+
+        let mut findings: HashMap<String, Vec<Finding>> = HashMap::new();
+        findings.insert(
+            "token".to_string(),
+            vec![
+                critical_finding("Function Removed", "transfer"),
+                critical_finding("Function Removed", "balance"),
+                critical_finding("Function Removed", "burn"),
+            ],
+        );
+
+        let cross = graph.propagate(&findings);
+        let targets: HashSet<&str> = cross
+            .iter()
+            .map(|c| c.finding.target.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            targets,
+            ["transfer", "balance"].into_iter().collect(),
+            "the union of both declarations' watched functions must be honored, and burn (watched by neither) excluded"
+        );
     }
 
     // ── Missing contracts ────────────────────────────────────────────────────

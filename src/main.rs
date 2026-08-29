@@ -252,6 +252,11 @@ impl std::str::FromStr for OutputSpec {
             });
         }
         if let Some((fmt, path)) = s.split_once(':') {
+            if path.contains(':') && !is_windows_absolute_path(path) {
+                return Err(format!(
+                    "Invalid output specification '{s}': contains multiple format separators. Expected FORMAT:PATH (e.g. json:report.json)"
+                ));
+            }
             let format: OutputFormat = fmt
                 .parse()
                 .map_err(|_| format!("Invalid format '{fmt}'. Supported: text, json, markdown"))?;
@@ -385,6 +390,15 @@ struct Args {
     /// Validate a suppression config without analyzing WASM inputs.
     #[arg(long, value_name = "CONFIG")]
     validate_config: Option<PathBuf>,
+
+    /// Print the fully resolved configuration (CLI flags, environment
+    /// variables, and the suppression config file) with the origin of every
+    /// value, then exit without analyzing any WASM inputs. Secrets (RPC
+    /// header values) are never resolved or printed, only the name of the
+    /// environment variable that supplies them. Honors --format json for
+    /// machine-readable output; any other format prints a text listing.
+    #[arg(long)]
+    show_config: bool,
 
     /// Print a concise remediation explanation for each finding.
     #[arg(long)]
@@ -1680,6 +1694,7 @@ fn run_init(args: &InitArgs) -> Result<()> {
         false,
         &old_spec,
         &new_spec,
+        None,
     );
 
     // Extract findings from the report
@@ -1699,6 +1714,11 @@ fn run_init(args: &InitArgs) -> Result<()> {
             }
         }
     }
+
+    // Sort findings by stable category and target fields for deterministic output
+    findings.sort_by(|(cat1, target1), (cat2, target2)| {
+        cat1.cmp(cat2).then_with(|| target1.cmp(target2))
+    });
 
     // Generate config content
     let mut content = String::new();
@@ -1805,6 +1825,12 @@ fn main() -> Result<()> {
     // before any WASM inputs are required.
     if let Some(path) = &args.validate_config {
         return validate_suppression_config(path);
+    }
+
+    // Config-inspection mode: resolve and print configuration, then exit,
+    // before any WASM inputs are required.
+    if args.show_config {
+        return run_show_config(&args);
     }
 
     let is_batch = args.manifest.is_some() || (args.old_dir.is_some() && args.new_dir.is_some());
@@ -2117,6 +2143,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                             type_name: None,
                             target: Some(gap.name.clone()),
                             root_target: None,
+                            change: None,
                         },
                         axes: vec![diff::CompatibilityAxis::CallAbi],
                         suppressed: false,
@@ -2126,10 +2153,15 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                              the --suppressions file if removal is intentional.",
                             gap.name
                         )),
+                        migrated_by: None,
                     }],
                 );
                 map
             },
+            migrated_count: 0,
+            migration_status:
+                soroban_upgrade_safeguard::contract_migration::MigrationStatus::NotApplicable,
+            migration_diagnostics: Vec::new(),
             empirical: false,
             empirical_findings: Vec::new(),
             budget_violations: Vec::new(),
@@ -2243,6 +2275,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                                         &storage_schemas.new,
                                     )),
                                     lineage_store: None,
+                                    contract: Some(contract_name.as_str()),
                                 },
                             )?;
                         report.set_no_timestamp(settings.no_timestamp.value);
@@ -2265,6 +2298,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                                 rpc_headers: &args.rpc_headers,
                                 rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
                                 lineage_store: None,
+                                contract: Some(contract_name.as_str()),
                             },
                             progress,
                         )
@@ -2468,6 +2502,7 @@ fn synthesize_error_report(
                         type_name: None,
                         target: Some(name.to_string()),
                         root_target: None,
+                        change: None,
                     },
                     axes: vec![diff::CompatibilityAxis::CallAbi],
                     suppressed: false,
@@ -2475,10 +2510,15 @@ fn synthesize_error_report(
                     remediation: Some(
                         "Check the contract paths and ensure both WASM files exist and are valid Soroban contracts.".to_string()
                     ),
+                    migrated_by: None,
                 }],
             );
             map
         },
+        migrated_count: 0,
+        migration_status:
+            soroban_upgrade_safeguard::contract_migration::MigrationStatus::NotApplicable,
+        migration_diagnostics: Vec::new(),
         empirical: false,
         empirical_findings: Vec::new(),
         budget_violations: Vec::new(),
@@ -2804,10 +2844,11 @@ fn render_batch_summary(
 
                 markdown.push_str("### Summary\n\n");
                 markdown.push_str(
-                    "| Contract | Status | Scope | Coverage | Critical | Warning | Info | Suppressed | Labels |\n",
+                    "| Contract | Status | Scope | Coverage | Critical | Warning | Info | Migrated | Suppressed | Labels |\n",
                 );
-                markdown
-                    .push_str("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n");
+                markdown.push_str(
+                    "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n",
+                );
 
                 for result in results {
                     let report = result.report();
@@ -2817,7 +2858,7 @@ fn render_batch_summary(
                         "❌ FAILED"
                     };
                     markdown.push_str(&format!(
-                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                         result.name(),
                         status_str,
                         report.scope().summary_line(),
@@ -2825,6 +2866,7 @@ fn render_batch_summary(
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
+                        report.migrated_count(),
                         report.suppressed_count(),
                         format_labels(result.labels(), "-")
                     ));
@@ -2887,7 +2929,7 @@ fn render_batch_summary(
                         format!(" {{{}}}", format_labels(result.labels(), ""))
                     };
                     text.push_str(&format!(
-                        "  - {}: {} [{}; {}] ({} critical, {} warnings, {} info, {} suppressed){}\n",
+                        "  - {}: {} [{}; {}] ({} critical, {} warnings, {} info, {} migrated, {} suppressed){}\n",
                         result.name().bold(),
                         status_str,
                         report.scope().summary_line(),
@@ -2895,6 +2937,7 @@ fn render_batch_summary(
                         report.critical_count(),
                         report.warning_count(),
                         report.info_count(),
+                        report.migrated_count(),
                         report.suppressed_count(),
                         labels_suffix
                     ));
@@ -3026,9 +3069,23 @@ fn run_single(
         Vec::new()
     };
 
+    // Name the contract by the new build's file stem so a config shared across
+    // contracts can scope a migration with `contracts = [..]`.
+    let contract_name = Path::new(new_wasm_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(String::from);
+
     let run_comparison = |progress: &dyn Fn(String)| -> Result<bool> {
         progress("🔍 Soroban Upgrade Safeguard".to_string());
         progress("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+
+        if !suppressions.migrations.is_empty() {
+            progress(format!(
+                "🔧 {} declared migration(s) loaded",
+                suppressions.migrations.len()
+            ));
+        }
 
         progress(format!(
             "\n{}",
@@ -3086,6 +3143,7 @@ fn run_single(
                     strict: args.strict,
                     storage_schemas: None,
                     lineage_store: store_opt.as_ref(),
+                    contract: contract_name.as_deref(),
                 },
             )?
             .with_symlinks(None, new.symlink.clone())
@@ -3123,6 +3181,7 @@ fn run_single(
                     rpc_headers: &args.rpc_headers,
                     rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
                     lineage_store: store_opt.as_ref(),
+                    contract: contract_name.as_deref(),
                 },
                 progress,
             )?
@@ -3789,6 +3848,9 @@ struct ContractComparison<'a> {
     rpc_headers: &'a [String],
     rpc_allow_id_mismatch: bool,
     lineage_store: Option<&'a soroban_upgrade_safeguard::lineage::LineageStore>,
+    /// The contract's name, used to scope migrations declared with
+    /// `contracts = [..]` in a config shared across several contracts.
+    contract: Option<&'a str>,
 }
 
 struct PairStorageSchemas {
@@ -3846,6 +3908,7 @@ fn compare_contracts(
         rpc_headers,
         rpc_allow_id_mismatch,
         lineage_store,
+        contract,
     } = comparison;
     let old_meta = parser::extract_metadata(old_bytes)?;
     let old_spec = spec::ContractSpec::from_entries(&old_meta.spec);
@@ -3905,6 +3968,7 @@ fn compare_contracts(
         *strict,
         &old_spec,
         &new_spec,
+        *contract,
     )
     .with_interface_hashes(old_spec.interface_hash(), new_spec.interface_hash());
 
@@ -4076,6 +4140,455 @@ fn validate_suppression_config(path: &Path) -> Result<()> {
         .bold()
     );
     std::process::exit(1);
+}
+
+/// One resolved configuration value paired with the layer that produced it,
+/// for `--show-config`. `source` is a short, stable label: `"cli"`, `"env"`,
+/// `"config file"`, or `"default"`.
+fn setting<T: serde::Serialize>(value: T, source: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({ "value": value, "source": source.into() })
+}
+
+/// `--show-config`: resolve configuration exactly as a normal run would (CLI
+/// flags, environment variables, and the suppression config file) and print
+/// every value together with the layer that decided it, then exit without
+/// touching any WASM input.
+///
+/// RPC header *values* are never resolved here — only the environment
+/// variable name that would supply them at run time — so a printed config
+/// never leaks a secret even when redirected into a CI log.
+fn run_show_config(args: &Args) -> Result<()> {
+    let (suppressions, config_source) = load_suppressions(
+        args.no_config,
+        args.config.as_deref(),
+        args.search_parent_config,
+    )?;
+
+    let mut root = serde_json::Map::new();
+
+    root.insert(
+        "config_file".to_string(),
+        match &config_source {
+            Some((path, source)) => setting(path.display().to_string(), source.to_string()),
+            None => setting(serde_json::Value::Null, "default (none found)"),
+        },
+    );
+
+    let mut output = serde_json::Map::new();
+    output.insert(
+        "format".to_string(),
+        setting(
+            args.format.unwrap_or(OutputFormat::Text).to_string(),
+            if args.format.is_some() { "cli" } else { "default" },
+        ),
+    );
+    output.insert(
+        "explain".to_string(),
+        setting(args.explain, if args.explain { "cli" } else { "default" }),
+    );
+    output.insert(
+        "strict".to_string(),
+        setting(args.strict, if args.strict { "cli" } else { "default" }),
+    );
+    let no_color_env = std::env::var_os("NO_COLOR").is_some();
+    output.insert(
+        "no_color".to_string(),
+        setting(
+            args.no_color || no_color_env,
+            if args.no_color {
+                "cli"
+            } else if no_color_env {
+                "env (NO_COLOR)"
+            } else {
+                "default"
+            },
+        ),
+    );
+    output.insert(
+        "color".to_string(),
+        setting(
+            format!("{:?}", args.color).to_lowercase(),
+            "cli or default",
+        ),
+    );
+    output.insert(
+        "ascii".to_string(),
+        setting(args.ascii, if args.ascii { "cli" } else { "default" }),
+    );
+    output.insert(
+        "plain".to_string(),
+        setting(args.plain, if args.plain { "cli" } else { "default" }),
+    );
+    output.insert(
+        "width".to_string(),
+        match args.width {
+            Some(w) => setting(w, "cli"),
+            None => setting(serde_json::Value::Null, "default (auto-detected)"),
+        },
+    );
+    output.insert(
+        "quiet".to_string(),
+        setting(args.quiet, if args.quiet { "cli" } else { "default" }),
+    );
+    output.insert(
+        "no_timestamp".to_string(),
+        setting(
+            args.no_timestamp,
+            if args.no_timestamp { "cli" } else { "default" },
+        ),
+    );
+    root.insert("output".to_string(), serde_json::Value::Object(output));
+
+    let mut input = serde_json::Map::new();
+    input.insert(
+        "contract_id".to_string(),
+        match &args.contract_id {
+            Some(v) => setting(v.clone(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    input.insert(
+        "rpc_url".to_string(),
+        match &args.rpc_url {
+            Some(v) => setting(v.clone(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    input.insert(
+        "rpc_headers".to_string(),
+        serde_json::Value::Array(
+            args.rpc_headers
+                .iter()
+                .map(|spec| match spec.split_once('=') {
+                    Some((name, env_var)) => {
+                        serde_json::json!({ "name": name, "value_from_env": env_var, "value": "<redacted>" })
+                    }
+                    None => serde_json::json!({ "raw": spec }),
+                })
+                .collect(),
+        ),
+    );
+    input.insert(
+        "allow_http_local".to_string(),
+        setting(
+            args.allow_http_local,
+            if args.allow_http_local { "cli" } else { "default" },
+        ),
+    );
+    input.insert(
+        "no_symlinks".to_string(),
+        setting(
+            args.no_symlinks,
+            if args.no_symlinks { "cli" } else { "default" },
+        ),
+    );
+    input.insert(
+        "expected_wasm_hash".to_string(),
+        match &args.expected_wasm_hash {
+            Some(v) => setting(v.clone(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    input.insert(
+        "interface_lockfile".to_string(),
+        match &args.interface_lockfile {
+            Some(v) => setting(v.display().to_string(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    root.insert("input".to_string(), serde_json::Value::Object(input));
+
+    let mut batch = serde_json::Map::new();
+    batch.insert(
+        "manifest".to_string(),
+        match &args.manifest {
+            Some(v) => setting(v.display().to_string(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    batch.insert("max_pairs".to_string(), {
+        let is_default = args.max_pairs == manifest::DEFAULT_MAX_PAIRS;
+        setting(args.max_pairs, if is_default { "default" } else { "cli" })
+    });
+    batch.insert(
+        "old_dir".to_string(),
+        match &args.old_dir {
+            Some(v) => setting(v.display().to_string(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    batch.insert(
+        "new_dir".to_string(),
+        match &args.new_dir {
+            Some(v) => setting(v.display().to_string(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    batch.insert(
+        "per_contract_output_dir".to_string(),
+        match &args.per_contract_output_dir {
+            Some(v) => setting(v.display().to_string(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    batch.insert("per_contract_output_name_template".to_string(), {
+        let is_default = args.per_contract_output_name_template == "{name}.{ext}";
+        setting(
+            args.per_contract_output_name_template.clone(),
+            if is_default { "default" } else { "cli" },
+        )
+    });
+    root.insert("batch".to_string(), serde_json::Value::Object(batch));
+
+    let mut watch = serde_json::Map::new();
+    watch.insert(
+        "watch".to_string(),
+        setting(args.watch, if args.watch { "cli" } else { "default" }),
+    );
+    watch.insert("watch_debounce_ms".to_string(), {
+        let is_default = args.watch_debounce_ms == DEFAULT_WATCH_DEBOUNCE_MS;
+        setting(
+            args.watch_debounce_ms,
+            if is_default { "default" } else { "cli" },
+        )
+    });
+    watch.insert(
+        "watch_status_file".to_string(),
+        match &args.watch_status_file {
+            Some(v) => setting(v.display().to_string(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    root.insert("watch".to_string(), serde_json::Value::Object(watch));
+
+    let mut remote = serde_json::Map::new();
+    remote.insert("max_bytes".to_string(), {
+        let is_default = args.remote_max_bytes == remote::DEFAULT_MAX_BYTES;
+        setting(
+            args.remote_max_bytes,
+            if is_default { "default" } else { "cli" },
+        )
+    });
+    remote.insert("timeout_secs".to_string(), {
+        let is_default = args.remote_timeout_secs == remote::DEFAULT_TIMEOUT_SECS;
+        setting(
+            args.remote_timeout_secs,
+            if is_default { "default" } else { "cli" },
+        )
+    });
+    remote.insert("max_redirects".to_string(), {
+        let is_default = args.remote_max_redirects == remote::DEFAULT_MAX_REDIRECTS;
+        setting(
+            args.remote_max_redirects,
+            if is_default { "default" } else { "cli" },
+        )
+    });
+    let remote_cache_env = std::env::var_os(remote::CACHE_DIR_ENV_VAR);
+    remote.insert(
+        "cache_dir".to_string(),
+        match &args.remote_cache_dir {
+            Some(v) => setting(v.display().to_string(), "cli"),
+            None => setting(
+                remote::default_cache_dir().display().to_string(),
+                if remote_cache_env.is_some() {
+                    "env (SOROBAN_SAFEGUARD_REMOTE_CACHE)"
+                } else {
+                    "default"
+                },
+            ),
+        },
+    );
+    remote.insert(
+        "no_cache".to_string(),
+        setting(
+            args.no_remote_cache,
+            if args.no_remote_cache { "cli" } else { "default" },
+        ),
+    );
+    root.insert(
+        "remote_fetch".to_string(),
+        serde_json::Value::Object(remote),
+    );
+
+    let mut oci_section = serde_json::Map::new();
+    oci_section.insert("max_bytes".to_string(), {
+        let is_default = args.oci_max_bytes == oci::DEFAULT_MAX_BYTES;
+        setting(
+            args.oci_max_bytes,
+            if is_default { "default" } else { "cli" },
+        )
+    });
+    oci_section.insert("timeout_secs".to_string(), {
+        let is_default = args.oci_timeout_secs == oci::DEFAULT_TIMEOUT_SECS;
+        setting(
+            args.oci_timeout_secs,
+            if is_default { "default" } else { "cli" },
+        )
+    });
+    let oci_cache_env = std::env::var_os(oci::CACHE_DIR_ENV_VAR);
+    oci_section.insert(
+        "cache_dir".to_string(),
+        match &args.oci_cache_dir {
+            Some(v) => setting(v.display().to_string(), "cli"),
+            None => setting(
+                oci::default_cache_dir().display().to_string(),
+                if oci_cache_env.is_some() {
+                    "env (SOROBAN_SAFEGUARD_OCI_CACHE)"
+                } else {
+                    "default"
+                },
+            ),
+        },
+    );
+    oci_section.insert(
+        "no_cache".to_string(),
+        setting(
+            args.no_oci_cache,
+            if args.no_oci_cache { "cli" } else { "default" },
+        ),
+    );
+    oci_section.insert(
+        "allow_tags".to_string(),
+        setting(
+            args.allow_oci_tags,
+            if args.allow_oci_tags { "cli" } else { "default" },
+        ),
+    );
+    root.insert("oci_fetch".to_string(), serde_json::Value::Object(oci_section));
+
+    let mut lineage = serde_json::Map::new();
+    lineage.insert(
+        "lineage_store".to_string(),
+        match &args.lineage_store {
+            Some(v) => setting(v.display().to_string(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    lineage.insert(
+        "record_version".to_string(),
+        match &args.record_version {
+            Some(v) => setting(v.clone(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    lineage.insert(
+        "retire_version".to_string(),
+        match &args.retire_version {
+            Some(v) => setting(v.clone(), "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    lineage.insert(
+        "max_live_versions".to_string(),
+        match args.max_live_versions {
+            Some(v) => setting(v, "cli"),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    root.insert("lineage".to_string(), serde_json::Value::Object(lineage));
+
+    // Values sourced from the suppression config file. When no file was
+    // loaded these all report the built-in default, matching a fresh
+    // `SuppressionConfig::default()`.
+    let from_file = config_source.is_some();
+    let mut suppression = serde_json::Map::new();
+    suppression.insert(
+        "max_suppressions".to_string(),
+        match suppressions.max_suppressions {
+            Some(v) => setting(v, if from_file { "config file" } else { "default" }),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    suppression.insert(
+        "allow_targetless".to_string(),
+        match suppressions.allow_targetless {
+            Some(v) => setting(v, if from_file { "config file" } else { "default" }),
+            None => setting(serde_json::Value::Null, "default"),
+        },
+    );
+    suppression.insert(
+        "rule_count".to_string(),
+        setting(
+            suppressions.rules.len(),
+            if from_file { "config file" } else { "default" },
+        ),
+    );
+    let policy = suppressions.policy();
+    let mut gating = serde_json::Map::new();
+    let default_policy = soroban_upgrade_safeguard::suppression::PolicyConfig::default();
+    macro_rules! gate_setting {
+        ($field:ident) => {
+            gating.insert(
+                stringify!($field).to_string(),
+                setting(
+                    policy.$field,
+                    if from_file && policy.$field != default_policy.$field {
+                        "config file"
+                    } else {
+                        "default"
+                    },
+                ),
+            );
+        };
+    }
+    gate_setting!(gate_storage_layout);
+    gate_setting!(gate_call_abi);
+    gate_setting!(gate_event_indexer);
+    gate_setting!(gate_source_level);
+    gate_setting!(gate_runtime_surface);
+    suppression.insert("gating".to_string(), serde_json::Value::Object(gating));
+    root.insert(
+        "suppression_policy".to_string(),
+        serde_json::Value::Object(suppression),
+    );
+
+    let report = serde_json::Value::Object(root);
+
+    let format = args.format.unwrap_or(OutputFormat::Text);
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_resolved_config_text(&report, ""));
+    }
+    Ok(())
+}
+
+/// Flatten a `--show-config` JSON tree of `{"value": ..., "source": ...}`
+/// leaves into `dotted.path = value  (source)` text lines.
+fn render_resolved_config_text(value: &serde_json::Value, prefix: &str) -> String {
+    let mut out = String::new();
+    match value {
+        serde_json::Value::Object(map)
+            if map.len() == 2 && map.contains_key("value") && map.contains_key("source") =>
+        {
+            let source = map["source"].as_str().unwrap_or("?");
+            let rendered = match &map["value"] {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => "<none>".to_string(),
+                other => other.to_string(),
+            };
+            out.push_str(&format!("{prefix} = {rendered}  ({source})\n"));
+        }
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let child_prefix = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                out.push_str(&render_resolved_config_text(child, &child_prefix));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                out.push_str(&render_resolved_config_text(item, &format!("{prefix}[{i}]")));
+            }
+        }
+        other => {
+            out.push_str(&format!("{prefix} = {other}\n"));
+        }
+    }
+    out
 }
 
 /// The command-line layer of the manifest precedence chain.

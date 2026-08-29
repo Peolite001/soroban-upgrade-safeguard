@@ -47,7 +47,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    
 2. **Clone Your Fork**: Clone your personal fork locally to your machine:
    ```bash
-   git clone [https://github.com/](https://github.com/)<your-username>/soroban-upgrade-safeguard.git
+   git clone https://github.com/<your-username>/soroban-upgrade-safeguard.git
    cd soroban-upgrade-safeguard
    cargo build
    ```
@@ -342,6 +342,12 @@ For a complete walkthrough of every coordinated change required -- stable identi
 5. Be responsive to review feedback. Small follow-up commits during review are fine; we can squash on merge.
 
 ## Reporting Bugs
+
+If the failure happens while a WASM file is loading or decoding — a
+validation error, an interface that comes back unexpectedly empty, an
+"unsupported contract" error, or a resource-limit rejection — check the
+[Troubleshooting Loader Failures](loader-troubleshooting.md) guide first;
+it covers the common causes and next actions for each of those cases.
 
 A good bug report includes:
 
