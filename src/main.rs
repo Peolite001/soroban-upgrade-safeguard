@@ -1567,6 +1567,19 @@ fn run_stream(args: &StreamArgs) -> Result<()> {
 
 /// Re-render a stored JSON report as text or Markdown.
 fn run_render(args: &RenderArgs) -> Result<()> {
+    if args.report != Path::new("-") {
+        let metadata = std::fs::metadata(&args.report).with_context(|| {
+            format!("Failed to inspect report path: {}", args.report.display())
+        })?;
+
+        if metadata.is_dir() {
+            anyhow::bail!(
+                "Input '{}' is a directory; expected a saved JSON report file.",
+                args.report.display()
+            );
+        }
+    }
+
     let raw = if args.report == Path::new("-") {
         std::io::read_to_string(std::io::stdin()).context("Failed to read report from stdin")?
     } else {
