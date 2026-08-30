@@ -2716,15 +2716,20 @@ fn compare_batch_pair(
     let pair_suppressions = match suppressions_for_pair(settings, config_cache) {
         Ok(suppressions) => suppressions,
         Err(e) => {
-            let error = e.to_string();
+            let enriched_error = format!(
+                "pair '{}' (id: {}): {}",
+                contract_name,
+                contract_id,
+                e
+            );
             progress(format!(
                 "  ⚠️  Failed to load suppression config for '{}': {}",
                 contract_name,
-                error.red()
+                e.to_string().red()
             ));
             let report = synthesize_error_report(
                 &contract_name,
-                &error,
+                &enriched_error,
                 settings.strict.value,
                 settings.no_timestamp.value,
             );
@@ -2736,7 +2741,7 @@ fn compare_batch_pair(
                 new_path: Some(pair.new.clone()),
                 old_storage_schema: pair.old_storage_schema.clone(),
                 new_storage_schema: pair.new_storage_schema.clone(),
-                error,
+                error: enriched_error,
                 report,
             };
         }
@@ -2804,7 +2809,13 @@ fn compare_batch_pair(
                     report.with_symlinks(old_wasm.symlink.clone(), new_wasm.symlink.clone())
                 }
                 Err(e) => {
-                    pair_error = Some(e.to_string());
+                    let enriched_error = format!(
+                        "pair '{}' (id: {}): {}",
+                        contract_name,
+                        contract_id,
+                        e
+                    );
+                    pair_error = Some(enriched_error.clone());
                     progress(format!(
                         "  ⚠️  Comparison failed for '{}': {}",
                         contract_name,
@@ -2812,7 +2823,7 @@ fn compare_batch_pair(
                     ));
                     synthesize_error_report(
                         &contract_name,
-                        &e.to_string(),
+                        &enriched_error,
                         settings.strict.value,
                         settings.no_timestamp.value,
                     )
@@ -2821,7 +2832,13 @@ fn compare_batch_pair(
             }
         }
         (Err(e), _) | (_, Err(e)) => {
-            pair_error = Some(e.to_string());
+            let enriched_error = format!(
+                "pair '{}' (id: {}): {}",
+                contract_name,
+                contract_id,
+                e
+            );
+            pair_error = Some(enriched_error.clone());
             progress(format!(
                 "  ⚠️  Failed to load contract files for '{}': {}",
                 contract_name,
@@ -2829,7 +2846,7 @@ fn compare_batch_pair(
             ));
             synthesize_error_report(
                 &contract_name,
-                &e.to_string(),
+                &enriched_error,
                 settings.strict.value,
                 settings.no_timestamp.value,
             )
@@ -5216,6 +5233,18 @@ fn scan_directories(
             let new_path = new_dir.join(filename);
             let name = path.file_stem().and_then(|s| s.to_str()).map(String::from);
             if new_path.exists() {
+                // Reject self-comparison in directory scan mode too
+                use crate::manifest::canonical_identity;
+                if canonical_identity(&path) == canonical_identity(&new_path) {
+                    anyhow::bail!(
+                        "Directory scan attempted to compare a file with itself.\n  \
+                         file: {}\n  old-dir: {}\n  new-dir: {}\n\
+                         A comparison requires two distinct build inputs (old and new).",
+                        path.display(),
+                        old_dir.display(),
+                        new_dir.display()
+                    );
+                }
                 let derived = name
                     .clone()
                     .unwrap_or_else(|| filename.to_string_lossy().to_string());
@@ -5276,7 +5305,34 @@ fn scan_directories(
 
     if pairs.is_empty() && gaps.is_empty() {
         if new_only.is_empty() {
-            anyhow::bail!("No .wasm files found in '{}'", old_dir.display());
+            // Both directories contain no WASM files. Check if directories are truly empty
+            // or just contain no WASM artifacts, for a better diagnostic.
+            let old_has_files = std::fs::read_dir(old_dir)?
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().is_file());
+            let new_has_files = std::fs::read_dir(new_dir)?
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().is_file());
+            
+            if !old_has_files && !new_has_files {
+                anyhow::bail!(
+                    "Both batch directories are empty.\n  \
+                     old-dir: {}\n  \
+                     new-dir: {}\n\
+                     Directory scan requires at least one .wasm artifact in the old directory.",
+                    old_dir.display(),
+                    new_dir.display()
+                );
+            } else {
+                anyhow::bail!(
+                    "No .wasm files found in batch directories.\n  \
+                     old-dir: {}\n  \
+                     new-dir: {}\n\
+                     Directory scan requires .wasm artifacts. Check that the directories contain built contract files.",
+                    old_dir.display(),
+                    new_dir.display()
+                );
+            }
         }
         // Every artifact sits on the new side only. Bailing with just "no files
         // in the old directory" would describe the symptom; reversed directory
