@@ -244,3 +244,126 @@ fn batch_conflicting_options_exit_with_error() {
         "positional args + manifest must fail"
     );
 }
+
+#[test]
+fn batch_directory_ignores_unrelated_files() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dir_ignore_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
+
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("a.wasm")).expect("copy wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("a.wasm")).expect("copy wasm");
+
+    std::fs::write(old_dir.join("readme.txt"), "project notes").expect("write readme");
+    std::fs::write(old_dir.join("config.json"), "{}").expect("write json");
+    std::fs::write(old_dir.join("Makefile"), "build:\n\tcargo build").expect("write makefile");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 0, "all-safe batch must exit 0");
+    assert!(
+        stdout.contains("Overall Status: ✅ PASSED"),
+        "stdout must show overall passed"
+    );
+    assert!(
+        stdout.contains("a: ✅ PASSED"),
+        "stdout must list the valid WASM pair"
+    );
+    assert!(
+        !stdout.contains("readme.txt"),
+        "unrelated readme.txt must not appear in output"
+    );
+    assert!(
+        !stdout.contains("config.json"),
+        "unrelated config.json must not appear in output"
+    );
+    assert!(
+        !stdout.contains("Makefile"),
+        "unrelated Makefile must not appear in output"
+    );
+    assert!(
+        !stderr.contains('⚠'),
+        "stderr must not contain warnings for non-WASM files"
+    );
+    assert!(
+        !stderr.contains("readme.txt"),
+        "stderr must not mention unrelated files"
+    );
+}
+
+#[test]
+fn batch_directory_ignores_unrelated_files_json() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dir_ignore_json_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
+
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("a.wasm")).expect("copy wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("a.wasm")).expect("copy wasm");
+
+    std::fs::write(old_dir.join("notes.txt"), "some notes").expect("write txt");
+    std::fs::write(old_dir.join("data.json"), "{}").expect("write json");
+    std::fs::write(old_dir.join("script"), "echo hello").expect("write script");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .args(["--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+
+    assert_eq!(code, 0);
+    assert_eq!(json["is_safe"], Value::Bool(true), "JSON must report safe");
+
+    let results = json["results"]
+        .as_object()
+        .expect("results must be an object");
+    assert!(
+        results.contains_key("a"),
+        "JSON results must contain the valid WASM pair 'a'"
+    );
+    assert_eq!(
+        results["a"]["is_safe"],
+        Value::Bool(true),
+        "contract 'a' must be safe"
+    );
+
+    assert!(
+        !stdout.contains("notes.txt"),
+        "JSON must not contain unrelated txt file"
+    );
+    assert!(
+        !stdout.contains("data.json"),
+        "JSON must not contain unrelated json file"
+    );
+    assert!(
+        !stdout.contains("script"),
+        "JSON must not contain unrelated extensionless file"
+    );
+    assert!(
+        !stderr.contains('⚠'),
+        "stderr must not contain warnings for non-WASM files"
+    );
+}
