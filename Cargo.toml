@@ -43,6 +43,7 @@ libc = { version = "0.2", optional = true }
 # tests/diff_properties.rs and tests/fuzz_walk.rs). Dev-only: it does not
 # affect the shipped binary.
 proptest = "1"
+regex = "1"
 public-api = "0.52.1"
 rustdoc-json = "0.9.10"
 rustup-toolchain = "0.1.10"
