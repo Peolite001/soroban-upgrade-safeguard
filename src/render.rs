@@ -62,6 +62,12 @@ pub struct Provenance {
     /// neither input was.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub symlinks: Vec<crate::loader::SymlinkResolution>,
+    /// The Git commit (full SHA) the tool was invoked from, when the working
+    /// directory is inside a Git repository and the `git` binary is
+    /// available. `None` otherwise — Git metadata is captured on a
+    /// best-effort basis and is never required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<String>,
 }
 
 /// Severity counts, serialized as a nested `counts` object.
@@ -340,6 +346,9 @@ impl RenderableReport {
                 &format!("Symlink:  {} -> {}\n", symlink.requested, symlink.resolved).dimmed(),
             );
         }
+        if let Some(ref commit) = self.provenance.git_commit {
+            block.push_str(&format!("Commit:   {commit}\n").dimmed());
+        }
         block.push_str(
             &"────────────────────────────────────────\n"
                 .dimmed()
@@ -389,6 +398,9 @@ impl RenderableReport {
                 markdown_code_span(&symlink.requested),
                 markdown_code_span(&symlink.resolved)
             ));
+        }
+        if let Some(ref commit) = self.provenance.git_commit {
+            block.push_str(&format!("- **Commit**: {}\n", markdown_code_span(commit)));
         }
         block.push('\n');
         block
