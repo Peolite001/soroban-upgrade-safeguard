@@ -291,7 +291,7 @@ when a CI log should contain the report and nothing else.
 
 ### Watch mode
 
-Re-run the comparison automatically when input WASM files change:
+Re-run the comparison automatically when input files change:
 
 ```bash
 soroban-upgrade-safeguard ./wasm/v1.wasm ./wasm/v2.wasm --watch
@@ -304,6 +304,43 @@ Watch mode:
 - Handles transient missing files gracefully (e.g. build tools that delete and recreate).
 - Keeps the process running regardless of comparison verdict (non-zero exit codes do NOT exit the watcher).
 - Exit with `Ctrl+C`.
+
+Watch mode also works at repository scale, for both directory comparisons and
+batch manifests. In that case it builds an input dependency graph instead of
+re-running the whole batch on every write:
+
+```bash
+# watch a whole directory comparison
+soroban-upgrade-safeguard --old-dir ./artifacts/v1 --new-dir ./artifacts/v2 --watch
+
+# watch a batch manifest (TOML or JSON, `include` chain included)
+soroban-upgrade-safeguard --manifest release.toml --watch
+```
+
+For a batch, every pair's inputs — its two WASM builds, its storage schemas,
+its suppression config, and the manifest file(s) that defined it — are tracked.
+Filesystem events are normalized and debounced, then mapped to only the pairs
+that actually read the touched file. Untouched pairs keep their last known
+verdict, and the full, deterministically ordered aggregate report is re-rendered
+after each cycle. Specifically:
+
+- A **WASM/schema/config** change re-analyzes exactly the pairs that read it.
+- A **manifest edit** re-resolves the composition (pairs may appear, disappear,
+  or pick up new settings) and re-analyzes only the pairs whose identity or
+  settings changed.
+- A **directory scan** change re-derives the pair set: a removed artifact becomes
+  a Critical gap, a restored one heals, a newly added pair appears.
+- **Atomic replacement** (a build tool writing to a temp file then renaming it
+  into place, possibly several times in quick succession) is coalesced into a
+  single cycle, and the watch process's own report/status writes are ignored so
+  it never reacts to itself.
+- A pair that fails to load or analyze is isolated as its own error while every
+  unrelated contract retains its result; a transiently missing or mid-edit input
+  is reported without terminating the watcher.
+
+Use `--watch-status-file <path>` with any watch mode to have the process write
+an atomically-updated JSON status document (state, cycle number, timestamps,
+verdict) that an external build system or service manager can poll cheaply.
 
 ### Comparing two directories of builds
 
