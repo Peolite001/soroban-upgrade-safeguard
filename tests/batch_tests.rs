@@ -448,184 +448,124 @@ fn batch_conflicting_options_exit_with_error() {
 }
 
 #[test]
-fn batch_manifest_writes_per_contract_reports_to_output_dir() {
-    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("per_contract_reports");
-    let output_dir = tmp_dir.join("reports");
-    std::fs::create_dir_all(&tmp_dir).expect("failed to create tmp dir");
+fn batch_directory_ignores_unrelated_files() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dir_ignore_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
 
-    let manifest_content = format!(
-        r#"
-        [[pairs]]
-        old = {:?}
-        new = {:?}
-        name = "clean_contract"
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
 
-        [[pairs]]
-        old = {:?}
-        new = {:?}
-        name = "breaking_contract"
-        "#,
-        wasm("v1.wasm").to_str().unwrap(),
-        wasm("v1.wasm").to_str().unwrap(),
-        wasm("v1.wasm").to_str().unwrap(),
-        wasm("v2.wasm").to_str().unwrap()
-    );
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("a.wasm")).expect("copy wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("a.wasm")).expect("copy wasm");
 
-    let manifest_path = write_manifest("manifest_per_contract.toml", &manifest_content);
+    std::fs::write(old_dir.join("readme.txt"), "project notes").expect("write readme");
+    std::fs::write(old_dir.join("config.json"), "{}").expect("write json");
+    std::fs::write(old_dir.join("Makefile"), "build:\n\tcargo build").expect("write makefile");
 
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
-        .arg("--manifest")
-        .arg(&manifest_path)
-        .arg("--per-contract-output-dir")
-        .arg(&output_dir)
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
         .output()
         .expect("failed to run binary");
 
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
     let code = output.status.code().expect("process terminated by signal");
-    assert_eq!(code, 1, "batch run with breaking contract must exit 1");
 
-    let clean_path = output_dir.join("clean_contract.txt");
-    let breaking_path = output_dir.join("breaking_contract.txt");
-
-    assert!(clean_path.exists(), "expected clean contract report file");
+    assert_eq!(code, 0, "all-safe batch must exit 0");
     assert!(
-        breaking_path.exists(),
-        "expected breaking contract report file"
-    );
-
-    let clean_contents = std::fs::read_to_string(&clean_path).expect("failed to read clean report");
-    let breaking_contents =
-        std::fs::read_to_string(&breaking_path).expect("failed to read breaking report");
-
-    assert!(
-        clean_contents.contains("SOROBAN UPGRADE SAFETY REPORT"),
-        "clean report missing header"
+        stdout.contains("Overall Status: ✅ PASSED"),
+        "stdout must show overall passed"
     );
     assert!(
-        breaking_contents.contains("SOROBAN UPGRADE SAFETY REPORT"),
-        "breaking report missing header"
+        stdout.contains("a: ✅ PASSED"),
+        "stdout must list the valid WASM pair"
+    );
+    assert!(
+        !stdout.contains("readme.txt"),
+        "unrelated readme.txt must not appear in output"
+    );
+    assert!(
+        !stdout.contains("config.json"),
+        "unrelated config.json must not appear in output"
+    );
+    assert!(
+        !stdout.contains("Makefile"),
+        "unrelated Makefile must not appear in output"
+    );
+    assert!(
+        !stderr.contains('⚠'),
+        "stderr must not contain warnings for non-WASM files"
+    );
+    assert!(
+        !stderr.contains("readme.txt"),
+        "stderr must not mention unrelated files"
     );
 }
 
 #[test]
-fn batch_manifest_writes_per_contract_custom_template() {
-    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("per_contract_custom_template");
-    let output_dir = tmp_dir.join("reports");
-    std::fs::create_dir_all(&tmp_dir).expect("failed to create tmp dir");
+fn batch_directory_ignores_unrelated_files_json() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dir_ignore_json_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
 
-    let manifest_content = format!(
-        r#"
-        [[pairs]]
-        old = {:?}
-        new = {:?}
-        name = "clean_contract"
-        id = "my-clean-id"
-        "#,
-        wasm("v1.wasm").to_str().unwrap(),
-        wasm("v1.wasm").to_str().unwrap()
-    );
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
 
-    let manifest_path = write_manifest("manifest_custom_template.toml", &manifest_content);
+    std::fs::copy(wasm("v1.wasm"), old_dir.join("a.wasm")).expect("copy wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join("a.wasm")).expect("copy wasm");
+
+    std::fs::write(old_dir.join("notes.txt"), "some notes").expect("write txt");
+    std::fs::write(old_dir.join("data.json"), "{}").expect("write json");
+    std::fs::write(old_dir.join("script"), "echo hello").expect("write script");
 
     let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
-        .arg("--manifest")
-        .arg(&manifest_path)
-        .arg("--per-contract-output-dir")
-        .arg(&output_dir)
-        .arg("--per-contract-output-name-template")
-        .arg("{id}_custom.{ext}")
-        .arg("--format")
-        .arg("json")
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .args(["--format", "json"])
         .output()
         .expect("failed to run binary");
 
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
     let code = output.status.code().expect("process terminated by signal");
-    assert_eq!(code, 0, "batch run must exit 0");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
 
-    let clean_path = output_dir.join("my-clean-id_custom.json");
+    assert_eq!(code, 0);
+    assert_eq!(json["is_safe"], Value::Bool(true), "JSON must report safe");
+
+    let results = json["results"]
+        .as_object()
+        .expect("results must be an object");
     assert!(
-        clean_path.exists(),
-        "expected custom-named report file to exist"
+        results.contains_key("a"),
+        "JSON results must contain the valid WASM pair 'a'"
     );
-}
-
-#[test]
-fn batch_manifest_invalid_template_placeholder_fails() {
-    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("invalid_template");
-    let output_dir = tmp_dir.join("reports");
-
-    let manifest_content = format!(
-        r#"
-        [[pairs]]
-        old = {:?}
-        new = {:?}
-        name = "clean_contract"
-        "#,
-        wasm("v1.wasm").to_str().unwrap(),
-        wasm("v1.wasm").to_str().unwrap()
+    assert_eq!(
+        results["a"]["is_safe"],
+        Value::Bool(true),
+        "contract 'a' must be safe"
     );
 
-    let manifest_path = write_manifest("manifest_invalid_template.toml", &manifest_content);
-
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
-        .arg("--manifest")
-        .arg(&manifest_path)
-        .arg("--per-contract-output-dir")
-        .arg(&output_dir)
-        .arg("--per-contract-output-name-template")
-        .arg("{invalid_placeholder}.{ext}")
-        .output()
-        .expect("failed to run binary");
-
-    let code = output.status.code().expect("process terminated by signal");
-    assert_eq!(code, 1, "batch run with invalid template must fail");
-    let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("Unknown placeholder") || stderr.contains("invalid_placeholder"),
-        "should report placeholder error"
+        !stdout.contains("notes.txt"),
+        "JSON must not contain unrelated txt file"
     );
-}
-
-#[test]
-fn batch_manifest_template_collision_fails() {
-    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("template_collision");
-    let output_dir = tmp_dir.join("reports");
-
-    let manifest_content = format!(
-        r#"
-        [[pairs]]
-        old = {:?}
-        new = {:?}
-        name = "clean_1"
-
-        [[pairs]]
-        old = {:?}
-        new = {:?}
-        name = "clean_2"
-        "#,
-        wasm("v1.wasm").to_str().unwrap(),
-        wasm("v1.wasm").to_str().unwrap(),
-        wasm("v1.wasm").to_str().unwrap(),
-        wasm("v1.wasm").to_str().unwrap()
-    );
-
-    let manifest_path = write_manifest("manifest_collision.toml", &manifest_content);
-
-    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
-        .arg("--manifest")
-        .arg(&manifest_path)
-        .arg("--per-contract-output-dir")
-        .arg(&output_dir)
-        .arg("--per-contract-output-name-template")
-        .arg("static_name.{ext}")
-        .output()
-        .expect("failed to run binary");
-
-    let code = output.status.code().expect("process terminated by signal");
-    assert_eq!(code, 1, "batch run with template collision must fail");
-    let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("collision"),
-        "should report collision error"
+        !stdout.contains("data.json"),
+        "JSON must not contain unrelated json file"
+    );
+    assert!(
+        !stdout.contains("script"),
+        "JSON must not contain unrelated extensionless file"
+    );
+    assert!(
+        !stderr.contains('⚠'),
+        "stderr must not contain warnings for non-WASM files"
     );
 }
