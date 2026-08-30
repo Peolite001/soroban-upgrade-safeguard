@@ -24,8 +24,11 @@ fn wasm(name: &str) -> PathBuf {
 }
 
 fn tmp(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("readme-smoke-{}-{}", std::process::id(), name))
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "readme-smoke-{}-{}",
+        std::process::id(),
+        name
+    ))
 }
 
 fn bin() -> Command {
@@ -60,7 +63,7 @@ fn readme_basic_comparison_reports_the_known_breaking_upgrade() {
 
     assert_eq!(result.code, 1, "v1 -> v2 is a known breaking upgrade");
     assert!(
-        result.stdout.contains("[CRITICAL]") || result.stdout.contains("[FAIL]"),
+        result.stdout.contains("Critical breaking changes detected"),
         "text report should surface the breaking verdict, got: {}",
         result.stdout
     );
@@ -118,7 +121,10 @@ fn readme_lockfile_generate_and_gate_round_trip() {
         "lockfile generation should succeed: {}",
         generate.stderr
     );
-    assert!(lockfile.exists(), "lockfile command should write its output file");
+    assert!(
+        lockfile.exists(),
+        "lockfile command should write its output file"
+    );
 
     // The same build's interface must match the lockfile it was generated from.
     let gate = run(|cmd| {
@@ -204,7 +210,10 @@ fn readme_quiet_still_gates_on_json_with_no_narration() {
             .arg("--quiet");
     });
 
-    assert_eq!(result.code, 1, "quiet must not change the verdict/exit code");
+    assert_eq!(
+        result.code, 1,
+        "quiet must not change the verdict/exit code"
+    );
     assert!(
         serde_json::from_str::<serde_json::Value>(&result.stdout).is_ok(),
         "stdout should be clean JSON with no narration mixed in"

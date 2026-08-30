@@ -31,6 +31,9 @@ use soroban_upgrade_safeguard::{
     suppression::{SuppressionConfig, DEFAULT_CONFIG_FILE},
 };
 
+#[cfg(feature = "watch")]
+mod watch;
+
 /// Environment variable providing a fallback suppression config path when
 /// `--config` is not passed on the command line. See `--config`'s own help
 /// text. CI systems can set this once instead of repeating `--config` on
@@ -265,7 +268,7 @@ impl std::str::FromStr for OutputSpec {
             });
         }
         if let Some((fmt, path)) = s.split_once(':') {
-            let format: OutputFormat = fmt.parse().map_err(|_| {
+            let _format: OutputFormat = fmt.parse().map_err(|_| {
                 format!("Invalid format '{fmt}'. Supported: {SUPPORTED_OUTPUT_FORMATS}")
             })?;
             if path.trim().is_empty() {
@@ -575,7 +578,10 @@ struct Args {
     )]
     per_contract_output_name_template: String,
 
-    /// Watch mode: re-run comparison when input files change
+    /// Watch mode: re-run comparison when input files change. Works for a
+    /// single pair, a `--manifest` batch, or `--old-dir`/`--new-dir` directory
+    /// comparison. For batches, events are mapped to only the affected pairs
+    /// while the full aggregate verdict is re-rendered.
     #[arg(long)]
     watch: bool,
 
@@ -2010,14 +2016,25 @@ fn main() -> Result<()> {
     run_single(&args, &outputs, &suppressions, &progress)
 }
 
-fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> Result<()> {
-    let cli = cli_settings(args)?;
+/// The result of resolving a batch mode run out of its inputs: the composed
+/// manifest (if any), the pairs, and the directory-mode gap/new-only lists.
+struct BuiltBatch {
+    resolved_manifest: Option<manifest::ResolvedManifest>,
+    pairs: Vec<BatchPair>,
+    gaps: Vec<GapContract>,
+    new_only: Vec<NewOnlyContract>,
+}
 
-    // Manifest mode resolves includes, defaults and per-pair overrides up front —
-    // including duplicate-identity detection, so a collision fails before any
-    // pair runs rather than mid-loop with earlier reports already on disk.
-    let (resolved_manifest, pairs, mut gaps, new_only) = if let Some(manifest_path) = &args.manifest
-    {
+/// Resolve a batch run into its ready-to-execute form, shared by the single-pass
+/// batch loop and the incremental watch loop.
+///
+/// Manifest mode resolves includes, defaults and per-pair overrides up front —
+/// including duplicate-identity detection, so a collision fails before any pair
+/// runs rather than mid-loop with earlier reports already on disk. Directory
+/// mode sweeps both directories for shared-name `.wasm` artifacts.
+fn build_batch(args: &Args) -> Result<BuiltBatch> {
+    let cli = cli_settings(args)?;
+    let (resolved_manifest, pairs, gaps, new_only) = if let Some(manifest_path) = &args.manifest {
         let resolved = manifest::resolve(manifest_path, &cli)?;
         let pairs: Vec<BatchPair> = resolved
             .pairs
@@ -2037,6 +2054,39 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         )?;
         (None, pairs, gaps, new_only)
     };
+    Ok(BuiltBatch {
+        resolved_manifest,
+        pairs,
+        gaps,
+        new_only,
+    })
+}
+
+fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> Result<()> {
+    // Watch mode for a whole batch re-runs only the pairs whose inputs
+    // changed, rather than recomputing every pair on every file event.
+    if args.watch {
+        #[cfg(feature = "watch")]
+        {
+            return crate::watch::run_batch_watch(args, outputs, progress);
+        }
+        #[cfg(not(feature = "watch"))]
+        {
+            eprintln!("Warning: --watch is not available in this build. Rebuild with the 'watch' feature enabled.");
+            return Ok(());
+        }
+    }
+
+    // Manifest mode resolves includes, defaults and per-pair overrides up front —
+    // including duplicate-identity detection, so a collision fails before any
+    // pair runs rather than mid-loop with earlier reports already on disk.
+    let built = build_batch(args)?;
+    let (resolved_manifest, pairs, mut gaps, new_only) = (
+        built.resolved_manifest,
+        built.pairs,
+        built.gaps,
+        built.new_only,
+    );
 
     if args.per_contract_output_dir.is_some() {
         validate_template(&args.per_contract_output_name_template)?;
@@ -2138,161 +2188,22 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             gap.name.bold().red()
         ));
 
-        let gap_report = report::SafetyReport {
-            call_abi: soroban_upgrade_safeguard::CallAbiCompatibility::default(),
-            critical_count: 1,
-            warning_count: 0,
-            info_count: 0,
-            suppressed_count: 0,
-            suppressed_critical_count: 0,
-            suppressed_warning_count: 0,
-            suppressed_info_count: 0,
-            total_findings: 1,
-            is_safe: false,
-            strict: args.strict,
-            critical_root_count: 1,
-            cascade_critical_count: 0,
-            rpc_provenance: None,
-            old_symlink: None,
-            new_symlink: None,
-            old_interface_hash: None,
-            new_interface_hash: None,
-            no_timestamp: args.no_timestamp,
-            old_spec_summary: None,
-            new_spec_summary: Some("(contract missing from new deployment)".to_string()),
-            scope: report::AnalysisScope::default(),
-            metrics: None,
-            axis_verdicts: {
-                let mut verdicts = std::collections::HashMap::new();
-                verdicts.insert(diff::CompatibilityAxis::CallAbi, report::AxisStatus::Failed);
-                verdicts.insert(
-                    diff::CompatibilityAxis::StorageLayout,
-                    report::AxisStatus::Passed,
-                );
-                verdicts.insert(
-                    diff::CompatibilityAxis::EventIndexer,
-                    report::AxisStatus::Passed,
-                );
-                verdicts.insert(
-                    diff::CompatibilityAxis::SourceLevel,
-                    report::AxisStatus::Passed,
-                );
-                verdicts.insert(
-                    diff::CompatibilityAxis::RuntimeSurface,
-                    report::AxisStatus::Passed,
-                );
-                verdicts
-            },
-            gated_axes: {
-                let mut gated = std::collections::HashSet::new();
-                gated.insert(diff::CompatibilityAxis::CallAbi);
-                gated.insert(diff::CompatibilityAxis::StorageLayout);
-                gated.insert(diff::CompatibilityAxis::RuntimeSurface);
-                gated
-            },
-            findings_by_category: {
-                let mut map = std::collections::HashMap::new();
-                map.insert(
-                    "contract-missing-from-new".to_string(),
-                    vec![report::ReportedFinding {
-                        rule_id: "contract_missing_from_new".to_string(),
-                        finding: diff::Finding {
-                            severity: diff::Severity::Critical,
-                            axes: vec![diff::CompatibilityAxis::CallAbi],
-                            category: "contract-missing-from-new".to_string(),
-                            message: format!(
-                                "'{}' exists in the old directory but was not found in the new directory. \
-                                 This contract would be removed from the deployment, breaking all clients \
-                                 that depend on it.",
-                                gap.name
-                            ),
-                            type_name: None,
-                            target: Some(gap.name.clone()),
-                            root_target: None,
-                            change: None,
-                        },
-                        axes: vec![diff::CompatibilityAxis::CallAbi],
-                        suppressed: false,
-                        suppression_reason: None,
-                        remediation: Some(format!(
-                            "Ensure the .wasm for '{}' is present in the new directory, or add it to \
-                             the --suppressions file if removal is intentional.",
-                            gap.name
-                        )),
-                        migrated_by: None,
-                    }],
-                );
-                map
-            },
-            migrated_count: 0,
-            migration_status:
-                soroban_upgrade_safeguard::contract_migration::MigrationStatus::NotApplicable,
-            migration_diagnostics: Vec::new(),
-            empirical: false,
-            empirical_findings: Vec::new(),
-            budget_violations: Vec::new(),
-            settings: report::ReportSettings::default(),
-        };
-
-        let file_outputs: Vec<OutputSpec> = outputs
-            .iter()
-            .filter(|output| output.path.is_some())
-            .cloned()
-            .collect();
-        render_to_outputs(
-            &gap_report,
-            &file_outputs,
-            args.explain,
-            args.ascii,
-            args.plain,
+        let gap_result = gap_to_result(&gap, args);
+        render_gap_outputs(
+            &gap_result,
+            gap_result.name(),
+            args,
+            outputs,
             width,
-            Some(&gap.name),
             progress,
         )?;
-
-        if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
-            let content = render_single(
-                &gap_report,
-                args.format.unwrap_or(OutputFormat::Text),
-                args.explain,
-                args.ascii,
-                args.plain,
-                width,
-            )?;
-            write_report_file(
-                output_dir,
-                &gap.name,
-                &gap.name,
-                &args.per_contract_output_name_template,
-                args.format.unwrap_or(OutputFormat::Text),
-                &content,
-            )?;
-        }
-
-        results.push(BatchResult::Error {
-            id: gap.name.clone(),
-            name: gap.name,
-            labels: Vec::new(),
-            old_path: gap.old_path,
-            new_path: None,
-            old_storage_schema: None,
-            new_storage_schema: None,
-            error: "contract is missing from the new deployment".to_string(),
-            report: gap_report,
-        });
+        results.push(gap_result);
         overall_safe = false;
     }
 
     // Process each regular pair with error-handling (per-pair failures do not abort the batch)
     for (i, pair) in pairs.iter().enumerate() {
         let contract_name = pair.name.clone();
-        let contract_id = pair.id.clone();
-        let contract_labels = pair.labels.clone();
-        let settings = &pair.settings;
-        let pair_suppressions = suppressions_for_pair(settings, &mut config_cache)?;
-        let explain = settings.explain.value;
-        let ascii = settings.ascii.value || args.ascii;
-        let plain = args.plain;
 
         if !seen_names.insert(contract_name.clone()) {
             anyhow::bail!(
@@ -2308,167 +2219,20 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             contract_name.bold()
         ));
 
-        let mut pair_error = None;
-        let report = match (
-            load_wasm_input(
-                &pair.old,
-                &remote_config,
-                &oci_config,
-                args.no_symlinks,
-                progress,
-            ),
-            load_wasm_input(
-                &pair.new,
-                &remote_config,
-                &oci_config,
-                args.no_symlinks,
-                progress,
-            ),
-        ) {
-            (Ok(old_wasm), Ok(new_wasm)) => {
-                match load_pair_storage_schemas(pair).and_then(|storage_schemas| {
-                    if let Some(storage_schemas) = storage_schemas.as_ref() {
-                        let mut report =
-                            soroban_upgrade_safeguard::compare_wasm_bytes_with_options(
-                                &old_wasm.bytes,
-                                &new_wasm.bytes,
-                                &soroban_upgrade_safeguard::CompareOptions {
-                                    suppressions: Some(&pair_suppressions),
-                                    explain,
-                                    strict: settings.strict.value,
-                                    storage_schemas: Some((
-                                        &storage_schemas.old,
-                                        &storage_schemas.new,
-                                    )),
-                                    lineage_store: None,
-                                    contract: Some(contract_name.as_str()),
-                                },
-                            )?;
-                        report.set_no_timestamp(settings.no_timestamp.value);
-                        Ok(report)
-                    } else {
-                        compare_contracts(
-                            &ContractComparison {
-                                old_bytes: &old_wasm.bytes,
-                                old_path: &old_wasm.path,
-                                new_bytes: &new_wasm.bytes,
-                                new_path: &new_wasm.path,
-                                suppressions: &pair_suppressions,
-                                explain,
-                                strict: settings.strict.value,
-                                no_timestamp: settings.no_timestamp.value,
-                                empirical: args.empirical || args.empirical_file.is_some(),
-                                empirical_file: args.empirical_file.as_deref(),
-                                contract_id: None,
-                                rpc_url: None,
-                                rpc_headers: &args.rpc_headers,
-                                rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
-                                lineage_store: None,
-                                contract: Some(contract_name.as_str()),
-                            },
-                            progress,
-                        )
-                    }
-                }) {
-                    Ok(report) => {
-                        report.with_symlinks(old_wasm.symlink.clone(), new_wasm.symlink.clone())
-                    }
-                    Err(e) => {
-                        pair_error = Some(e.to_string());
-                        progress(format!(
-                            "  ⚠️  Comparison failed for '{}': {}",
-                            contract_name,
-                            e.to_string().red()
-                        ));
-                        synthesize_error_report(
-                            &contract_name,
-                            &e.to_string(),
-                            settings.strict.value,
-                            settings.no_timestamp.value,
-                        )
-                        .with_symlinks(old_wasm.symlink.clone(), new_wasm.symlink.clone())
-                    }
-                }
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                pair_error = Some(e.to_string());
-                progress(format!(
-                    "  ⚠️  Failed to load contract files for '{}': {}",
-                    contract_name,
-                    e.to_string().red()
-                ));
-                synthesize_error_report(
-                    &contract_name,
-                    &e.to_string(),
-                    settings.strict.value,
-                    settings.no_timestamp.value,
-                )
-            }
-        };
+        let result = compare_batch_pair(
+            pair,
+            args,
+            &remote_config,
+            &oci_config,
+            &mut config_cache,
+            progress,
+        );
+        render_pair_outputs(&result, pair, args, outputs, width, progress)?;
 
-        if !report.is_safe() {
+        if !result.report().is_safe() {
             overall_safe = false;
         }
-
-        let file_outputs: Vec<OutputSpec> = outputs
-            .iter()
-            .filter(|output| output.path.is_some())
-            .cloned()
-            .collect();
-        render_to_outputs(
-            &report,
-            &file_outputs,
-            explain,
-            ascii,
-            plain,
-            width,
-            Some(&contract_name),
-            progress,
-        )?;
-
-        if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
-            let content = render_single(
-                &report,
-                args.format.unwrap_or(OutputFormat::Text),
-                explain,
-                ascii,
-                plain,
-                width,
-            )?;
-            write_report_file(
-                output_dir,
-                &contract_name,
-                &contract_id,
-                &args.per_contract_output_name_template,
-                args.format.unwrap_or(OutputFormat::Text),
-                &content,
-            )?;
-        }
-
-        if let Some(error) = pair_error {
-            results.push(BatchResult::Error {
-                name: contract_name,
-                id: contract_id,
-                labels: contract_labels,
-                old_path: pair.old.clone(),
-                new_path: Some(pair.new.clone()),
-                old_storage_schema: pair.old_storage_schema.clone(),
-                new_storage_schema: pair.new_storage_schema.clone(),
-                error,
-                report,
-            });
-        } else {
-            results.push(BatchResult::Success {
-                name: contract_name,
-                id: contract_id,
-                labels: contract_labels,
-                old_path: pair.old.clone(),
-                new_path: pair.new.clone(),
-                old_storage_schema: pair.old_storage_schema.clone(),
-                new_storage_schema: pair.new_storage_schema.clone(),
-                report,
-            });
-        }
+        results.push(result);
         progress("\n----------------------------------------\n".to_string());
     }
 
@@ -2684,6 +2448,392 @@ impl BatchResult {
             }
         }
     }
+}
+
+/// Run one batch pair end to end, isolating every failure into a
+/// `BatchResult::Error` rather than aborting the enclosing run.
+///
+/// This is the single compute path shared by the one-shot batch loop and the
+/// incremental watch loop, so a pair-level error (a missing WASM, an
+/// unparseable schema, a broken suppression config, a comparison failure)
+/// degrades exactly one pair's result and leaves every other pair untouched.
+fn compare_batch_pair(
+    pair: &BatchPair,
+    args: &Args,
+    remote_config: &RemoteFetchConfig,
+    oci_config: &OciFetchConfig,
+    config_cache: &mut HashMap<PathBuf, SuppressionConfig>,
+    progress: &dyn Fn(String),
+) -> BatchResult {
+    let contract_name = pair.name.clone();
+    let contract_id = pair.id.clone();
+    let contract_labels = pair.labels.clone();
+    let settings = &pair.settings;
+    let explain = settings.explain.value;
+
+    let pair_suppressions = match suppressions_for_pair(settings, config_cache) {
+        Ok(suppressions) => suppressions,
+        Err(e) => {
+            let error = e.to_string();
+            progress(format!(
+                "  ⚠️  Failed to load suppression config for '{}': {}",
+                contract_name,
+                error.red()
+            ));
+            let report = synthesize_error_report(
+                &contract_name,
+                &error,
+                settings.strict.value,
+                settings.no_timestamp.value,
+            );
+            return BatchResult::Error {
+                name: contract_name,
+                id: contract_id,
+                labels: contract_labels,
+                old_path: pair.old.clone(),
+                new_path: Some(pair.new.clone()),
+                old_storage_schema: pair.old_storage_schema.clone(),
+                new_storage_schema: pair.new_storage_schema.clone(),
+                error,
+                report,
+            };
+        }
+    };
+
+    let mut pair_error = None;
+    let report = match (
+        load_wasm_input(
+            &pair.old,
+            remote_config,
+            oci_config,
+            args.no_symlinks,
+            progress,
+        ),
+        load_wasm_input(
+            &pair.new,
+            remote_config,
+            oci_config,
+            args.no_symlinks,
+            progress,
+        ),
+    ) {
+        (Ok(old_wasm), Ok(new_wasm)) => {
+            match load_pair_storage_schemas(pair).and_then(|storage_schemas| {
+                if let Some(storage_schemas) = storage_schemas.as_ref() {
+                    let mut report = soroban_upgrade_safeguard::compare_wasm_bytes_with_options(
+                        &old_wasm.bytes,
+                        &new_wasm.bytes,
+                        &soroban_upgrade_safeguard::CompareOptions {
+                            suppressions: Some(&pair_suppressions),
+                            explain,
+                            strict: settings.strict.value,
+                            storage_schemas: Some((&storage_schemas.old, &storage_schemas.new)),
+                            lineage_store: None,
+                            contract: Some(contract_name.as_str()),
+                        },
+                    )?;
+                    report.set_no_timestamp(settings.no_timestamp.value);
+                    Ok(report)
+                } else {
+                    compare_contracts(
+                        &ContractComparison {
+                            old_bytes: &old_wasm.bytes,
+                            old_path: &old_wasm.path,
+                            new_bytes: &new_wasm.bytes,
+                            new_path: &new_wasm.path,
+                            suppressions: &pair_suppressions,
+                            explain,
+                            strict: settings.strict.value,
+                            no_timestamp: settings.no_timestamp.value,
+                            empirical: args.empirical || args.empirical_file.is_some(),
+                            empirical_file: args.empirical_file.as_deref(),
+                            contract_id: None,
+                            rpc_url: None,
+                            rpc_headers: &args.rpc_headers,
+                            rpc_allow_id_mismatch: args.rpc_allow_id_mismatch,
+                            lineage_store: None,
+                            contract: Some(contract_name.as_str()),
+                        },
+                        progress,
+                    )
+                }
+            }) {
+                Ok(report) => {
+                    report.with_symlinks(old_wasm.symlink.clone(), new_wasm.symlink.clone())
+                }
+                Err(e) => {
+                    pair_error = Some(e.to_string());
+                    progress(format!(
+                        "  ⚠️  Comparison failed for '{}': {}",
+                        contract_name,
+                        e.to_string().red()
+                    ));
+                    synthesize_error_report(
+                        &contract_name,
+                        &e.to_string(),
+                        settings.strict.value,
+                        settings.no_timestamp.value,
+                    )
+                    .with_symlinks(old_wasm.symlink.clone(), new_wasm.symlink.clone())
+                }
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            pair_error = Some(e.to_string());
+            progress(format!(
+                "  ⚠️  Failed to load contract files for '{}': {}",
+                contract_name,
+                e.to_string().red()
+            ));
+            synthesize_error_report(
+                &contract_name,
+                &e.to_string(),
+                settings.strict.value,
+                settings.no_timestamp.value,
+            )
+        }
+    };
+
+    if let Some(error) = pair_error {
+        return BatchResult::Error {
+            name: contract_name,
+            id: contract_id,
+            labels: contract_labels,
+            old_path: pair.old.clone(),
+            new_path: Some(pair.new.clone()),
+            old_storage_schema: pair.old_storage_schema.clone(),
+            new_storage_schema: pair.new_storage_schema.clone(),
+            error,
+            report,
+        };
+    }
+    BatchResult::Success {
+        name: contract_name,
+        id: contract_id,
+        labels: contract_labels,
+        old_path: pair.old.clone(),
+        new_path: pair.new.clone(),
+        old_storage_schema: pair.old_storage_schema.clone(),
+        new_storage_schema: pair.new_storage_schema.clone(),
+        report,
+    }
+}
+
+/// Render a single pair's report to the file-backed outputs (and the
+/// per-contract output directory, when requested). Mirrors the in-loop
+/// rendering of the one-shot batch loop so incremental runs re-emit only the
+/// pair they actually recomputed.
+fn render_pair_outputs(
+    result: &BatchResult,
+    pair: &BatchPair,
+    args: &Args,
+    outputs: &[OutputSpec],
+    width: Option<usize>,
+    progress: &dyn Fn(String),
+) -> Result<()> {
+    let report = result.report();
+    let explain = pair.settings.explain.value;
+    let ascii = pair.settings.ascii.value || args.ascii;
+    let plain = args.plain;
+
+    let file_outputs: Vec<OutputSpec> = outputs
+        .iter()
+        .filter(|output| output.path.is_some())
+        .cloned()
+        .collect();
+    render_to_outputs(
+        report,
+        &file_outputs,
+        explain,
+        ascii,
+        plain,
+        width,
+        Some(&pair.name),
+        progress,
+    )?;
+
+    if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
+        let content = render_single(
+            report,
+            args.format.unwrap_or(OutputFormat::Text),
+            explain,
+            ascii,
+            plain,
+            width,
+        )?;
+        write_report_file(
+            output_dir,
+            &pair.name,
+            &pair.id,
+            &args.per_contract_output_name_template,
+            args.format.unwrap_or(OutputFormat::Text),
+            &content,
+        )?;
+    }
+    Ok(())
+}
+
+/// Build the `BatchResult::Error` a gap contract (present in the old directory,
+/// absent from the new one) produces. A gap is always Critical: removing a
+/// deployed contract breaks every client that depends on it. `args` supplies
+/// the run-level `strict`/`no_timestamp` toggles that apply to every pair.
+fn gap_to_result(gap: &GapContract, args: &Args) -> BatchResult {
+    let name = gap.name.clone();
+    let old_path = gap.old_path.clone();
+    let gap_report = report::SafetyReport {
+        call_abi: soroban_upgrade_safeguard::CallAbiCompatibility::default(),
+        critical_count: 1,
+        warning_count: 0,
+        info_count: 0,
+        suppressed_count: 0,
+        suppressed_critical_count: 0,
+        suppressed_warning_count: 0,
+        suppressed_info_count: 0,
+        total_findings: 1,
+        is_safe: false,
+        strict: args.strict,
+        critical_root_count: 1,
+        cascade_critical_count: 0,
+        rpc_provenance: None,
+        old_symlink: None,
+        new_symlink: None,
+        old_interface_hash: None,
+        new_interface_hash: None,
+        no_timestamp: args.no_timestamp,
+        old_spec_summary: None,
+        new_spec_summary: Some("(contract missing from new deployment)".to_string()),
+        scope: report::AnalysisScope::default(),
+        metrics: None,
+        axis_verdicts: {
+            let mut verdicts = std::collections::HashMap::new();
+            verdicts.insert(diff::CompatibilityAxis::CallAbi, report::AxisStatus::Failed);
+            verdicts.insert(
+                diff::CompatibilityAxis::StorageLayout,
+                report::AxisStatus::Passed,
+            );
+            verdicts.insert(
+                diff::CompatibilityAxis::EventIndexer,
+                report::AxisStatus::Passed,
+            );
+            verdicts.insert(
+                diff::CompatibilityAxis::SourceLevel,
+                report::AxisStatus::Passed,
+            );
+            verdicts.insert(
+                diff::CompatibilityAxis::RuntimeSurface,
+                report::AxisStatus::Passed,
+            );
+            verdicts
+        },
+        gated_axes: {
+            let mut gated = std::collections::HashSet::new();
+            gated.insert(diff::CompatibilityAxis::CallAbi);
+            gated.insert(diff::CompatibilityAxis::StorageLayout);
+            gated.insert(diff::CompatibilityAxis::RuntimeSurface);
+            gated
+        },
+        findings_by_category: {
+            let mut map = std::collections::HashMap::new();
+            map.insert(
+                "contract-missing-from-new".to_string(),
+                vec![report::ReportedFinding {
+                    rule_id: "contract_missing_from_new".to_string(),
+                    finding: diff::Finding {
+                        severity: diff::Severity::Critical,
+                        axes: vec![diff::CompatibilityAxis::CallAbi],
+                        category: "contract-missing-from-new".to_string(),
+                        message: format!(
+                            "'{}' exists in the old directory but was not found in the new directory. \
+                             This contract would be removed from the deployment, breaking all clients \
+                             that depend on it.",
+                            name
+                        ),
+                        type_name: None,
+                        target: Some(name.clone()),
+                        root_target: None,
+                        change: None,
+                    },
+                    axes: vec![diff::CompatibilityAxis::CallAbi],
+                    suppressed: false,
+                    suppression_reason: None,
+                    remediation: Some(format!(
+                        "Ensure the .wasm for '{}' is present in the new directory, or add it to \
+                         the --suppressions file if removal is intentional.",
+                        name
+                    )),
+                    migrated_by: None,
+                }],
+            );
+            map
+        },
+        migrated_count: 0,
+        migration_status:
+            soroban_upgrade_safeguard::contract_migration::MigrationStatus::NotApplicable,
+        migration_diagnostics: Vec::new(),
+        empirical: false,
+        empirical_findings: Vec::new(),
+        budget_violations: Vec::new(),
+        settings: report::ReportSettings::default(),
+    };
+    BatchResult::Error {
+        id: name.clone(),
+        name,
+        labels: Vec::new(),
+        old_path,
+        new_path: None,
+        old_storage_schema: None,
+        new_storage_schema: None,
+        error: "contract is missing from the new deployment".to_string(),
+        report: gap_report,
+    }
+}
+
+/// Render one gap contract's report to the file-backed outputs and the
+/// per-contract output directory, mirroring the one-shot batch loop.
+fn render_gap_outputs(
+    result: &BatchResult,
+    gap_name: &str,
+    args: &Args,
+    outputs: &[OutputSpec],
+    width: Option<usize>,
+    progress: &dyn Fn(String),
+) -> Result<()> {
+    let report = result.report();
+    let file_outputs: Vec<OutputSpec> = outputs
+        .iter()
+        .filter(|output| output.path.is_some())
+        .cloned()
+        .collect();
+    render_to_outputs(
+        report,
+        &file_outputs,
+        args.explain,
+        args.ascii,
+        args.plain,
+        width,
+        Some(gap_name),
+        progress,
+    )?;
+
+    if let Some(output_dir) = args.per_contract_output_dir.as_deref() {
+        let content = render_single(
+            report,
+            args.format.unwrap_or(OutputFormat::Text),
+            args.explain,
+            args.ascii,
+            args.plain,
+            width,
+        )?;
+        write_report_file(
+            output_dir,
+            gap_name,
+            gap_name,
+            &args.per_contract_output_name_template,
+            args.format.unwrap_or(OutputFormat::Text),
+            &content,
+        )?;
+    }
+    Ok(())
 }
 
 /// Stable, machine-readable batch-verdict categories. `as_str()` values are
@@ -3383,6 +3533,24 @@ fn parse_watch_debounce_ms(s: &str) -> Result<u64, String> {
         ));
     }
     Ok(ms)
+}
+
+/// Write a watch status document to the requested path, best-effort. Shared by
+/// the single-comparison and batch watch loops so the atomic-write behavior is
+/// identical everywhere.
+#[cfg(feature = "watch")]
+fn handle_status_write(
+    status: &soroban_upgrade_safeguard::watch_status::WatchStatus,
+    path: Option<&Path>,
+) {
+    if let Some(path) = path {
+        if let Err(e) = status.write_to(path) {
+            eprintln!(
+                "Warning: failed to write watch status file {}: {e}",
+                path.display()
+            );
+        }
+    }
 }
 
 fn is_batch_mode(args: &Args) -> bool {
@@ -4260,7 +4428,11 @@ fn run_show_config(args: &Args) -> Result<()> {
         "format".to_string(),
         setting(
             args.format.unwrap_or(OutputFormat::Text).to_string(),
-            if args.format.is_some() { "cli" } else { "default" },
+            if args.format.is_some() {
+                "cli"
+            } else {
+                "default"
+            },
         ),
     );
     output.insert(
@@ -4287,10 +4459,7 @@ fn run_show_config(args: &Args) -> Result<()> {
     );
     output.insert(
         "color".to_string(),
-        setting(
-            format!("{:?}", args.color).to_lowercase(),
-            "cli or default",
-        ),
+        setting(format!("{:?}", args.color).to_lowercase(), "cli or default"),
     );
     output.insert(
         "ascii".to_string(),
@@ -4353,7 +4522,11 @@ fn run_show_config(args: &Args) -> Result<()> {
         "allow_http_local".to_string(),
         setting(
             args.allow_http_local,
-            if args.allow_http_local { "cli" } else { "default" },
+            if args.allow_http_local {
+                "cli"
+            } else {
+                "default"
+            },
         ),
     );
     input.insert(
@@ -4483,7 +4656,11 @@ fn run_show_config(args: &Args) -> Result<()> {
         "no_cache".to_string(),
         setting(
             args.no_remote_cache,
-            if args.no_remote_cache { "cli" } else { "default" },
+            if args.no_remote_cache {
+                "cli"
+            } else {
+                "default"
+            },
         ),
     );
     root.insert(
@@ -4532,10 +4709,17 @@ fn run_show_config(args: &Args) -> Result<()> {
         "allow_tags".to_string(),
         setting(
             args.allow_oci_tags,
-            if args.allow_oci_tags { "cli" } else { "default" },
+            if args.allow_oci_tags {
+                "cli"
+            } else {
+                "default"
+            },
         ),
     );
-    root.insert("oci_fetch".to_string(), serde_json::Value::Object(oci_section));
+    root.insert(
+        "oci_fetch".to_string(),
+        serde_json::Value::Object(oci_section),
+    );
 
     let mut lineage = serde_json::Map::new();
     lineage.insert(
@@ -4662,7 +4846,10 @@ fn render_resolved_config_text(value: &serde_json::Value, prefix: &str) -> Strin
         }
         serde_json::Value::Array(items) => {
             for (i, item) in items.iter().enumerate() {
-                out.push_str(&render_resolved_config_text(item, &format!("{prefix}[{i}]")));
+                out.push_str(&render_resolved_config_text(
+                    item,
+                    &format!("{prefix}[{i}]"),
+                ));
             }
         }
         other => {
@@ -5204,7 +5391,10 @@ mod tests {
             "MARKDOWN".parse::<OutputFormat>().unwrap(),
             OutputFormat::Markdown
         );
-        assert_eq!("MD".parse::<OutputFormat>().unwrap(), OutputFormat::Markdown);
+        assert_eq!(
+            "MD".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Markdown
+        );
     }
 
     #[test]
