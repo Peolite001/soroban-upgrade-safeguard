@@ -3599,7 +3599,9 @@ fn write_atomically(path: &Path, content: &[u8]) -> Result<()> {
 fn emit_output(spec: &OutputSpec, content: &str) -> Result<()> {
     match &spec.path {
         Some(path) => {
-            write_atomically(path, content.as_bytes())
+            let mut formatted = content.trim_end_matches('\n').to_string();
+            formatted.push('\n');
+            write_atomically(path, formatted.as_bytes())
                 .with_context(|| format!("Failed to write output file '{}'.", path.display()))?;
         }
         None => {
@@ -4886,7 +4888,9 @@ fn write_report_file(
     };
     let filename = evaluate_template(template, contract_name, pair_id, ext)?;
     let output_path = output_dir.join(filename);
-    write_atomically(&output_path, content.as_bytes())
+    let mut formatted = content.trim_end_matches('\n').to_string();
+    formatted.push('\n');
+    write_atomically(&output_path, formatted.as_bytes())
         .with_context(|| format!("Failed to write output file '{}'.", output_path.display()))?;
     Ok(())
 }
