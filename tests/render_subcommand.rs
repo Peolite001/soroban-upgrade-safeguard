@@ -198,6 +198,27 @@ fn the_report_carries_the_interface_hashes() {
 // --- Error handling ----------------------------------------------------------
 
 #[test]
+fn render_ignores_unknown_additive_json_fields() {
+    let report: serde_json::Value = serde_json::from_str(&live("json")).unwrap();
+    let mut unknown = report.clone();
+
+    unknown["future_top_level_field"] = serde_json::json!({
+        "note": "ignored by older renderers",
+        "nested": {"still_unknown": true}
+    });
+    unknown["provenance"]["future_nested_field"] = serde_json::json!({
+        "extra": "ignored by older renderers"
+    });
+
+    let (rendered, code) = render(&unknown.to_string(), &["--format", "markdown"]);
+
+    assert_eq!(code, 1, "the stored verdict was a failure, so must the exit be");
+    assert!(rendered.contains("SOROBAN UPGRADE SAFETY REPORT"));
+    assert!(rendered.contains("CRITICAL") || rendered.contains("WARNING") || rendered.contains("INFO"));
+    assert!(rendered.contains("Storage Layout Compatibility") || rendered.contains("Call ABI Compatibility"));
+}
+
+#[test]
 fn a_malformed_report_fails_with_a_clear_error() {
     let (_, code) = render("{ this is not json", &[]);
     assert_ne!(code, 0);
