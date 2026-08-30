@@ -816,6 +816,44 @@ mod tests {
     }
 
     #[test]
+    fn validates_expired_and_future_rules_with_fixed_dates() {
+        let expired = SuppressionConfig::from_toml_str(
+            r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target   = "Data.amount"
+            expiry   = "2000-01-01"
+            "#,
+        )
+        .unwrap();
+        let future = SuppressionConfig::from_toml_str(
+            r#"
+            [[suppress]]
+            category = "Struct Field Removed"
+            target   = "Data.amount"
+            expiry   = "2100-01-01"
+            "#,
+        )
+        .unwrap();
+
+        let expired_validation = expired.validate();
+        let future_validation = future.validate();
+
+        assert!(
+            expired_validation
+                .errors
+                .iter()
+                .any(|message| message.contains("expired")),
+            "an expired rule must be rejected during validation"
+        );
+        assert!(
+            future_validation.errors.is_empty(),
+            "a future-dated rule must remain valid: {:?}",
+            future_validation.errors
+        );
+    }
+
+    #[test]
     fn validate_flags_a_rule_with_an_unknown_category() {
         // "Struct Field Reordded" is a misspelling of "Struct Field Reordered";
         // the tool never emits it, so the rule could never match.
