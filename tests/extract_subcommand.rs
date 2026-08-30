@@ -442,3 +442,43 @@ fn the_local_pair_mode_still_works() {
     assert_eq!(json["is_safe"], Value::Bool(false));
     assert_eq!(output.status.code(), Some(1));
 }
+
+#[test]
+fn extract_output_trailing_newline_regression_test() {
+    let path = wasm("v1.wasm");
+
+    // 1. Full extraction output ends with exactly one newline
+    let (full_stdout, code) = extract(&[path.to_str().unwrap()]);
+    assert_eq!(code, 0, "extract must succeed");
+    assert!(
+        full_stdout.ends_with('\n'),
+        "full extraction output must end with a newline"
+    );
+    assert!(
+        !full_stdout.ends_with("\n\n"),
+        "full extraction output must end with exactly one newline"
+    );
+    let trimmed_full = &full_stdout[..full_stdout.len() - 1];
+    let parsed: Value = serde_json::from_str(trimmed_full)
+        .expect("removing the final newline leaves valid JSON");
+    assert_eq!(parsed["spec_schema_version"], 1);
+
+    // 2. Hash-only extraction output ends with exactly one newline
+    let (hash_stdout, code) = extract(&[path.to_str().unwrap(), "--hash-only"]);
+    assert_eq!(code, 0, "extract --hash-only must succeed");
+    assert!(
+        hash_stdout.ends_with('\n'),
+        "hash-only output must end with a newline"
+    );
+    assert!(
+        !hash_stdout.ends_with("\n\n"),
+        "hash-only output must end with exactly one newline"
+    );
+    let trimmed_hash = &hash_stdout[..hash_stdout.len() - 1];
+    assert_eq!(trimmed_hash.len(), 64);
+    assert!(
+        trimmed_hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "removing the final newline leaves a valid hash"
+    );
+}
+

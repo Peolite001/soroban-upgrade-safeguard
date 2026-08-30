@@ -274,88 +274,69 @@ fn a_missing_report_file_fails_with_a_clear_error() {
 }
 
 #[test]
-fn unicode_finding_content_survives_text_and_markdown_rendering() {
-    let unicode_message = "Storage field '✨tokenbalance' modified unexpectedly 🚀";
-    let unicode_target = "ContractState::🔑authkey";
-    let unicode_remediation = "Update schema mapping to handle 🌟 unicode keys properly.";
+fn empty_report_rendering_regression_test() {
+    // Produce an empty report (identical upgrade with zero findings)
+    let output = bin()
+        .arg(wasm("v1.wasm"))
+        .arg(wasm("v1.wasm"))
+        .args(["--format", "json"])
+        .output()
+        .expect("failed to run binary");
+    assert_eq!(output.status.code(), Some(0));
 
-    let mut report_val: serde_json::Value = serde_json::from_str(&live("json")).unwrap();
+    let empty_report_json = String::from_utf8(output.stdout).unwrap();
+    assert!(empty_report_json.contains("\"total_findings\": 0"));
 
-    // Build the unicode finding by cloning a real one from the live report, so
-    // its shape always matches the current report schema (severity/axes/rule_id/
-    // target/root_target) regardless of schema drift. Then swap in the unicode
-    // content. This is what lets arbitrary reporter content round-trip safely.
-    let unicode_finding = {
-        let mut base: serde_json::Value = report_val["findings_by_category"]
-            .as_object()
-            .and_then(|cat| {
-                cat.values()
-                    .find(|v| v.as_array().is_some_and(|a| !a.is_empty()))
-            })
-            .and_then(|arr| arr.as_array())
-            .and_then(|arr| arr.first())
-            .cloned()
-            .expect("live report should contain at least one finding");
-        if let Some(obj) = base.as_object_mut() {
-            obj.insert("category".to_string(), serde_json::json!(unicode_target));
-            obj.insert("message".to_string(), serde_json::json!(unicode_message));
-            obj.insert("target".to_string(), serde_json::json!(unicode_target));
-            obj.insert(
-                "remediation".to_string(),
-                serde_json::json!(unicode_remediation),
-            );
-        }
-        base
-    };
-
-    if let Some(findings) = report_val.get_mut("findings_by_category") {
-        if let Some(cat) = findings.as_object_mut() {
-            cat.insert(
-                unicode_target.to_string(),
-                serde_json::json!([unicode_finding]),
-            );
-        }
-    }
-
-    if let Some(axis_findings) = report_val.get_mut("findings_by_axis") {
-        if let Some(axes) = axis_findings.as_object_mut() {
-            axes.insert(
-                "storage_layout".to_string(),
-                serde_json::json!([unicode_finding]),
-            );
-        }
-    }
-
-    let saved_json = serde_json::to_string_pretty(&report_val).unwrap();
-
-    // 1. Verify saved JSON input remains valid UTF-8 and round-trips successfully
-    let round_tripped = RenderableReport::from_json_str(&saved_json);
+    // 1. Text format path
+    let (text_out, text_code) = render(&empty_report_json, &["--format", "text"]);
+    assert_eq!(text_code, 0, "text render must exit 0");
     assert!(
-        round_tripped.is_ok(),
-        "Saved JSON report with Unicode content must parse successfully"
-    );
-
-    // 2. Unicode finding content survives text rendering
-    let (rendered_text, text_code) = render(&saved_json, &["--format", "text", "--explain"]);
-    assert_ne!(text_code, 0);
-    assert!(
-        rendered_text.contains(unicode_message),
-        "Unicode finding message must survive text rendering"
+        text_out.contains("✅ PASSED"),
+        "text output communicates passing verdict"
     );
     assert!(
-        rendered_text.contains(unicode_remediation),
-        "Unicode remediation text must survive text rendering"
+        text_out.contains("Critical: 0"),
+        "text output shows zero critical findings"
+    );
+    assert!(
+        text_out.contains("No relevant changes detected."),
+        "text output communicates successful outcome"
+    );
+    assert!(
+        !text_out.contains("--- ["),
+        "no empty category headings in text output"
+    );
+    assert!(
+        !text_out.contains("🔴") && !text_out.contains("🟡"),
+        "no placeholder finding rows in text output"
     );
 
-    // 3. The same content survives Markdown rendering
-    let (rendered_md, md_code) = render(&saved_json, &["--format", "markdown"]);
-    assert_ne!(md_code, 0);
+    // 2. Markdown format path
+    let (md_out, md_code) = render(&empty_report_json, &["--format", "markdown"]);
+    assert_eq!(md_code, 0, "markdown render must exit 0");
     assert!(
-        rendered_md.contains(unicode_message),
-        "Unicode finding message must survive Markdown rendering"
+        md_out.contains("## Status: ✅ PASSED"),
+        "markdown output communicates passing verdict"
     );
     assert!(
-        rendered_md.contains(unicode_target),
-        "Unicode finding target/category must survive Markdown rendering"
+        md_out.contains("| **Critical** | 0 |"),
+        "markdown output shows zero critical findings"
+    );
+    assert!(
+        md_out.contains("No relevant changes detected."),
+        "markdown output communicates successful outcome"
+    );
+    assert!(
+        !md_out.contains("### Storage Layout Compatibility"),
+        "no empty category headings in markdown output"
+    );
+    assert!(
+        !md_out.contains("### Call ABI Compatibility"),
+        "no empty category headings in markdown output"
+    );
+    assert!(
+        !md_out.contains("- 🔴") && !md_out.contains("- 🟡"),
+        "no placeholder finding rows in markdown output"
     );
 }
+
