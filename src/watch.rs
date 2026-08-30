@@ -63,10 +63,10 @@ use anyhow::{Context, Result};
 use notify::{RecursiveMode, Watcher};
 
 use crate::{
-    handle_status_write, oci_fetch_config, remote_fetch_config, render_batch_summary,
-    render_gap_outputs, render_pair_outputs, resolve_text_width, BatchPair, BatchResult,
-    BatchSummary, BuiltBatch, GapContract, NewOnlyContract, OutputSpec, Args, build_batch,
-    compare_batch_pair, gap_to_result, install_watch_sigterm_handler, watch_shutdown_requested,
+    build_batch, compare_batch_pair, gap_to_result, handle_status_write,
+    install_watch_sigterm_handler, oci_fetch_config, remote_fetch_config, render_batch_summary,
+    render_gap_outputs, render_pair_outputs, resolve_text_width, watch_shutdown_requested, Args,
+    BatchPair, BatchResult, BatchSummary, BuiltBatch, GapContract, NewOnlyContract, OutputSpec,
 };
 use soroban_upgrade_safeguard::manifest;
 
@@ -90,8 +90,11 @@ struct BatchPlan {
 
 impl BatchPlan {
     fn from_built(built: BuiltBatch, args: &Args) -> Self {
-        let pairs: BTreeMap<String, BatchPair> =
-            built.pairs.into_iter().map(|p| (p.name.clone(), p)).collect();
+        let pairs: BTreeMap<String, BatchPair> = built
+            .pairs
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect();
         let inputs = dependency_map(&pairs, args.empirical_file.as_deref());
 
         let manifest_sources = built
@@ -592,8 +595,7 @@ pub fn run_batch_watch(
                 }
 
                 cycle += 1;
-                let status =
-                    soroban_upgrade_safeguard::watch_status::WatchStatus::starting(cycle);
+                let status = soroban_upgrade_safeguard::watch_status::WatchStatus::starting(cycle);
                 handle_status_write(&status, args.watch_status_file.as_deref());
 
                 let recompute = impacted_pairs(&plan, &mut results, &mut fingerprints, &affected);
@@ -647,7 +649,8 @@ pub fn run_batch_watch(
     }
 
     if let Some(path) = args.watch_status_file.as_deref() {
-        let status = soroban_upgrade_safeguard::watch_status::WatchStatus::starting(cycle).shutdown();
+        let status =
+            soroban_upgrade_safeguard::watch_status::WatchStatus::starting(cycle).shutdown();
         handle_status_write(&status, Some(path));
     }
 
@@ -892,12 +895,21 @@ mod tests {
         p.old_storage_schema = Some(P::from("schemas/old.toml"));
         p.new_storage_schema = Some(P::from("schemas/new.toml"));
         pairs.insert(p.name.clone(), p);
-        pairs.insert("pool".to_string(), pair("pool", "old/pool.wasm", "new/pool.wasm"));
+        pairs.insert(
+            "pool".to_string(),
+            pair("pool", "old/pool.wasm", "new/pool.wasm"),
+        );
 
         let inputs = dependency_map(&pairs, None);
-        assert_eq!(inputs[&normalize_path(Path::new("old/token.wasm"))].len(), 1);
+        assert_eq!(
+            inputs[&normalize_path(Path::new("old/token.wasm"))].len(),
+            1
+        );
         assert!(inputs[&normalize_path(Path::new("old/token.wasm"))].contains("token"));
-        assert_eq!(inputs[&normalize_path(Path::new("schemas/old.toml"))].len(), 1);
+        assert_eq!(
+            inputs[&normalize_path(Path::new("schemas/old.toml"))].len(),
+            1
+        );
         assert!(inputs[&normalize_path(Path::new("new/pool.wasm"))].contains("pool"));
     }
 
@@ -971,8 +983,7 @@ mod tests {
         assert!(affected_input.named.contains("token"));
         assert!(!affected_input.rescan);
 
-        let affected_dir =
-            affected_by_paths(&plan, &[P::from("dir/other.wasm")], &ignore);
+        let affected_dir = affected_by_paths(&plan, &[P::from("dir/other.wasm")], &ignore);
         assert!(affected_dir.rescan);
         assert!(affected_dir.named.is_empty());
 
@@ -980,10 +991,7 @@ mod tests {
         assert!(!affected_junk.rescan);
         assert!(affected_junk.is_empty());
 
-        let affected_unknown =
-            affected_by_paths(&plan, &[P::from("unrelated.wasm")], &ignore);
+        let affected_unknown = affected_by_paths(&plan, &[P::from("unrelated.wasm")], &ignore);
         assert!(affected_unknown.named.is_empty());
     }
 }
-
-

@@ -65,7 +65,8 @@ fn wait_for_completed_cycle(status_file: &Path, min_cycle: u64) {
     while Instant::now() < deadline {
         if let Ok(contents) = std::fs::read_to_string(status_file) {
             if let Ok(value) = serde_json::from_str::<Value>(&contents) {
-                if value["state"] == "completed" && value["cycle"].as_u64().unwrap_or(0) >= min_cycle
+                if value["state"] == "completed"
+                    && value["cycle"].as_u64().unwrap_or(0) >= min_cycle
                 {
                     return;
                 }
@@ -114,10 +115,22 @@ fn batch_watch_recomputes_only_the_changed_pair() {
     let out = ws.join("out");
     std::fs::create_dir_all(&out).expect("out dir");
 
-    write_file(&old.join("a.wasm"), &std::fs::read(wasm("v1.wasm")).unwrap());
-    write_file(&new.join("a.wasm"), &std::fs::read(wasm("v1.wasm")).unwrap());
-    write_file(&old.join("b.wasm"), &std::fs::read(wasm("v1.wasm")).unwrap());
-    write_file(&new.join("b.wasm"), &std::fs::read(wasm("v1.wasm")).unwrap());
+    write_file(
+        &old.join("a.wasm"),
+        &std::fs::read(wasm("v1.wasm")).unwrap(),
+    );
+    write_file(
+        &new.join("a.wasm"),
+        &std::fs::read(wasm("v1.wasm")).unwrap(),
+    );
+    write_file(
+        &old.join("b.wasm"),
+        &std::fs::read(wasm("v1.wasm")).unwrap(),
+    );
+    write_file(
+        &new.join("b.wasm"),
+        &std::fs::read(wasm("v1.wasm")).unwrap(),
+    );
 
     let manifest = ws.join("m.toml");
     write_file(
@@ -144,7 +157,10 @@ fn batch_watch_recomputes_only_the_changed_pair() {
     assert_eq!(initial["results"].as_array().unwrap().len(), 2);
 
     // Make only pair "a" breaking; pair "b" must retain its last known result.
-    write_file(&new.join("a.wasm"), &std::fs::read(wasm("v2.wasm")).unwrap());
+    write_file(
+        &new.join("a.wasm"),
+        &std::fs::read(wasm("v2.wasm")).unwrap(),
+    );
 
     wait_for_completed_cycle(&status, 2);
     // Give any trailing events a moment to settle before asserting the count.
@@ -155,7 +171,10 @@ fn batch_watch_recomputes_only_the_changed_pair() {
     assert_eq!(result_safe(&after, "b"), Some(true));
     // A single content edit coalesces into exactly one incremental cycle.
     let cycle = read_value(&status, "cycle");
-    assert!(cycle <= 2, "edit should produce a single cycle, got {cycle}");
+    assert!(
+        cycle <= 2,
+        "edit should produce a single cycle, got {cycle}"
+    );
 }
 
 #[test]
@@ -166,8 +185,14 @@ fn batch_watch_coalesces_an_atomic_replacement_burst() {
     let out = ws.join("out");
     std::fs::create_dir_all(&out).expect("out dir");
 
-    write_file(&old.join("a.wasm"), &std::fs::read(wasm("v1.wasm")).unwrap());
-    write_file(&new.join("a.wasm"), &std::fs::read(wasm("v1.wasm")).unwrap());
+    write_file(
+        &old.join("a.wasm"),
+        &std::fs::read(wasm("v1.wasm")).unwrap(),
+    );
+    write_file(
+        &new.join("a.wasm"),
+        &std::fs::read(wasm("v1.wasm")).unwrap(),
+    );
 
     let status = out.join("status.json");
     let report = out.join("report.json");
@@ -199,7 +224,10 @@ fn batch_watch_coalesces_an_atomic_replacement_burst() {
     assert_eq!(after["is_safe"], false);
     assert_eq!(result_safe(&after, "a"), Some(false));
     let cycle = read_value(&status, "cycle");
-    assert!(cycle <= 2, "burst of replacements must coalesce, got {cycle} cycles");
+    assert!(
+        cycle <= 2,
+        "burst of replacements must coalesce, got {cycle} cycles"
+    );
 }
 
 #[test]
@@ -220,7 +248,8 @@ fn batch_watch_manifest_edit_re_resolves_the_composition() {
         &manifest,
         format!(
             "[[pairs]]\nold = {:?}\nnew = {:?}\nname = \"a\"\n",
-            old.join("a.wasm"), new.join("a.wasm")
+            old.join("a.wasm"),
+            new.join("a.wasm")
         )
         .as_bytes(),
     );
@@ -255,7 +284,10 @@ fn batch_watch_manifest_edit_re_resolves_the_composition() {
         .iter()
         .map(|r| r["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"c"), "edited manifest must add pair 'c', got {names:?}");
+    assert!(
+        names.contains(&"c"),
+        "edited manifest must add pair 'c', got {names:?}"
+    );
 }
 
 #[test]
@@ -349,7 +381,10 @@ fn batch_watch_newly_added_pair_appears() {
         .iter()
         .map(|r| r["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"zz"), "newly added artifact must appear, got {names:?}");
+    assert!(
+        names.contains(&"zz"),
+        "newly added artifact must appear, got {names:?}"
+    );
     assert_eq!(after["results"].as_array().unwrap().len(), 2);
 }
 
@@ -363,10 +398,22 @@ fn batch_watch_output_is_deterministic_across_runs() {
         let out = ws.join("out");
         std::fs::create_dir_all(&out).expect("out dir");
 
-        write_file(&old.join("a.wasm"), &std::fs::read(wasm("v1.wasm")).unwrap());
-        write_file(&new.join("a.wasm"), &std::fs::read(wasm("v1.wasm")).unwrap());
-        write_file(&old.join("b.wasm"), &std::fs::read(wasm("v1.wasm")).unwrap());
-        write_file(&new.join("b.wasm"), &std::fs::read(wasm("v2.wasm")).unwrap());
+        write_file(
+            &old.join("a.wasm"),
+            &std::fs::read(wasm("v1.wasm")).unwrap(),
+        );
+        write_file(
+            &new.join("a.wasm"),
+            &std::fs::read(wasm("v1.wasm")).unwrap(),
+        );
+        write_file(
+            &old.join("b.wasm"),
+            &std::fs::read(wasm("v1.wasm")).unwrap(),
+        );
+        write_file(
+            &new.join("b.wasm"),
+            &std::fs::read(wasm("v2.wasm")).unwrap(),
+        );
 
         let status = out.join("status.json");
         let report = out.join("report.json");

@@ -435,6 +435,7 @@ mod tests {
             suppressed,
             suppression_reason: None,
             remediation: None,
+            migrated_by: None,
         }
     }
 

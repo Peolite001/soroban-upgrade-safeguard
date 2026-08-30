@@ -409,7 +409,6 @@ fn interface_hash_is_64_lowercase_hex_and_matches_hash_only_across_multiple_fixt
     );
 }
 
-
 // --- The four pre-existing usage modes must be untouched ---------------------
 
 #[test]

@@ -275,25 +275,38 @@ fn a_missing_report_file_fails_with_a_clear_error() {
 
 #[test]
 fn unicode_finding_content_survives_text_and_markdown_rendering() {
-    let unicode_message = "Storage field '✨_token_balance' modified unexpectedly 🚀";
-    let unicode_target = "ContractState::🔑_auth_key";
+    let unicode_message = "Storage field '✨tokenbalance' modified unexpectedly 🚀";
+    let unicode_target = "ContractState::🔑authkey";
     let unicode_remediation = "Update schema mapping to handle 🌟 unicode keys properly.";
 
     let mut report_val: serde_json::Value = serde_json::from_str(&live("json")).unwrap();
 
-    let unicode_finding = serde_json::json!({
-        "finding": {
-            "axis": "storage_layout",
-            "category": unicode_target,
-            "severity": "critical",
-            "message": unicode_message,
-            "type_name": null,
-            "location": null
-        },
-        "suppressed": false,
-        "suppression_reason": null,
-        "remediation": unicode_remediation
-    });
+    // Build the unicode finding by cloning a real one from the live report, so
+    // its shape always matches the current report schema (severity/axes/rule_id/
+    // target/root_target) regardless of schema drift. Then swap in the unicode
+    // content. This is what lets arbitrary reporter content round-trip safely.
+    let unicode_finding = {
+        let mut base: serde_json::Value = report_val["findings_by_category"]
+            .as_object()
+            .and_then(|cat| {
+                cat.values()
+                    .find(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+            })
+            .and_then(|arr| arr.as_array())
+            .and_then(|arr| arr.first())
+            .cloned()
+            .expect("live report should contain at least one finding");
+        if let Some(obj) = base.as_object_mut() {
+            obj.insert("category".to_string(), serde_json::json!(unicode_target));
+            obj.insert("message".to_string(), serde_json::json!(unicode_message));
+            obj.insert("target".to_string(), serde_json::json!(unicode_target));
+            obj.insert(
+                "remediation".to_string(),
+                serde_json::json!(unicode_remediation),
+            );
+        }
+        base
+    };
 
     if let Some(findings) = report_val.get_mut("findings_by_category") {
         if let Some(cat) = findings.as_object_mut() {

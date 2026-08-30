@@ -2189,7 +2189,14 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
         ));
 
         let gap_result = gap_to_result(&gap, args);
-        render_gap_outputs(&gap_result, gap_result.name(), args, outputs, width, progress)?;
+        render_gap_outputs(
+            &gap_result,
+            gap_result.name(),
+            args,
+            outputs,
+            width,
+            progress,
+        )?;
         results.push(gap_result);
         overall_safe = false;
     }
@@ -2212,7 +2219,14 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             contract_name.bold()
         ));
 
-        let result = compare_batch_pair(pair, args, &remote_config, &oci_config, &mut config_cache, progress);
+        let result = compare_batch_pair(
+            pair,
+            args,
+            &remote_config,
+            &oci_config,
+            &mut config_cache,
+            progress,
+        );
         render_pair_outputs(&result, pair, args, outputs, width, progress)?;
 
         if !result.report().is_safe() {
@@ -2506,22 +2520,18 @@ fn compare_batch_pair(
         (Ok(old_wasm), Ok(new_wasm)) => {
             match load_pair_storage_schemas(pair).and_then(|storage_schemas| {
                 if let Some(storage_schemas) = storage_schemas.as_ref() {
-                    let mut report =
-                        soroban_upgrade_safeguard::compare_wasm_bytes_with_options(
-                            &old_wasm.bytes,
-                            &new_wasm.bytes,
-                            &soroban_upgrade_safeguard::CompareOptions {
-                                suppressions: Some(&pair_suppressions),
-                                explain,
-                                strict: settings.strict.value,
-                                storage_schemas: Some((
-                                    &storage_schemas.old,
-                                    &storage_schemas.new,
-                                )),
-                                lineage_store: None,
-                                contract: Some(contract_name.as_str()),
-                            },
-                        )?;
+                    let mut report = soroban_upgrade_safeguard::compare_wasm_bytes_with_options(
+                        &old_wasm.bytes,
+                        &new_wasm.bytes,
+                        &soroban_upgrade_safeguard::CompareOptions {
+                            suppressions: Some(&pair_suppressions),
+                            explain,
+                            strict: settings.strict.value,
+                            storage_schemas: Some((&storage_schemas.old, &storage_schemas.new)),
+                            lineage_store: None,
+                            contract: Some(contract_name.as_str()),
+                        },
+                    )?;
                     report.set_no_timestamp(settings.no_timestamp.value);
                     Ok(report)
                 } else {
@@ -2705,7 +2715,10 @@ fn gap_to_result(gap: &GapContract, args: &Args) -> BatchResult {
                 diff::CompatibilityAxis::EventIndexer,
                 report::AxisStatus::Passed,
             );
-            verdicts.insert(diff::CompatibilityAxis::SourceLevel, report::AxisStatus::Passed);
+            verdicts.insert(
+                diff::CompatibilityAxis::SourceLevel,
+                report::AxisStatus::Passed,
+            );
             verdicts.insert(
                 diff::CompatibilityAxis::RuntimeSurface,
                 report::AxisStatus::Passed,
@@ -4413,7 +4426,11 @@ fn run_show_config(args: &Args) -> Result<()> {
         "format".to_string(),
         setting(
             args.format.unwrap_or(OutputFormat::Text).to_string(),
-            if args.format.is_some() { "cli" } else { "default" },
+            if args.format.is_some() {
+                "cli"
+            } else {
+                "default"
+            },
         ),
     );
     output.insert(
@@ -4440,10 +4457,7 @@ fn run_show_config(args: &Args) -> Result<()> {
     );
     output.insert(
         "color".to_string(),
-        setting(
-            format!("{:?}", args.color).to_lowercase(),
-            "cli or default",
-        ),
+        setting(format!("{:?}", args.color).to_lowercase(), "cli or default"),
     );
     output.insert(
         "ascii".to_string(),
@@ -4506,7 +4520,11 @@ fn run_show_config(args: &Args) -> Result<()> {
         "allow_http_local".to_string(),
         setting(
             args.allow_http_local,
-            if args.allow_http_local { "cli" } else { "default" },
+            if args.allow_http_local {
+                "cli"
+            } else {
+                "default"
+            },
         ),
     );
     input.insert(
@@ -4636,7 +4654,11 @@ fn run_show_config(args: &Args) -> Result<()> {
         "no_cache".to_string(),
         setting(
             args.no_remote_cache,
-            if args.no_remote_cache { "cli" } else { "default" },
+            if args.no_remote_cache {
+                "cli"
+            } else {
+                "default"
+            },
         ),
     );
     root.insert(
@@ -4685,10 +4707,17 @@ fn run_show_config(args: &Args) -> Result<()> {
         "allow_tags".to_string(),
         setting(
             args.allow_oci_tags,
-            if args.allow_oci_tags { "cli" } else { "default" },
+            if args.allow_oci_tags {
+                "cli"
+            } else {
+                "default"
+            },
         ),
     );
-    root.insert("oci_fetch".to_string(), serde_json::Value::Object(oci_section));
+    root.insert(
+        "oci_fetch".to_string(),
+        serde_json::Value::Object(oci_section),
+    );
 
     let mut lineage = serde_json::Map::new();
     lineage.insert(
@@ -4815,7 +4844,10 @@ fn render_resolved_config_text(value: &serde_json::Value, prefix: &str) -> Strin
         }
         serde_json::Value::Array(items) => {
             for (i, item) in items.iter().enumerate() {
-                out.push_str(&render_resolved_config_text(item, &format!("{prefix}[{i}]")));
+                out.push_str(&render_resolved_config_text(
+                    item,
+                    &format!("{prefix}[{i}]"),
+                ));
             }
         }
         other => {
@@ -5355,7 +5387,10 @@ mod tests {
             "MARKDOWN".parse::<OutputFormat>().unwrap(),
             OutputFormat::Markdown
         );
-        assert_eq!("MD".parse::<OutputFormat>().unwrap(), OutputFormat::Markdown);
+        assert_eq!(
+            "MD".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Markdown
+        );
     }
 
     #[test]
