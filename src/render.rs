@@ -77,6 +77,8 @@ pub struct SeverityCounts {
 pub enum RenderError {
     /// The bytes were not valid JSON, or did not match the report shape.
     Malformed(serde_json::Error),
+    /// The input was empty after trimming whitespace.
+    EmptyInput,
     /// The report declares a schema version this build cannot render.
     IncompatibleSchema {
         found: u32,
@@ -92,6 +94,10 @@ impl std::fmt::Display for RenderError {
                 f,
                 "not a valid Soroban Upgrade Safeguard JSON report: {err}. \
                  Expected a document produced by `--format json`."
+            ),
+            RenderError::EmptyInput => write!(
+                f,
+                "render input is empty or whitespace-only. Expected a saved JSON report produced by `--format json`."
             ),
             RenderError::IncompatibleSchema {
                 found,
@@ -263,6 +269,10 @@ fn wrap_with_prefix(prefix: &str, message: &str, width: usize) -> String {
 impl RenderableReport {
     /// Parse a previously emitted JSON report.
     pub fn from_json_str(json: &str) -> Result<Self, RenderError> {
+        if json.trim().is_empty() {
+            return Err(RenderError::EmptyInput);
+        }
+
         let probe: SchemaProbe = serde_json::from_str(json).map_err(RenderError::Malformed)?;
         if probe.report_schema_version > REPORT_SCHEMA_VERSION {
             return Err(RenderError::IncompatibleSchema {

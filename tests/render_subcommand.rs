@@ -219,6 +219,33 @@ fn render_ignores_unknown_additive_json_fields() {
 }
 
 #[test]
+fn whitespace_only_render_input_fails_with_a_clear_error() {
+    let (_, code) = render("   \n\t  ", &[]);
+    assert_ne!(code, 0);
+
+    let mut child = bin()
+        .arg("render")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"   \n\t  ")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("saved JSON report"),
+        "error should mention the expected saved JSON report, got: {stderr}"
+    );
+}
+
+#[test]
 fn a_malformed_report_fails_with_a_clear_error() {
     let (_, code) = render("{ this is not json", &[]);
     assert_ne!(code, 0);
