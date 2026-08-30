@@ -159,6 +159,19 @@ pub fn load_wasm_with_policy(path: &Path, reject_symlinks: bool) -> Result<WasmM
         });
     }
 
+    // Directory inputs are valid filesystem paths, but not valid WASM files.
+    // Keep this distinct from "file not found" and malformed-WASM errors so
+    // the user gets a precise diagnostic while the rest of the loader behavior
+    // stays unchanged.
+    if path.is_dir() {
+        return Err(Error::InvalidInput {
+            details: format!(
+                "'{}' is a directory. Expected a WASM file, not a directory.",
+                path.display()
+            ),
+        });
+    }
+
     // 3. Read all bytes into memory
     let bytes = std::fs::read(path).map_err(|e| Error::FileAccess {
         path: path.to_path_buf(),
