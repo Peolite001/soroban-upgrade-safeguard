@@ -10,6 +10,8 @@
 //! rolled temp-dir helper).
 #![cfg(unix)]
 
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -217,6 +219,20 @@ fn both_sides_symlinked_records_two_entries() {
     assert_eq!(run.code, Some(1), "{}", run.combined());
     let json = run.json();
     assert_eq!(symlinks_in(&json).len(), 2);
+}
+
+#[test]
+fn a_non_utf8_path_component_is_reported_lossily_in_provenance() {
+    let dir = temp_dir("non-utf8-path");
+    let filename = OsString::from_vec(b"v1-\xFF.wasm".to_vec());
+    let path = dir.join(&filename);
+    std::fs::copy(wasm("v1.wasm"), &path).expect("failed to create WASM with a non-UTF-8 name");
+
+    let module = soroban_upgrade_safeguard::loader::load_wasm(&path)
+        .expect("a valid WASM file with a non-UTF-8 path component must still load");
+
+    assert_eq!(module.path, path.to_string_lossy().to_string());
+    assert!(module.path.contains("\u{FFFD}") || path.as_os_str().as_bytes().contains(&0xFF));
 }
 
 // ---------------------------------------------------------------------------
