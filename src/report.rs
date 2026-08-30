@@ -1304,6 +1304,7 @@ impl SafetyReport {
                     .into_iter()
                     .flatten()
                     .collect(),
+                git_commit: current_git_commit(),
             },
             is_safe: self.is_safe,
             strict: self.strict,
@@ -1372,6 +1373,33 @@ pub fn get_remediation_guidance(category: &str) -> Option<&'static str> {
 
 fn canonical_rule_id(category: &str) -> String {
     crate::suppression::canonical_rule_id(category)
+}
+
+/// Best-effort lookup of the Git commit (full SHA) the tool is being run
+/// from, by shelling out to `git rev-parse HEAD` in the current working
+/// directory.
+///
+/// Returns `None` — never an error — when `git` is not on `PATH`, the
+/// working directory is not inside a Git repository (or is a shallow clone
+/// with no HEAD), or the output isn't a well-formed commit hash. Capturing
+/// the invoking commit is a convenience for tying a report back to the
+/// source revision that produced it, not a requirement: CI checkouts,
+/// tarball extractions, and other non-Git contexts must still produce a
+/// complete report.
+fn current_git_commit() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(output.stdout).ok()?;
+    let commit = commit.trim();
+    let is_valid_sha = !commit.is_empty()
+        && commit.len() >= 7
+        && commit.chars().all(|c| c.is_ascii_hexdigit());
+    is_valid_sha.then(|| commit.to_string())
 }
 
 /// Return the current UTC time as an RFC 3339 / ISO 8601 string.

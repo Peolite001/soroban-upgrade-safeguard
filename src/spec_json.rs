@@ -18,6 +18,7 @@
 //!   "spec_schema_version": 1,
 //!   "tool_version": "0.1.0",
 //!   "source": "./target/wasm32-unknown-unknown/release/contract.wasm",
+//!   "source_kind": "local",
 //!   "interface_hash": "<64 hex chars>",
 //!   "env_meta": {
 //!     "interface_version": 90194313216,
@@ -76,13 +77,37 @@ pub struct ExtractedSpec {
     pub source: String,
     /// The build's interface hash, the same value the comparison report shows.
     pub interface_hash: String,
+    /// What kind of source `source` names, so a consumer can still tell a
+    /// local file apart from a remote/on-chain reference after redaction
+    /// (see [`crate::redact`]) replaces a local path's directory portion.
+    pub source_kind: SourceKind,
     /// Decoded `contractenvmetav0`, or `null` when the section is absent.
     pub env_meta: Option<EnvMetaJson>,
+    /// Declaration names that occurred more than once in the raw
+    /// `contractspecv0` entries, before first-wins de-duplication. Empty
+    /// when the build has no duplicate names.
+    pub duplicates: Vec<crate::spec::DuplicateDeclaration>,
+    /// What sections of the decoded interface this build carries.
+    pub scope: ExtractionScope,
     pub functions: Vec<FunctionJson>,
     pub structs: Vec<StructJson>,
     pub enums: Vec<EnumJson>,
     pub unions: Vec<UnionJson>,
     pub error_enums: Vec<ErrorEnumJson>,
+}
+
+/// What sections of the decoded interface an [`ExtractedSpec`] carries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractionScope {
+    /// Whether the build exports a `contractspecv0` section at all.
+    pub exported_interface: bool,
+    /// Whether the build carries a decodable `contractenvmetav0` section.
+    pub env_metadata: bool,
+    /// Number of raw (undecoded) `contractspecv0` entries.
+    pub spec_section_count: usize,
+    /// Number of duplicate declaration names found (see
+    /// [`ExtractedSpec::duplicates`]).
+    pub duplicate_count: usize,
 }
 
 impl ExtractedSpec {
@@ -150,17 +175,73 @@ impl ExtractedSpec {
             .collect();
         error_enums.sort_by(|a, b| a.name.cmp(&b.name));
 
+        let source = source.into();
+        let duplicates = crate::spec::ContractSpec::duplicate_declarations(&metadata.spec);
+        let scope = ExtractionScope {
+            exported_interface: !metadata.spec.is_empty(),
+            env_metadata: metadata.env_meta.is_some(),
+            spec_section_count: metadata.spec.len(),
+            duplicate_count: duplicates.len(),
+        };
         Self {
             spec_schema_version: SPEC_SCHEMA_VERSION,
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
-            source: source.into(),
+            source_kind: SourceKind::classify(&source),
+            source,
             interface_hash: InterfaceHash::of_spec(spec).to_hex(),
             env_meta: metadata.env_meta.as_ref().map(EnvMetaJson::from),
+            duplicates,
+            scope,
             functions,
             structs,
             enums,
             unions,
             error_enums,
+        }
+    }
+}
+
+impl ExtractedSpec {
+    /// Redact `source` in place when it names a local filesystem path,
+    /// replacing its directory portion with a stable label (see
+    /// [`crate::redact::redact_local_path`]) while keeping the file name and
+    /// [`Self::source_kind`] intact. A no-op for RPC, remote, and OCI
+    /// sources, which are identifiers rather than filesystem paths.
+    pub fn redact_source(&mut self) {
+        if self.source_kind == SourceKind::Local {
+            self.source = crate::redact::redact_local_path(&self.source);
+        }
+    }
+}
+
+/// What kind of source an [`ExtractedSpec::source`] (or a comparison
+/// report's input) names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    /// A local filesystem path.
+    Local,
+    /// A `stellar://<contract-id>` reference resolved via RPC.
+    Rpc,
+    /// An `oci://` reference resolved from a registry.
+    Oci,
+    /// An `http(s)://` URL fetched directly.
+    Remote,
+}
+
+impl SourceKind {
+    /// Classify a `source` string using the label conventions the loader
+    /// already applies: `stellar://` for RPC, `oci://` for OCI, `http(s)://`
+    /// for a direct remote fetch, and anything else as a local path.
+    pub fn classify(source: &str) -> Self {
+        if source.starts_with("stellar://") {
+            SourceKind::Rpc
+        } else if source.starts_with("oci://") {
+            SourceKind::Oci
+        } else if source.starts_with("http://") || source.starts_with("https://") {
+            SourceKind::Remote
+        } else {
+            SourceKind::Local
         }
     }
 }
