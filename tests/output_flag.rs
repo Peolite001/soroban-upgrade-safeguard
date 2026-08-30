@@ -265,8 +265,14 @@ fn output_flag_supports_path_with_spaces() {
     // The file must contain valid JSON report format and can be parsed or inspected
     let json: serde_json::Value = serde_json::from_str(&contents)
         .unwrap_or_else(|e| panic!("output file not valid JSON: {e}\n{contents}"));
-    assert!(json.get("is_safe").is_some(), "JSON report must contain 'is_safe'");
-    assert!(json.get("counts").is_some(), "JSON report must contain 'counts'");
+    assert!(
+        json.get("is_safe").is_some(),
+        "JSON report must contain 'is_safe'"
+    );
+    assert!(
+        json.get("counts").is_some(),
+        "JSON report must contain 'counts'"
+    );
 
     assert!(
         stdout.trim().is_empty(),
@@ -289,4 +295,3 @@ fn output_flag_supports_path_with_spaces() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_dir(&dir);
 }
-
