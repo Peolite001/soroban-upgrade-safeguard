@@ -131,6 +131,11 @@ pub mod profile;
 mod profile;
 
 #[cfg(feature = "unstable")]
+pub mod redact;
+#[cfg(not(feature = "unstable"))]
+mod redact;
+
+#[cfg(feature = "unstable")]
 pub mod remote;
 #[cfg(not(feature = "unstable"))]
 mod remote;

@@ -488,6 +488,13 @@ struct Args {
     #[arg(long)]
     plain: bool,
 
+    /// Replace local filesystem paths in report provenance (currently:
+    /// resolved symlink targets) with a stable, non-identifying label.
+    /// Interface hashes, contract IDs, and RPC endpoints (already sanitized)
+    /// are unaffected.
+    #[arg(long)]
+    redact_paths: bool,
+
     /// Word-wrap finding messages in text output to this many columns,
     /// overriding detection entirely. When omitted, width is detected only
     /// when stdout is a terminal: the COLUMNS environment variable if set
@@ -880,6 +887,33 @@ struct ExtractArgs {
     /// Print only the interface hash, with no other output.
     #[arg(long)]
     hash_only: bool,
+
+    /// Destination path for the extracted output. Defaults to stdout.
+    /// Written atomically (temp file + rename) and always overwrites an
+    /// existing file at this path, the same policy the comparison report's
+    /// `--output` uses.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+
+    /// Replace a local `source` path with a stable, non-identifying label
+    /// (keeping the file name and source kind). No-op for RPC/OCI/remote
+    /// sources, which are identifiers rather than filesystem paths.
+    #[arg(long)]
+    redact_paths: bool,
+
+    /// Omit decoded `contractenvmetav0` metadata (the `env_meta` field) from
+    /// the output.
+    #[arg(long)]
+    no_env_meta: bool,
+
+    /// Omit duplicate-declaration diagnostics (the `duplicates` field) from
+    /// the output.
+    #[arg(long)]
+    no_duplicates: bool,
+
+    /// Omit interface scope information (the `scope` field) from the output.
+    #[arg(long)]
+    no_scope: bool,
 }
 
 /// `lockfile`: write a committed snapshot of one contract's exported interface.
@@ -1046,13 +1080,46 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
     let contract_spec = spec::ContractSpec::from_entries(&metadata.spec);
 
     if args.hash_only {
-        println!("{}", contract_spec.interface_hash());
-        return Ok(());
+        return write_extract_output(args.output.as_deref(), &contract_spec.interface_hash().to_string());
     }
 
-    let extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
-    println!("{}", serde_json::to_string_pretty(&extracted)?);
-    Ok(())
+    let mut extracted = ExtractedSpec::new(&build.path, &metadata, &contract_spec);
+    if args.redact_paths {
+        extracted.redact_source();
+    }
+
+    let mut value = serde_json::to_value(&extracted)?;
+    if let Some(object) = value.as_object_mut() {
+        if args.no_env_meta {
+            object.remove("env_meta");
+        }
+        if args.no_duplicates {
+            object.remove("duplicates");
+        }
+        if args.no_scope {
+            object.remove("scope");
+        }
+    }
+    write_extract_output(args.output.as_deref(), &serde_json::to_string_pretty(&value)?)
+}
+
+/// Print `content` to stdout, or write it atomically to `path` when given —
+/// the same atomic-write (temp file + rename) and unconditional-overwrite
+/// policy the comparison report's `--output` uses. `content` gets exactly
+/// one trailing newline either way.
+fn write_extract_output(path: Option<&Path>, content: &str) -> Result<()> {
+    match path {
+        Some(path) => {
+            let mut formatted = content.trim_end_matches('\n').to_string();
+            formatted.push('\n');
+            write_atomically(path, formatted.as_bytes())
+                .with_context(|| format!("Failed to write output file '{}'.", path.display()))
+        }
+        None => {
+            println!("{content}");
+            Ok(())
+        }
+    }
 }
 
 /// Validate RPC connectivity and JSON-RPC protocol shape without fetching
@@ -2246,6 +2313,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             args.ascii,
             args.plain,
             width,
+            args.redact_paths,
             Some(&gap.name),
             progress,
         )?;
@@ -2258,6 +2326,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                 args.ascii,
                 args.plain,
                 width,
+                args.redact_paths,
             )?;
             write_report_file(
                 output_dir,
@@ -2422,6 +2491,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
             ascii,
             plain,
             width,
+            args.redact_paths,
             Some(&contract_name),
             progress,
         )?;
@@ -2434,6 +2504,7 @@ fn run_batch(args: &Args, outputs: &[OutputSpec], progress: &dyn Fn(String)) -> 
                 ascii,
                 plain,
                 width,
+                args.redact_paths,
             )?;
             write_report_file(
                 output_dir,
@@ -3293,6 +3364,7 @@ fn run_single(
             args.ascii,
             args.plain,
             resolve_text_width(args.width, std::io::stdout().is_terminal()),
+            args.redact_paths,
             None,
             progress,
         )?;
@@ -3397,11 +3469,12 @@ fn render_to_outputs(
     ascii: bool,
     plain: bool,
     width: Option<usize>,
+    redact: bool,
     contract_name: Option<&str>,
     progress: &dyn Fn(String),
 ) -> Result<()> {
     for output in outputs {
-        let content = render_single(report, output.format, explain, ascii, plain, width)?;
+        let content = render_single(report, output.format, explain, ascii, plain, width, redact)?;
         emit_output(output, &content)?;
 
         if let Some(ref path) = output.path {
@@ -3490,21 +3563,26 @@ fn render_single(
     ascii: bool,
     plain: bool,
     width: Option<usize>,
+    redact: bool,
 ) -> Result<String> {
     // JSON carries the severity as a field rather than as a marker glyph, and
     // the GitHub Actions workflow-command syntax is already plain ASCII, so
     // `--ascii`/`--plain` only affect the human-readable formats. `width` is
-    // narrower still: it only ever reaches `generate_summary_text_with_width`
+    // narrower still: it only ever reaches `to_text_with_width`
     // below, so JSON and Markdown output are structurally incapable of being
     // affected by it.
+    let mut renderable = report.to_renderable();
+    if redact {
+        renderable.redact_local_paths();
+    }
     match format {
-        OutputFormat::Json => Ok(serde_json::to_string_pretty(&report.to_json())?),
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&renderable)?),
         OutputFormat::Markdown => {
-            let markdown = report.generate_summary_markdown();
+            let markdown = renderable.to_markdown();
             Ok(destyle_text(markdown, ascii, plain))
         }
         OutputFormat::Text => {
-            let text = report.generate_summary_text_with_width(explain, width);
+            let text = renderable.to_text_with_width(explain, width);
             Ok(destyle_text(text, ascii, plain))
         }
         OutputFormat::GithubActions => Ok(render_github_actions(report)),

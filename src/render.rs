@@ -267,6 +267,19 @@ fn wrap_with_prefix(prefix: &str, message: &str, width: usize) -> String {
 }
 
 impl RenderableReport {
+    /// Redact local filesystem paths embedded in provenance, in place.
+    ///
+    /// Currently that means resolved symlink targets (`provenance.symlinks`),
+    /// which are absolute by construction and can expose a username or
+    /// workspace layout. Interface hashes, contract IDs, and RPC endpoints
+    /// (already sanitized by [`crate::rpc::redact_url`]) are untouched.
+    pub fn redact_local_paths(&mut self) {
+        for symlink in &mut self.provenance.symlinks {
+            symlink.requested = crate::redact::redact_local_path(&symlink.requested);
+            symlink.resolved = crate::redact::redact_local_path(&symlink.resolved);
+        }
+    }
+
     /// Parse a previously emitted JSON report.
     pub fn from_json_str(json: &str) -> Result<Self, RenderError> {
         let probe: SchemaProbe = serde_json::from_str(json).map_err(RenderError::Malformed)?;
