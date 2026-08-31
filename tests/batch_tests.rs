@@ -569,3 +569,89 @@ fn batch_directory_ignores_unrelated_files_json() {
         "stderr must not contain warnings for non-WASM files"
     );
 }
+
+#[test]
+fn batch_directory_handles_dotfile_wasm() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dotfile_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
+
+    std::fs::copy(wasm("v1.wasm"), old_dir.join(".baseline.wasm")).expect("copy wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join(".baseline.wasm")).expect("copy wasm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+
+    assert_eq!(code, 0, "all-safe batch must exit 0");
+    assert!(
+        stdout.contains("Overall Status: ✅ PASSED"),
+        "stdout must show overall passed"
+    );
+    assert!(
+        stdout.contains(".baseline"),
+        "stdout must contain the dotfile contract name '.baseline'"
+    );
+    assert!(
+        !stderr.contains('⚠'),
+        "stderr must not contain warnings for dotfile WASM"
+    );
+}
+
+#[test]
+fn batch_directory_handles_dotfile_wasm_json() {
+    let tmp_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dotfile_json_test");
+    let old_dir = tmp_dir.join("old");
+    let new_dir = tmp_dir.join("new");
+
+    std::fs::create_dir_all(&old_dir).ok();
+    std::fs::create_dir_all(&new_dir).ok();
+
+    std::fs::copy(wasm("v1.wasm"), old_dir.join(".baseline.wasm")).expect("copy wasm");
+    std::fs::copy(wasm("v1.wasm"), new_dir.join(".baseline.wasm")).expect("copy wasm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-upgrade-safeguard"))
+        .arg("--old-dir")
+        .arg(&old_dir)
+        .arg("--new-dir")
+        .arg(&new_dir)
+        .args(["--format", "json"])
+        .output()
+        .expect("failed to run binary");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not valid UTF-8");
+    let code = output.status.code().expect("process terminated by signal");
+    let json: Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+
+    assert_eq!(code, 0);
+    assert_eq!(json["is_safe"], Value::Bool(true), "JSON must report safe");
+
+    let results = json["results"]
+        .as_object()
+        .expect("results must be an object");
+    assert!(
+        results.contains_key(".baseline"),
+        "JSON results must contain the dotfile contract name '.baseline'"
+    );
+    assert_eq!(
+        results[".baseline"]["is_safe"],
+        Value::Bool(true),
+        "contract '.baseline' must be safe"
+    );
+    assert!(
+        !stderr.contains('⚠'),
+        "stderr must not contain warnings for dotfile WASM"
+    );
+}
