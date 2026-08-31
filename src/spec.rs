@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use stellar_xdr::curr::{
     ScSpecEntry, ScSpecFunctionV0, ScSpecUdtEnumV0, ScSpecUdtErrorEnumV0, ScSpecUdtStructV0,
     ScSpecUdtUnionV0,
@@ -17,7 +17,7 @@ use stellar_xdr::curr::{
 /// non-printing counterpart of that behavior, used by [`crate::lint`] and any
 /// other caller that needs the list of offending names rather than a
 /// side-effecting warning.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DuplicateDeclaration {
     /// Entry kind: "function", "struct", "enum", "union", or "error_enum".
     pub kind: &'static str,

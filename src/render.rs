@@ -127,6 +127,7 @@ impl std::error::Error for RenderError {
         match self {
             RenderError::Malformed(err) => Some(err),
             RenderError::IncompatibleSchema { .. } => None,
+            RenderError::EmptyInput => None,
         }
     }
 }
