@@ -88,7 +88,19 @@ pub struct SorobanMetadata {
 /// Soroban custom sections contain multiple XDR-encoded entries back to back.
 /// We wrap the data in a `Limited<Cursor>` and call `read_xdr` in a loop,
 /// checking the cursor position to detect when all bytes are consumed.
+///
+/// An empty `data` slice (a present but empty contractspecv0 section) returns
+/// an empty vector with a warning printed to stderr. This is distinct from a
+/// missing section (which never calls this function at all).
 fn decode_spec_entries(data: &[u8]) -> Result<Vec<ScSpecEntry>, Error> {
+    if data.is_empty() {
+        // A present but empty contractspecv0 section is unusual but valid:
+        // the contract was compiled with spec generation enabled but declares
+        // no public interface. Inform the user instead of failing silently.
+        eprintln!("warning: contractspecv0 section is present but empty (no spec entries)");
+        return Ok(Vec::new());
+    }
+
     let cursor = Cursor::new(data);
     let mut limited = Limited::new(cursor, Limits::none());
     let mut entries = Vec::new();
@@ -589,6 +601,25 @@ mod tests {
         assert!(
             metadata.env_meta.is_some(),
             "fixture wasm should contain decodable env metadata"
+        );
+    }
+
+    #[test]
+    fn extract_metadata_distinguishes_empty_from_missing_contractspec_section() {
+        // No `contractspecv0` section at all yields an empty spec list...
+        let without_section = wasm_with_imports(&[(0, 0)], &[]);
+        let metadata = extract_metadata(&without_section).expect("valid minimal module");
+        assert!(metadata.spec.is_empty());
+
+        // ...a present but empty contractspecv0 section also yields an empty
+        // spec list, but must print a warning to distinguish the two cases.
+        // (The warning is a side effect printed to stderr during decode; this
+        // test verifies the parser does not error and returns an empty vec.)
+        let with_empty_section = wasm_with_custom_section("contractspecv0", &[]);
+        let metadata = extract_metadata(&with_empty_section).expect("empty contractspec must parse");
+        assert!(
+            metadata.spec.is_empty(),
+            "an empty contractspecv0 section must decode to an empty spec vec"
         );
     }
 }
